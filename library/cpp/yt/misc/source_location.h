@@ -1,6 +1,23 @@
 #pragma once
 
+#include <util/generic/string.h>
+
+#ifdef __cpp_lib_source_location
+#include <source_location>
+#endif // __cpp_lib_source_location
+
 namespace NYT {
+
+////////////////////////////////////////////////////////////////////////////////
+
+// TODO(dgolear): Drop when LLVM-14 is eradicated.
+#ifdef __cpp_lib_source_location
+
+class TStringBuilderBase;
+
+void FormatValue(TStringBuilderBase* builder, const std::source_location& location, TStringBuf /*spec*/);
+
+#endif // __cpp_lib_source_location
 
 ////////////////////////////////////////////////////////////////////////////////
 

@@ -15,7 +15,7 @@ using namespace NNodeTrackerClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SchedulerSimulatorLogger;
+static constexpr auto& Logger = SchedulerSimulatorLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -147,20 +147,6 @@ TMemoryDistribution TSchedulerStrategyHost::GetExecNodeMemoryDistribution(
     return distribution;
 }
 
-TRefCountedExecNodeDescriptorMapPtr TSchedulerStrategyHost::CalculateExecNodeDescriptors(
-    const TSchedulingTagFilter& filter) const
-{
-    auto result = New<TRefCountedExecNodeDescriptorMap>();
-
-    for (const auto& execNode : *ExecNodes_) {
-        if (execNode->CanSchedule(filter)) {
-            EmplaceOrCrash(*result, execNode->GetId(), execNode->BuildExecDescriptor());
-        }
-    }
-
-    return result;
-}
-
 void TSchedulerStrategyHost::AbortAllocationsAtNode(TNodeId /*nodeId*/, NScheduler::EAbortReason /*reason*/)
 {
     // Nothing to do.
@@ -238,7 +224,7 @@ const NLogging::TLogger* TSchedulerStrategyHost::GetEventLogger()
 void TSchedulerStrategyHost::SetSchedulerAlert(ESchedulerAlertType alertType, const TError& alert)
 {
     if (!alert.IsOK()) {
-        YT_LOG_WARNING(alert, "Setting scheduler alert (AlertType: %lv)", alertType);
+        YT_LOG_WARNING(alert, "Setting scheduler alert (AlertType: %v)", alertType);
     }
 }
 
@@ -287,6 +273,11 @@ const THashMap<TString, TString>& TSchedulerStrategyHost::GetUserDefaultParentPo
 {
     static THashMap<TString, TString> stub;
     return stub;
+}
+
+bool TSchedulerStrategyHost::IsFairSharePreUpdateOffloadingEnabled() const
+{
+    return true;
 }
 
 } // namespace NYT::NSchedulerSimulator

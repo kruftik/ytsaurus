@@ -12,6 +12,7 @@ YA_IDE_VENV_VAR = 'YA_IDE_VENV'
 PY_NAMESPACE_PREFIX = 'py/namespace'
 BUILTIN_PROTO = 'builtin_proto'
 DEFAULT_FLAKE8_FILE_PROCESSING_TIME = "1.5"  # in seconds
+DEFAULT_BLACK_FILE_PROCESSING_TIME = "1.5"  # in seconds
 
 
 def _split_macro_call(macro_call, data, item_size, chunk_size=1024):
@@ -171,6 +172,7 @@ def add_python_lint_checks(unit, py_ver, files):
             "testenv/",  # CI-3229
             "yt/yt/",  # YT-20053
             "yt/python/",  # YT-20053
+            "yt/python_py2/",
         )
 
         if not upath.startswith(no_lint_allowed_paths):
@@ -216,7 +218,10 @@ def add_python_lint_checks(unit, py_ver, files):
             params = ["ruff", "tools/ruff_linter/bin/ruff_linter"]
             params += ["FILES"] + resolved_files
             params += ["GLOBAL_RESOURCES", resource]
-            configs = [unit.get('RUFF_CONFIG_PATHS_FILE'), 'build/config/tests/ruff/ruff.toml'] + get_ruff_configs(unit)
+            configs = [
+                rootrel_arc_src(unit.get('RUFF_CONFIG_PATHS_FILE'), unit),
+                'build/config/tests/ruff/ruff.toml',
+            ] + get_ruff_configs(unit)
             params += ['CONFIGS'] + configs
             unit.on_add_linter_check(params)
 
@@ -227,6 +232,10 @@ def add_python_lint_checks(unit, py_ver, files):
             params = ['black', 'tools/black_linter/black_linter']
             params += ['FILES'] + resolved_files
             params += ['CONFIGS', black_cfg]
+            params += [
+                "FILE_PROCESSING_TIME",
+                unit.get("BLACK_FILE_PROCESSING_TIME") or DEFAULT_BLACK_FILE_PROCESSING_TIME,
+            ]
             unit.on_add_linter_check(params)
 
 

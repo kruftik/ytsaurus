@@ -25,6 +25,7 @@ public:
     TDuration Period;
 
     i64 WorkerThreadPoolSize;
+    i64 PivotPickerThreadPoolSize;
 
     TDuration ParameterizedTimeoutOnStart;
     TDuration ParameterizedTimeout;
@@ -54,6 +55,7 @@ public:
     bool UseStatisticsReporter;
 
     int MaxParameterizedMoveActionCount;
+    int MaxParameterizedMoveActionHardLimit;
     double ParameterizedNodeDeviationThreshold;
     double ParameterizedCellDeviationThreshold;
     double ParameterizedMinRelativeMetricImprovement;

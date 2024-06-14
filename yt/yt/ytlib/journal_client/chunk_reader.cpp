@@ -43,6 +43,7 @@ namespace {
 
 std::vector<IChunkReaderPtr> CreatePartReaders(
     const TChunkReaderConfigPtr& config,
+    const TRemoteReaderOptionsPtr& remoteReaderOptions,
     const TChunkReaderHostPtr& chunkReaderHost,
     TChunkId chunkId,
     TChunkReplicaWithMediumList replicas)
@@ -54,20 +55,25 @@ std::vector<IChunkReaderPtr> CreatePartReaders(
     SortBy(replicas, [] (auto replica) { return replica.GetReplicaIndex(); });
 
     auto options = New<TRemoteReaderOptions>();
+    options->EnableP2P = remoteReaderOptions->EnableP2P;
+    options->UseProxyingDataNodeService = remoteReaderOptions->UseProxyingDataNodeService;
     options->AllowFetchingSeedsFromMaster = false;
 
     std::vector<IChunkReaderPtr> partReaders;
     for (int replicaIndex = 0; replicaIndex < ChunkReplicaIndexBound; ++replicaIndex) {
         auto partChunkId = EncodeChunkId(TChunkIdWithIndex(chunkId, replicaIndex));
+
         TChunkReplicaWithMediumList partReplicas;
         for (auto replica : replicas) {
             if (replica.GetReplicaIndex() == replicaIndex) {
                 partReplicas.push_back(replica);
             }
         }
+
         if (partReplicas.empty()) {
             continue;
         }
+
         partReaders.push_back(CreateReplicationReader(
             config,
             options,
@@ -114,16 +120,18 @@ class TErasureChunkReader
 public:
     TErasureChunkReader(
         TChunkReaderConfigPtr config,
+        TRemoteReaderOptionsPtr remoteReaderOptions,
         TChunkReaderHostPtr chunkReaderHost,
         TChunkId chunkId,
         NErasure::ICodec* codec,
         const TChunkReplicaWithMediumList& replicas)
         : Config_(std::move(config))
+        , Options_(std::move(remoteReaderOptions))
         , ChunkReaderHost_(std::move(chunkReaderHost))
         , Client_(ChunkReaderHost_->Client)
         , ChunkId_(chunkId)
         , Codec_(codec)
-        , Logger(JournalClientLogger.WithTag("ChunkId: %v", ChunkId_))
+        , Logger(JournalClientLogger().WithTag("ChunkId: %v", ChunkId_))
         , InitialReplicas_(replicas)
     {
         const auto& nodeDirectory = Client_->GetNativeConnection()->GetNodeDirectory();
@@ -154,7 +162,7 @@ public:
             , FirstBlockIndex_(firstBlockIndex)
             , BlockCount_(blockCount)
             , InitialReplicas_(Reader_->InitialReplicas_.Load())
-            , Logger(Reader_->Logger.WithTag("ReadSessionId: %v, ReadBlocksSessionId: %v", Options_.ReadSessionId, TGuid::Create()))
+            , Logger(Reader_->Logger().WithTag("ReadSessionId: %v, ReadBlocksSessionId: %v", Options_.ReadSessionId, TGuid::Create()))
         {
             DoRetry();
         }
@@ -216,6 +224,7 @@ public:
                 Reader_->Codec_,
                 CreatePartReaders(
                     Reader_->Config_,
+                    Reader_->Options_,
                     Reader_->ChunkReaderHost_,
                     DecodeChunkId(Reader_->ChunkId_).Id,
                     replicas.Replicas),
@@ -307,6 +316,7 @@ public:
 
 private:
     const TChunkReaderConfigPtr Config_;
+    const TRemoteReaderOptionsPtr Options_;
     const TChunkReaderHostPtr ChunkReaderHost_;
     const IClientPtr Client_;
     const TChunkId ChunkId_;
@@ -323,6 +333,7 @@ DEFINE_REFCOUNTED_TYPE(TErasureChunkReader)
 
 IChunkReaderPtr CreateChunkReader(
     TChunkReaderConfigPtr config,
+    TRemoteReaderOptionsPtr remoteReaderOptions,
     TChunkReaderHostPtr chunkReaderHost,
     TChunkId chunkId,
     NErasure::ECodec codecId,
@@ -331,13 +342,14 @@ IChunkReaderPtr CreateChunkReader(
     if (codecId == NErasure::ECodec::None) {
         return CreateReplicationReader(
             config,
-            New<TRemoteReaderOptions>(),
+            std::move(remoteReaderOptions),
             std::move(chunkReaderHost),
             chunkId,
             replicas);
     } else {
         return New<TErasureChunkReader>(
             config,
+            std::move(remoteReaderOptions),
             std::move(chunkReaderHost),
             chunkId,
             NErasure::GetCodec(codecId),

@@ -27,7 +27,7 @@ using NVectorHdrf::TJobResources;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const NLogging::TLogger& Logger = SchedulerPoolServerLogger;
+static constexpr auto& Logger = SchedulerPoolServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -223,7 +223,7 @@ void TSchedulerPool::Load(NCellMaster::TLoadContext& context)
                         Id_,
                         key,
                         ConvertToYsonString(value, EYsonFormat::Text),
-                        ConvertToYsonString(SpecifiedAttributes_[internedKey]), EYsonFormat::Text);
+                        ConvertToYsonString(SpecifiedAttributes_[internedKey], EYsonFormat::Text));
                 } else {
                     try {
                         YT_LOG_INFO("Moving pool attribute from common attributes map to SpecifiedAttributes map "

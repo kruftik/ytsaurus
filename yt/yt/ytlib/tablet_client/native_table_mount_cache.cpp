@@ -335,10 +335,12 @@ private:
             auto primarySchema = FromProto<TTableSchemaPtr>(rsp->schema());
             tableInfo->Schemas[ETableSchemaKind::Primary] = primarySchema;
             tableInfo->Schemas[ETableSchemaKind::Write] = primarySchema->ToWrite();
+            tableInfo->Schemas[ETableSchemaKind::WriteViaQueueProducer] = primarySchema->ToWriteViaQueueProducer();
             tableInfo->Schemas[ETableSchemaKind::VersionedWrite] = primarySchema->ToVersionedWrite();
             tableInfo->Schemas[ETableSchemaKind::Delete] = primarySchema->ToDelete();
             tableInfo->Schemas[ETableSchemaKind::Query] = primarySchema->ToQuery();
             tableInfo->Schemas[ETableSchemaKind::Lookup] = primarySchema->ToLookup();
+            tableInfo->Schemas[ETableSchemaKind::Lock] = primarySchema->ToLock();
             tableInfo->Schemas[ETableSchemaKind::PrimaryWithTabletIndex] = primarySchema->WithTabletIndex();
             tableInfo->Schemas[ETableSchemaKind::ReplicationLog] = primarySchema->ToReplicationLog();
 
@@ -398,9 +400,11 @@ private:
 
             tableInfo->Indices.reserve(rsp->indices_size());
             for (const auto& protoIndexInfo : rsp->indices()) {
-                TIndexInfo indexInfo;
-                indexInfo.TableId = FromProto<TObjectId>(protoIndexInfo.index_table_id());
-                indexInfo.Kind = FromProto<ESecondaryIndexKind>(protoIndexInfo.index_kind());
+                TIndexInfo indexInfo{
+                    .TableId = FromProto<TObjectId>(protoIndexInfo.index_table_id()),
+                    .Kind = FromProto<ESecondaryIndexKind>(protoIndexInfo.index_kind()),
+                    .Predicate = YT_PROTO_OPTIONAL(protoIndexInfo, predicate),
+                };
                 tableInfo->Indices.push_back(indexInfo);
             }
 

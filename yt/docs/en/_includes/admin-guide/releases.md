@@ -4,7 +4,7 @@
 
 All main components are releases as a docker image.
 
-**Current release:** 23.2.0 (`ytsaurus/ytsaurus:stable-23.2.0-relwithdebinfo`)
+**Current release:** {{yt-server-version}} (`ytsaurus/ytsaurus:stable-{{yt-server-version}}-relwithdebinfo`)
 
 **All releases:**
 
@@ -141,9 +141,31 @@ Enhancements:
 
 Publishes as docker images.
 
-**Current release:** 0.0.5 (`ytsaurus/query-tracker:0.0.5-ya-build-relwithdebinfo`)
+**Current release:** 0.0.6 (`ytsaurus/query-tracker:0.0.6-relwithdebinfo`)
 
 **All releases:**
+
+{% cut "**0.0.6**" %}
+
+- Fixed authorization in complex cluster-free YQL queries
+- Fixed a bug that caused queries with large queries to never complete
+- Fixed a bag caused possibility of SQL injection in query tracker
+- Reduced the size of query_tracker docker images
+
+**Related issues:**
+- [Problems with QT ACOs](https://github.com/ytsaurus/yt-k8s-operator/issues/176)
+
+In case of an error when starting query
+```
+Access control object "nobody" does not exist
+```
+You need to run commands by admin
+```
+yt create access_control_object_namespace --attr '{name=queries}'
+yt create access_control_object --attr '{namespace=queries;name=nobody}'
+```
+
+{% endcut %}
 
 {% cut "**0.0.5**" %}
 
@@ -191,7 +213,7 @@ NB: This release is compatible only with the operator 0.5.0 and newer versions.
 
 {% cut "**0.0.3**" %}
 
-- Fixed a bug that caused the user transaction to expire before the completion of the yql query on IPv4 only networks. 
+- Fixed a bug that caused the user transaction to expire before the completion of the yql query on IPv4 only networks.
 - System query_tracker tables have been moved to sys bundle
 
 {% endcut %}
@@ -359,7 +381,7 @@ Publishes as docker images.
 
 ## Kubernetes operator
 
-Publishes as a helm-chart on [docker hub](https://hub.docker.com/r/ytsaurus/ytop-chart/tags).
+Publishes as a helm-chart on [Github Packages](https://github.com/ytsaurus/yt-k8s-operator/pkgs/container/ytop-chart).
 
 **Current release:** 0.6.0
 

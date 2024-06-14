@@ -225,7 +225,7 @@ void TCompositeAutomatonPart::LogHandlerError(const TError& error)
 TCompositeAutomaton::TCompositeAutomaton(
     IInvokerPtr asyncSnapshotInvoker,
     TCellId cellId)
-    : Logger(HydraLogger.WithTag("CellId: %v", cellId))
+    : Logger(HydraLogger().WithTag("CellId: %v", cellId))
     , Profiler_(HydraProfiler.WithTag("cell_id", ToString(cellId)))
     , AsyncSnapshotInvoker_(asyncSnapshotInvoker)
     , MutationWaitTimer_(Profiler_.Timer("/mutation_wait_time"))
@@ -236,31 +236,6 @@ TCompositeAutomaton::TCompositeAutomaton(
 void TCompositeAutomaton::SetSerializationDumpEnabled(bool value)
 {
     SerializationDumpEnabled_ = value;
-}
-
-void TCompositeAutomaton::SetLowerWriteCountDumpLimit(i64 lowerLimit)
-{
-    LowerWriteCountDumpLimit_ = lowerLimit;
-}
-
-void TCompositeAutomaton::SetUpperWriteCountDumpLimit(i64 upperLimit)
-{
-    UpperWriteCountDumpLimit_ = upperLimit;
-}
-
-void TCompositeAutomaton::SetEnableTotalWriteCountReport(bool enableTotalWriteCountReport)
-{
-    EnableTotalWriteCountReport_ = enableTotalWriteCountReport;
-}
-
-void TCompositeAutomaton::SetSnapshotValidationOptions(const TSnapshotValidationOptions& options)
-{
-    SetSerializationDumpEnabled(options.SerializationDumpEnabled);
-    if (options.DumpConfig) {
-        SetLowerWriteCountDumpLimit(options.DumpConfig->LowerLimit);
-        SetUpperWriteCountDumpLimit(options.DumpConfig->UpperLimit);
-    }
-    SetEnableTotalWriteCountReport(options.EnableTotalWriteCountReport);
 }
 
 void TCompositeAutomaton::RegisterPart(TCompositeAutomatonPartPtr part)
@@ -285,9 +260,6 @@ void TCompositeAutomaton::RegisterPart(TCompositeAutomatonPartPtr part)
 void TCompositeAutomaton::SetupLoadContext(TLoadContext* context)
 {
     context->Dumper().SetEnabled(SerializationDumpEnabled_);
-    context->Dumper().SetLowerWriteCountDumpLimit(LowerWriteCountDumpLimit_);
-    context->Dumper().SetUpperWriteCountDumpLimit(UpperWriteCountDumpLimit_);
-    context->SetEnableTotalWriteCountReport(EnableTotalWriteCountReport_);
 }
 
 void TCompositeAutomaton::RegisterMethod(
@@ -376,7 +348,7 @@ TFuture<void> TCompositeAutomaton::SaveSnapshot(const TSnapshotSaveContext& cont
 
     // NB: Hold the parts strongly during the async phase.
     return
-        BIND([=, this, this_ = MakeStrong(this), parts_ = GetParts()] () {
+        BIND([=, this, this_ = MakeStrong(this), parts_ = GetParts()] {
             DoSaveSnapshot(
                 writer,
                 context.Logger,
@@ -454,10 +426,6 @@ void TCompositeAutomaton::LoadSnapshot(const TSnapshotLoadContext& context)
                         }
                     }
                 }
-            }
-
-            if (context.GetEnableTotalWriteCountReport()) {
-                context.Dumper().ReportWriteCount();
             }
         });
 }

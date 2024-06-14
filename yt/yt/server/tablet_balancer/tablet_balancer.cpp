@@ -44,7 +44,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletBalancerLogger;
+static constexpr auto& Logger = TabletBalancerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -116,12 +116,15 @@ public:
         const TTabletBalancerDynamicConfigPtr& newConfig) override;
 
 private:
+    using TReshardDescriptorIt = std::vector<TReshardDescriptor>::iterator;
+
     struct TScheduledActionCountLimiter
     {
         THashMap<TGlobalGroupTag, i64> GroupToActionCount;
         i64 GroupLimit;
 
         bool TryIncrease(const TGlobalGroupTag& groupTag);
+        bool CanIncrease(const TGlobalGroupTag& groupTag);
     };
 
     struct TBundleErrors
@@ -139,6 +142,7 @@ private:
 
     THashSet<TGlobalGroupTag> GroupsToMoveOnNextIteration_;
     IThreadPoolPtr WorkerPool_;
+    IThreadPoolPtr PivotPickerPool_;
     IActionManagerPtr ActionManager_;
     TTableRegistryPtr TableRegistry_;
 
@@ -165,6 +169,7 @@ private:
 
     bool IsBalancingAllowed(const TBundleStatePtr& bundleState) const;
     bool TryScheduleActionCreation(const TGlobalGroupTag& groupTag, const TActionDescriptor& descriptor);
+    bool CanScheduleActionCreation(const TGlobalGroupTag& groupTag);
 
     TEventTimer& GetProfilingTimer(const TGlobalGroupTag& groupTag, EBalancingMode type) const;
 
@@ -203,13 +208,20 @@ private:
     void RemoveBundleErrorsByTtl(TDuration ttl) const;
     void RemoveRetryableErrorsOnSuccessfulIteration(const TString& bundleName) const;
 
-    void PickReshardPivotKeysIfNeeded(
+    TFuture<std::vector<TLegacyOwningKey>> PickReshardPivotKeysIfNeeded(
         TReshardDescriptor* descriptor,
         const TTable* table,
         int firstTabletIndex,
         int lastTabletIndex,
         std::optional<double> slicingAccuracy,
         bool enableVerboseLogging) const;
+
+    std::vector<TReshardDescriptor> PickPivotsForDescriptors(
+        TReshardDescriptorIt begin,
+        TReshardDescriptorIt end,
+        const IReshardIterationPtr& reshardIteration,
+        const TBundleStatePtr& bundleState,
+        TGlobalGroupTag groupTag);
 
     TTableParameterizedMetricTrackerPtr GetParameterizedMetricTracker(const TGlobalGroupTag& groupTag);
 };
@@ -230,6 +242,9 @@ TTabletBalancer::TTabletBalancer(
     , WorkerPool_(CreateThreadPool(
         Config_->WorkerThreadPoolSize,
         "TabletBalancer"))
+    , PivotPickerPool_(CreateThreadPool(
+        Config_->PivotPickerThreadPoolSize,
+        "PivotKeysPicker"))
     , TableRegistry_(New<TTableRegistry>())
     , DynamicConfig_(TAtomicIntrusivePtr(New<TTabletBalancerDynamicConfig>()))
     , ParameterizedBalancingScheduler_(
@@ -462,6 +477,16 @@ bool TTabletBalancer::IsBalancingAllowed(const TBundleStatePtr& bundleState) con
 
 bool TTabletBalancer::TScheduledActionCountLimiter::TryIncrease(const TGlobalGroupTag& groupTag)
 {
+    if (!CanIncrease(groupTag)) {
+        return false;
+    }
+
+    ++GroupToActionCount[groupTag];
+    return true;
+}
+
+bool TTabletBalancer::TScheduledActionCountLimiter::CanIncrease(const TGlobalGroupTag& groupTag)
+{
     if (GroupToActionCount[groupTag] >= GroupLimit) {
         YT_LOG_WARNING("Action per iteration limit exceeded (BundleName: %v, Group: %v, Limit: %v)",
             groupTag.first,
@@ -469,9 +494,13 @@ bool TTabletBalancer::TScheduledActionCountLimiter::TryIncrease(const TGlobalGro
             GroupLimit);
         return false;
     }
-
-    ++GroupToActionCount[groupTag];
     return true;
+}
+
+bool TTabletBalancer::CanScheduleActionCreation(
+    const TGlobalGroupTag& groupTag)
+{
+    return ActionCountLimiter_.CanIncrease(groupTag);
 }
 
 bool TTabletBalancer::TryScheduleActionCreation(
@@ -732,7 +761,7 @@ void TTabletBalancer::BalanceViaMoveInMemory(const TBundleStatePtr& bundleState)
             bundleState->GetBundle(),
             /*movableTables*/ std::nullopt,
             /*ignoreTableWiseConfig*/ false,
-            Logger)
+            Logger())
         .AsyncVia(WorkerPool_->GetInvoker())
         .Run())
         .ValueOrThrow();
@@ -792,7 +821,7 @@ void TTabletBalancer::BalanceViaMoveOrdinary(const TBundleStatePtr& bundleState)
             ReassignOrdinaryTablets,
             bundleState->GetBundle(),
             /*movableTables*/ std::nullopt,
-            Logger)
+            Logger())
         .AsyncVia(WorkerPool_->GetInvoker())
         .Run())
         .ValueOrThrow();
@@ -862,10 +891,12 @@ void TTabletBalancer::BalanceViaMoveParameterized(const TBundleStatePtr& bundleS
                 .CellDeviationThreshold = dynamicConfig->ParameterizedCellDeviationThreshold,
                 .MinRelativeMetricImprovement = dynamicConfig->ParameterizedMinRelativeMetricImprovement,
                 .Metric = dynamicConfig->DefaultParameterizedMetric,
-            }.MergeWith(groupConfig->Parameterized),
+            }.MergeWith(
+                groupConfig->Parameterized,
+                std::min(dynamicConfig->MaxActionsPerGroup, dynamicConfig->MaxParameterizedMoveActionHardLimit)),
             groupName,
             metricTracker,
-            Logger)
+            Logger())
         .AsyncVia(WorkerPool_->GetInvoker())
         .Run())
         .ValueOrThrow();
@@ -928,7 +959,7 @@ void TTabletBalancer::TryBalanceViaMoveParameterized(const TBundleStatePtr& bund
         const auto& groupConfig = GetOrCrash(bundle->Config->Groups, groupName);
         YT_LOG_ERROR(ex,
             "Parameterized balancing via move failed with an exception "
-            "(BundleName: %v, Group: %v, GroupType: %lv, GroupMetric: %v)",
+            "(BundleName: %v, Group: %v, GroupType: %v, GroupMetric: %v)",
             bundle->Name,
             groupName,
             groupConfig->Type,
@@ -957,7 +988,7 @@ void TTabletBalancer::TryBalanceViaReshardParameterized(
         const auto& groupConfig = GetOrCrash(bundle->Config->Groups, groupName);
         YT_LOG_ERROR(ex,
             "Parameterized balancing via reshard failed with an exception "
-            "(BundleName: %v, Group: %v, GroupType: %lv, GroupMetric: %v)",
+            "(BundleName: %v, Group: %v, GroupType: %v, GroupMetric: %v)",
             bundle->Name,
             groupName,
             groupConfig->Type,
@@ -1011,9 +1042,6 @@ void TTabletBalancer::ExecuteReshardIteration(
     int actionCount = 0;
     auto groupTag = TGlobalGroupTag(reshardIteration->GetBundleName(), reshardIteration->GetGroupName());
 
-    bool enableVerboseLogging = reshardIteration->GetDynamicConfig()->EnableReshardVerboseLogging ||
-        bundleState->GetBundle()->Config->EnableVerboseLogging;
-
     std::vector<TReshardDescriptor> descriptors;
     for (const auto& table : tables) {
         if (!reshardIteration->IsTableBalancingEnabled(table)) {
@@ -1032,7 +1060,7 @@ void TTabletBalancer::ExecuteReshardIteration(
 
     auto descriptorRanges = [&]<class It>(It begin, It end) {
         std::vector<std::pair<It, It>> ranges;
-        auto firstSplit = std::find_if(begin, end, [](const auto& descriptor) {
+        auto firstSplit = std::find_if(begin, end, [] (const auto& descriptor) {
             return std::get<0>(descriptor.Priority);
         });
 
@@ -1045,10 +1073,29 @@ void TTabletBalancer::ExecuteReshardIteration(
         return ranges;
     } (descriptors.begin(), descriptors.end());
 
-    int actionLimit = reshardIteration->GetDynamicConfig()->MaxActionsPerGroup;
+    int actionCountLimit = reshardIteration->GetDynamicConfig()->MaxActionsPerGroup;
     if (descriptorRanges.size() > 1) {
-        actionLimit = reshardIteration->GetDynamicConfig()->MaxActionsPerReshardType;
+        actionCountLimit = std::min(
+            DivCeil<int>(actionCountLimit, std::ssize(descriptorRanges)),
+            reshardIteration->GetDynamicConfig()->MaxActionsPerReshardType);
     }
+
+    auto saveLimitExceededError = [&] (const TReshardDescriptor& descriptor, auto limit) {
+        SaveFatalBundleError(groupTag.first, TError(
+            EErrorCode::GroupActionLimitExceeded,
+            "Group %Qv has exceeded the limit for creating actions. "
+            "Failed to schedule reshard action",
+            groupTag.second)
+            << TErrorAttribute("limit", limit));
+
+        YT_LOG_DEBUG("Group has exceeded the limit for creating actions. "
+            "Will not schedule reshard actions anymore "
+            "(Group: %v, Limit: %v, CorrelationId: %v, BundleName: %v)",
+            groupTag.second,
+            limit,
+            descriptor.CorrelationId,
+            groupTag.first);
+    };
 
     bool actionLimitExceeded = false;
     for (auto [beginIt, endIt] : descriptorRanges) {
@@ -1056,90 +1103,46 @@ void TTabletBalancer::ExecuteReshardIteration(
             break;
         }
 
-        int actionTypeCount = 0;
-        for (auto descriptorIt = beginIt; descriptorIt < endIt && actionTypeCount < actionLimit; ++descriptorIt) {
-            auto firstTablet = GetOrCrash(bundleState->Tablets(), descriptorIt->Tablets[0]);
-            auto table = firstTablet->Table;
+        if (std::distance(beginIt, endIt) > actionCountLimit) {
+            endIt = beginIt + actionCountLimit;
+            saveLimitExceededError(*endIt, actionCountLimit);
+        }
+
+        auto limitedDescriptors = PickPivotsForDescriptors(
+            beginIt,
+            endIt,
+            reshardIteration,
+            bundleState,
+            groupTag);
+
+        for (const auto& descriptor : limitedDescriptors) {
+            auto firstTablet = GetOrCrash(bundleState->Tablets(), descriptor.Tablets[0]);
+            auto* table = firstTablet->Table;
             auto firstTabletIndex = firstTablet->Index;
-            auto lastTabletIndex = firstTablet->Index + std::ssize(descriptorIt->Tablets) - 1;
+            auto lastTabletIndex = firstTabletIndex + std::ssize(descriptor.Tablets) - 1;
 
-            if (reshardIteration->GetDynamicConfig()->PickReshardPivotKeys) {
-                try {
-                    PickReshardPivotKeysIfNeeded(
-                        descriptorIt,
-                        table,
-                        firstTabletIndex,
-                        lastTabletIndex,
-                        reshardIteration->GetDynamicConfig()->ReshardSlicingAccuracy,
-                        enableVerboseLogging);
-                } catch (const std::exception& ex) {
-                    YT_LOG_ERROR(ex,
-                        "Failed to pick pivot keys for reshard action "
-                        "(TabletIds: %v, TabletCount: %v, DataSize: %v, "
-                        "TableId: %v, TabletIndexes: %v-%v, CorrelationId: %v)",
-                        descriptorIt->Tablets,
-                        descriptorIt->TabletCount,
-                        descriptorIt->DataSize,
-                        table->Id,
-                        firstTabletIndex,
-                        lastTabletIndex,
-                        descriptorIt->CorrelationId);
-
-                    PickPivotFailures_.Increment(1);
-
-                    if (reshardIteration->GetDynamicConfig()->CancelActionIfPickPivotKeysFails) {
-                        YT_LOG_DEBUG(ex,
-                            "Cancelled tablet action creation because pick pivot keys failed "
-                            "(TabletIds: %v, TabletCount: %v, DataSize: %v, TableId: %v, "
-                            "TabletIndexes: %v-%v, CorrelationId: %v)",
-                            descriptorIt->Tablets,
-                            descriptorIt->TabletCount,
-                            descriptorIt->DataSize,
-                            table->Id,
-                            firstTabletIndex,
-                            lastTabletIndex,
-                            descriptorIt->CorrelationId);
-                        continue;
-                    }
-                }
-            }
-
-            if (!TryScheduleActionCreation(groupTag, {*descriptorIt})) {
-                SaveFatalBundleError(groupTag.first, TError(
-                    EErrorCode::GroupActionLimitExceeded,
-                    "Group %Qv has exceeded the limit for creating actions. "
-                    "Failed to schedule reshard action",
-                    groupTag.second)
-                    << TErrorAttribute("limit", ActionCountLimiter_.GroupLimit));
-
+            if (!TryScheduleActionCreation(groupTag, {descriptor})) {
+                saveLimitExceededError(descriptor, ActionCountLimiter_.GroupLimit);
                 actionLimitExceeded = true;
-                YT_LOG_DEBUG("Group has exceeded the limit for creating actions. "
-                    "Will not schedule reshard actions anymore "
-                    "(Group: %v, Limit: %v, CorrelationId: %v, BundleName: %v)",
-                    groupTag.second,
-                    ActionCountLimiter_.GroupLimit,
-                    descriptorIt->CorrelationId,
-                    bundleState->GetBundle()->Name);
                 break;
             }
 
             ++actionCount;
-            ++actionTypeCount;
             YT_LOG_DEBUG("Reshard action created (TabletIds: %v, TabletCount: %v, "
                 "DataSize: %v, TableId: %v, TabletIndexes: %v-%v, TablePath: %v, CorrelationId: %v)",
-                descriptorIt->Tablets,
-                descriptorIt->TabletCount,
-                descriptorIt->DataSize,
+                descriptor.Tablets,
+                descriptor.TabletCount,
+                descriptor.DataSize,
                 table->Id,
                 firstTabletIndex,
                 lastTabletIndex,
                 table->Path,
-                descriptorIt->CorrelationId);
+                descriptor.CorrelationId);
 
             reshardIteration->UpdateProfilingCounters(
                 table,
                 bundleState->GetProfilingCounters(table, reshardIteration->GetGroupName()),
-                *descriptorIt);
+                descriptor);
         }
     }
 
@@ -1149,6 +1152,104 @@ void TTabletBalancer::ExecuteReshardIteration(
     }
 
     reshardIteration->FinishIteration(actionCount);
+}
+
+std::vector<TReshardDescriptor> TTabletBalancer::PickPivotsForDescriptors(
+    TReshardDescriptorIt begin,
+    TReshardDescriptorIt end,
+    const IReshardIterationPtr& reshardIteration,
+    const TBundleStatePtr& bundleState,
+    TGlobalGroupTag groupTag)
+{
+    bool pickPivotKeys = reshardIteration->IsPickPivotKeysEnabled(bundleState->GetBundle()->Config);
+    if (!pickPivotKeys) {
+        return {begin, end};
+    }
+
+    bool enableVerboseLogging = reshardIteration->GetDynamicConfig()->EnableReshardVerboseLogging ||
+        bundleState->GetBundle()->Config->EnableVerboseLogging;
+
+    std::vector<TFuture<std::vector<TLegacyOwningKey>>> futures;
+    std::vector<TReshardDescriptor> descriptors;
+    std::vector<TReshardDescriptorIt> descriptorsToPick;
+    std::vector<const TTablet*> firstTablets;
+    for (auto descriptorIt = begin; descriptorIt < end; ++descriptorIt) {
+        if (pickPivotKeys) {
+            auto firstTablet = GetOrCrash(bundleState->Tablets(), descriptorIt->Tablets[0]);
+            auto future = PickReshardPivotKeysIfNeeded(
+                descriptorIt,
+                firstTablet->Table,
+                firstTablet->Index,
+                firstTablet->Index + std::ssize(descriptorIt->Tablets) - 1,
+                reshardIteration->GetDynamicConfig()->ReshardSlicingAccuracy,
+                enableVerboseLogging);
+
+            if (future) {
+                futures.emplace_back(std::move(future));
+                firstTablets.emplace_back(firstTablet.Get());
+                descriptorsToPick.push_back(descriptorIt);
+                continue;
+            }
+        }
+
+        descriptors.emplace_back(std::move(*descriptorIt));
+    }
+
+    YT_LOG_DEBUG("Pick pivot keys started (BundleName: %v, Group: %v, DescriptorsToPickCount: %v)",
+        groupTag.first,
+        groupTag.second,
+        std::ssize(descriptorsToPick));
+
+    auto responses = WaitFor(AllSet(std::move(futures))).ValueOrThrow();
+
+    YT_LOG_DEBUG("Pick pivot keys finished (BundleName: %v, Group: %v)",
+        groupTag.first,
+        groupTag.second);
+
+    for (int index = 0; index < std::ssize(descriptorsToPick); ++index) {
+        auto descriptorIt = descriptorsToPick[index];
+        auto* firstTablet = firstTablets[index];
+        auto* table = firstTablet->Table;
+        auto firstTabletIndex = firstTablet->Index;
+        auto lastTabletIndex = firstTabletIndex + std::ssize(descriptorIt->Tablets) - 1;
+        auto rspOrError = responses[index];
+
+        if (!rspOrError.IsOK()) {
+            YT_LOG_ERROR(rspOrError,
+                "Failed to pick pivot keys for reshard action "
+                "(TabletIds: %v, TabletCount: %v, DataSize: %v, "
+                "TableId: %v, TabletIndexes: %v-%v, CorrelationId: %v)",
+                descriptorIt->Tablets,
+                descriptorIt->TabletCount,
+                descriptorIt->DataSize,
+                table->Id,
+                firstTabletIndex,
+                lastTabletIndex,
+                descriptorIt->CorrelationId);
+
+            PickPivotFailures_.Increment(1);
+
+            if (reshardIteration->GetDynamicConfig()->CancelActionIfPickPivotKeysFails) {
+                YT_LOG_DEBUG(rspOrError,
+                    "Cancelled tablet action creation because pick pivot keys failed "
+                    "(TabletIds: %v, TabletCount: %v, DataSize: %v, TableId: %v, "
+                    "TabletIndexes: %v-%v, CorrelationId: %v)",
+                    descriptorIt->Tablets,
+                    descriptorIt->TabletCount,
+                    descriptorIt->DataSize,
+                    table->Id,
+                    firstTabletIndex,
+                    lastTabletIndex,
+                    descriptorIt->CorrelationId);
+                continue;
+            }
+        } else {
+            descriptorIt->PivotKeys = std::move(rspOrError.ValueOrThrow());
+        }
+
+        descriptors.emplace_back(std::move(*descriptorIt));
+    }
+    return descriptors;
 }
 
 void TTabletBalancer::BalanceViaReshard(const TBundleStatePtr& bundleState, const TGroupName& groupName)
@@ -1218,7 +1319,7 @@ void TTabletBalancer::RemoveRetryableErrorsOnSuccessfulIteration(const TString& 
     }
 }
 
-void TTabletBalancer::PickReshardPivotKeysIfNeeded(
+TFuture<std::vector<TLegacyOwningKey>> TTabletBalancer::PickReshardPivotKeysIfNeeded(
     TReshardDescriptor* descriptor,
     const TTable* table,
     int firstTabletIndex,
@@ -1232,7 +1333,7 @@ void TTabletBalancer::PickReshardPivotKeysIfNeeded(
         YT_LOG_DEBUG_IF(enableVerboseLogging,
             "Skip picking pivot keys because this is a merge action (CorrelationId: %v)",
             descriptor->CorrelationId);
-        return;
+        return {};
     }
 
     auto options = TReshardTableOptions{
@@ -1257,16 +1358,19 @@ void TTabletBalancer::PickReshardPivotKeysIfNeeded(
             partitionCount,
             descriptor->TabletCount,
             descriptor->CorrelationId);
-        return;
+        return {};
     }
 
-    descriptor->PivotKeys = PickPivotKeysWithSlicing(
+    return BIND(
+        PickPivotKeysWithSlicing,
         Bootstrap_->GetClient(),
         table->Path,
         descriptor->TabletCount,
         options,
-        Logger,
-        enableVerboseLogging || table->TableConfig->EnableVerboseLogging);
+        Logger(),
+        enableVerboseLogging || table->TableConfig->EnableVerboseLogging)
+        .AsyncVia(PivotPickerPool_->GetInvoker())
+        .Run();
 }
 
 TTableParameterizedMetricTrackerPtr TTabletBalancer::GetParameterizedMetricTracker(

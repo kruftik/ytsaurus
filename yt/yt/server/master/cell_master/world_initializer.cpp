@@ -76,7 +76,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CellMasterLogger;
+static constexpr auto& Logger = CellMasterLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -689,14 +689,19 @@ private:
                 EObjectType::MediumMap);
 
             ScheduleCreateNode(
-                "//sys/transactions",
+                "//sys/foreign_transactions",
                 transactionId,
-                EObjectType::TransactionMap);
+                EObjectType::ForeignTransactionMap);
 
             ScheduleCreateNode(
                 "//sys/topmost_transactions",
                 transactionId,
                 EObjectType::TopmostTransactionMap);
+
+            ScheduleCreateNode(
+                "//sys/transactions",
+                transactionId,
+                EObjectType::TransactionMap);
 
             ScheduleCreateNode(
                 "//sys/accounts",
@@ -1099,7 +1104,7 @@ private:
         return NYTree::ExecuteVerb(
             service,
             request,
-            ObjectServerLogger,
+            ObjectServerLogger(),
             NLogging::ELogLevel::Debug);
     }
 

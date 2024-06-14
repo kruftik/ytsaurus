@@ -54,7 +54,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ClusterDiscoveryServerLogger;
+static constexpr auto& Logger = ClusterDiscoveryServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -67,9 +67,9 @@ public:
 
     {
         if (Config_->AbortOnUnrecognizedOptions) {
-            AbortOnUnrecognizedOptions(Logger, Config_);
+            AbortOnUnrecognizedOptions(Logger(), Config_);
         } else {
-            WarnForUnrecognizedOptions(Logger, Config_);
+            WarnForUnrecognizedOptions(Logger(), Config_);
         }
     }
 
@@ -157,10 +157,12 @@ private:
             &MonitoringManager_,
             &OrchidRoot_);
 
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/config",
-            ConvertTo<INodePtr>(Config_));
+        if (Config_->ExposeConfigInOrchid) {
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/config",
+                ConvertTo<INodePtr>(Config_));
+        }
         SetNodeByYPath(
             OrchidRoot_,
             "/discovery_server",

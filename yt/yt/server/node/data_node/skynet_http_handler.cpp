@@ -2,10 +2,9 @@
 
 #include "bootstrap.h"
 #include "local_chunk_reader.h"
+#include "chunk.h"
+#include "chunk_store.h"
 #include "chunk_meta_manager.h"
-
-#include <yt/yt/server/node/data_node/chunk_store.h>
-#include <yt/yt/server/node/data_node/chunk.h>
 
 #include <yt/yt/server/node/cluster_node/config.h>
 
@@ -43,7 +42,7 @@ using NChunkClient::NProto::TMiscExt;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static inline const NLogging::TLogger Logger("SkynetHandler");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "SkynetHandler");
 
 ////////////////////////////////////////////////////////////////////////////////
 

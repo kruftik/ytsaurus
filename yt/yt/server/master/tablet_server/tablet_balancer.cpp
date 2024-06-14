@@ -42,7 +42,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletServerLogger;
+static constexpr auto& Logger = TabletServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -340,7 +340,7 @@ private:
 
         const auto& hydraManager = Bootstrap_->GetHydraFacade()->GetHydraManager();
         YT_UNUSED_FUTURE(CreateMutation(hydraManager, request)
-            ->CommitAndLog(Logger));
+            ->CommitAndLog(Logger()));
     }
 
     void CreateReshardAction(const std::vector<TTablet*>& tablets, int newTabletCount, i64 size)
@@ -371,7 +371,7 @@ private:
 
         const auto& hydraManager = Bootstrap_->GetHydraFacade()->GetHydraManager();
         YT_UNUSED_FUTURE(CreateMutation(hydraManager, request)
-            ->CommitAndLog(Logger));
+            ->CommitAndLog(Logger()));
     }
 
     int ApplyMoveActions()
@@ -397,8 +397,7 @@ private:
         auto descriptors = NTabletServer::ReassignInMemoryTablets(
             bundle,
             /*movableTablets*/ std::nullopt,
-            /*ignoreTableWiseConfig*/ false
-        );
+            /*ignoreTableWiseConfig*/ false);
 
         if (!descriptors.empty()) {
             for (auto descriptor : descriptors) {
@@ -506,7 +505,7 @@ private:
         std::sort(
             cellTablets.begin(),
             cellTablets.end(),
-            [](const auto& lhs, const auto& rhs) {
+            [] (const auto& lhs, const auto& rhs) {
                 return lhs.second.size() > rhs.second.size();
             });
 

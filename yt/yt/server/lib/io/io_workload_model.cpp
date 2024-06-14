@@ -514,6 +514,16 @@ public:
         return Underlying_->UseDirectIOForReads();
     }
 
+    bool IsReadInFlightRequestLimitExceeded() const override
+    {
+        return Underlying_->IsReadInFlightRequestLimitExceeded();
+    }
+
+    bool IsWriteInFlightRequestLimitExceeded() const override
+    {
+        return Underlying_->IsWriteInFlightRequestLimitExceeded();
+    }
+
 private:
     const IIOEnginePtr Underlying_;
     const NLogging::TLogger Logger;

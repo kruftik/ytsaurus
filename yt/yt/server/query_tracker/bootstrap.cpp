@@ -1,8 +1,10 @@
 #include "bootstrap.h"
 
 #include "query_tracker.h"
+#include "query_tracker_proxy.h"
 #include "config.h"
 #include "private.h"
+#include "proxy_service.h"
 #include "dynamic_config_manager.h"
 
 #include <yt/yt/server/lib/admin/admin_service.h>
@@ -11,6 +13,8 @@
 
 #include <yt/yt/server/lib/cypress_registrar/config.h>
 #include <yt/yt/server/lib/cypress_registrar/cypress_registrar.h>
+
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
 
 #include <yt/yt/ytlib/query_tracker_client/records/query.record.h>
 
@@ -81,7 +85,7 @@ using namespace NTableClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = QueryTrackerLogger;
+static constexpr auto& Logger = QueryTrackerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -90,9 +94,9 @@ TBootstrap::TBootstrap(TQueryTrackerServerConfigPtr config, INodePtr configNode)
     , ConfigNode_(std::move(configNode))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 }
 
@@ -102,6 +106,9 @@ void TBootstrap::Run()
 {
     ControlQueue_ = New<TActionQueue>("Control");
     ControlInvoker_ = ControlQueue_->GetInvoker();
+
+    ProxyPool_ = CreateThreadPool(Config_->ProxyThreadPoolSize, "Proxy");
+    ProxyInvoker_ = ProxyPool_->GetInvoker();
 
     BIND(&TBootstrap::DoRun, this)
         .AsyncVia(ControlInvoker_)
@@ -128,12 +135,13 @@ void TBootstrap::DoRun()
         std::move(connectionOptions));
 
     NativeConnection_->GetClusterDirectorySynchronizer()->Start();
+    NativeConnection_->GetMasterCellDirectorySynchronizer()->Start();
 
     SetupClusterConnectionDynamicConfigUpdate(
         NativeConnection_,
         NApi::NNative::EClusterConnectionDynamicConfigPolicy::FromClusterDirectory,
         /*staticClusterConnectionNode*/ nullptr,
-        Logger);
+        Logger());
 
     NativeAuthenticator_ = NNative::CreateNativeAuthenticator(NativeConnection_);
 
@@ -149,7 +157,7 @@ void TBootstrap::DoRun()
 
     HttpServer_ = NHttp::CreateServer(Config_->CreateMonitoringHttpServerConfig());
 
-    AlertManager_ = CreateAlertManager(QueryTrackerLogger, TProfiler{}, ControlInvoker_);
+    AlertManager_ = CreateAlertManager(QueryTrackerLogger(), TProfiler{}, ControlInvoker_);
 
     if (Config_->CoreDumper) {
         CoreDumper_ = NCoreDump::CreateCoreDumper(Config_->CoreDumper);
@@ -171,14 +179,16 @@ void TBootstrap::DoRun()
         orchidRoot,
         "/alerts",
         CreateVirtualNode(AlertManager_->GetOrchidService()));
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
-    SetNodeByYPath(
-        orchidRoot,
-        "/dynamic_config_manager",
-        CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+        SetNodeByYPath(
+            orchidRoot,
+            "/dynamic_config_manager",
+            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+    }
     if (CoreDumper_) {
         SetNodeByYPath(
             orchidRoot,
@@ -189,6 +199,11 @@ void TBootstrap::DoRun()
         orchidRoot,
         "query_tracker");
 
+    QueryTrackerProxy_ = CreateQueryTrackerProxy(
+        NativeClient_,
+        Config_->Root,
+        DynamicConfigManager_->GetConfig()->QueryTracker->ProxyConfig);
+
     RpcServer_->RegisterService(CreateAdminService(
         ControlInvoker_,
         CoreDumper_,
@@ -197,6 +212,9 @@ void TBootstrap::DoRun()
         orchidRoot,
         ControlInvoker_,
         NativeAuthenticator_));
+    RpcServer_->RegisterService(CreateProxyService(
+        ProxyInvoker_,
+        QueryTrackerProxy_));
 
     QueryTracker_ = CreateQueryTracker(
         DynamicConfigManager_->GetConfig()->QueryTracker,
@@ -261,6 +279,9 @@ void TBootstrap::OnDynamicConfigChanged(
     }
     if (QueryTracker_) {
         QueryTracker_->Reconfigure(newConfig->QueryTracker);
+    }
+    if (QueryTrackerProxy_) {
+        QueryTrackerProxy_->Reconfigure(newConfig->QueryTracker->ProxyConfig);
     }
 
     YT_LOG_DEBUG(

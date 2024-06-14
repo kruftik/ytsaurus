@@ -93,6 +93,7 @@ public:
     bool IsPrimaryMaster() const;
     bool IsSecondaryMaster() const;
     bool IsMulticell() const;
+    bool IsDynamicallyPropagatedMaster() const;
 
     void VerifyPersistentStateRead() const;
 
@@ -103,9 +104,11 @@ public:
     NObjectClient::TCellTag GetPrimaryCellTag() const;
 
     const NObjectClient::TCellTagList& GetSecondaryCellTags() const;
+    const THashSet<NObjectClient::TCellTag>& GetDynamicallyPropagatedMastersCellTags() const;
 
     const IAlertManagerPtr& GetAlertManager() const;
     const IConfigManagerPtr& GetConfigManager() const;
+    const TDynamicClusterConfigPtr& GetDynamicConfig() const;
     const IMulticellManagerPtr& GetMulticellManager() const;
     const NIncumbentServer::IIncumbentManagerPtr& GetIncumbentManager() const;
     const NRpc::IServerPtr& GetRpcServer() const;
@@ -170,9 +173,7 @@ public:
     void Run();
     void LoadSnapshotOrThrow(
         const TString& fileName,
-        bool dump,
-        bool EnableTotalWriteCountReport,
-        const TString& dumpConfigString);
+        bool dump);
 
     void ReplayChangelogsOrThrow(std::vector<TString> changelogFileNames);
 
@@ -275,21 +276,13 @@ protected:
     void DoRun();
     void DoLoadSnapshot(
         const TString& fileName,
-        bool dump,
-        bool enableTotalWriteCountReport,
-        const NHydra::TSerializationDumperConfigPtr& dumpConfig);
+        bool dump);
 
     void DoReplayChangelogs(const std::vector<TString>& changelogFileNames);
 
     void DoBuildSnapshot();
 
     void DoFinishDryRun();
-
-    void ValidateLoadSnapshotParameters(
-        bool dump,
-        bool enableTotalWriteCountReport,
-        const TString& dumpConfigString,
-        NHydra::TSerializationDumperConfigPtr* dumpConfig);
 
     void OnDynamicConfigChanged(const TDynamicClusterConfigPtr& oldConfig);
 };

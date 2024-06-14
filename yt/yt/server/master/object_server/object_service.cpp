@@ -20,6 +20,8 @@
 #include <yt/yt/server/master/security_server/security_manager.h>
 #include <yt/yt/server/master/security_server/user.h>
 
+#include <yt/yt/server/master/sequoia_server/config.h>
+
 #include <yt/yt/server/master/transaction_server/transaction_replication_session.h>
 
 #include <yt/yt/server/master/transaction_server/proto/transaction_manager.pb.h>
@@ -27,6 +29,8 @@
 #include <yt/yt/server/lib/hive/hive_manager.h>
 
 #include <yt/yt/server/lib/transaction_server/helpers.h>
+
+#include <yt/yt/server/lib/transaction_supervisor/transaction_supervisor.h>
 
 #include <yt/yt/ytlib/cypress_client/rpc_helpers.h>
 
@@ -160,13 +164,13 @@ public:
             NObjectClient::TObjectServiceProxy::GetDescriptor(),
             // Execute method is being handled in RPC thread pool anyway.
             EAutomatonThreadQueue::ObjectService,
-            ObjectServerLogger)
+            ObjectServerLogger())
         , Config_(std::move(config))
         , AutomatonInvoker_(Bootstrap_->GetHydraFacade()->GetAutomatonInvoker(EAutomatonThreadQueue::ObjectService))
         , Cache_(New<TObjectServiceCache>(
             Config_->MasterCache,
             GetNullMemoryUsageTracker(),
-            ObjectServerLogger,
+            ObjectServerLogger(),
             ObjectServerProfiler.WithPrefix("/object_service_cache")))
         , ProcessSessionsExecutor_(New<TPeriodicExecutor>(
             AutomatonInvoker_,
@@ -278,6 +282,7 @@ private:
     TStickyUserErrorCache StickyUserErrorCache_;
     std::atomic<bool> EnableTwoLevelCache_ = false;
     std::atomic<bool> EnableLocalReadExecutor_ = true;
+    std::atomic<bool> EnableCypressTransactionsInSequoia_ = false;
     std::atomic<TDuration> ScheduleReplyRetryBackoff_ = TDuration::MilliSeconds(100);
 
     static IInvokerPtr GetRpcInvoker()
@@ -556,7 +561,7 @@ private:
 
     DECLARE_THREAD_AFFINITY_SLOT(AutomatonThread);
 
-    const NLogging::TLogger& Logger = ObjectServerLogger;
+    const NLogging::TLogger& Logger = ObjectServerLogger();
 
 
     void GuardedRunRpc()
@@ -886,11 +891,17 @@ private:
                 cellTags);
         }
 
+        // NB: we always have to wait all current prepared transactions to
+        // observe side effects of Sequoia transactions.
+        const auto& transactionSupervisor = Bootstrap_->GetTransactionSupervisor();
+        std::vector<TFuture<void>> additionalFutures = {
+            transactionSupervisor->WaitUntilPreparedTransactionsFinished(),
+        };
         if (additionalFuture) {
-            return CellSyncSession_->Sync(cellTags, std::move(additionalFuture));
-        } else {
-            return CellSyncSession_->Sync(cellTags);
+            additionalFutures.push_back(std::move(additionalFuture));
         }
+
+        return CellSyncSession_->Sync(cellTags, std::move(additionalFutures));
     }
 
     void RunSyncPhaseOne()
@@ -946,7 +957,7 @@ private:
 
         subrequest->RpcContext = CreateYPathContext(
             subrequest->RequestMessage,
-            ObjectServerLogger,
+            ObjectServerLogger(),
             NLogging::ELogLevel::Debug);
 
         if (mutating) {
@@ -1148,6 +1159,7 @@ private:
                         Bootstrap_,
                         std::move(writeSubrequestTransactions),
                         TInitiatorRequestLogInfo(RequestId_, subrequestIndex),
+                        Owner_->EnableCypressTransactionsInSequoia_.load(std::memory_order::acquire),
                         std::move(subrequest.Mutation));
                 } else {
                     // Pre-phase-two.
@@ -1166,7 +1178,8 @@ private:
             RemoteTransactionReplicationSession_ = New<TTransactionReplicationSessionWithoutBoomerangs>(
                 Bootstrap_,
                 std::move(transactionsToReplicateWithoutBoomerangs),
-                TInitiatorRequestLogInfo(RequestId_));
+                TInitiatorRequestLogInfo(RequestId_),
+                Owner_->EnableCypressTransactionsInSequoia_.load(std::memory_order::acquire));
         } else {
             // Pre-phase-two.
             RemoteTransactionReplicationSession_->Reset(std::move(transactionsToReplicateWithoutBoomerangs));
@@ -1528,6 +1541,10 @@ private:
                     .ApplyTo(ReadRequestComplexityLimits_->Max);
             }
         }
+
+        User_->AlertIfPendingRemoval(
+            Format("User pending for removal has accessed object service (User: %v)",
+            User_->GetName()));
 
         if (NeedsUserAccessValidation_) {
             NeedsUserAccessValidation_ = false;
@@ -2285,6 +2302,11 @@ void TObjectService::OnDynamicConfigChanged(TDynamicClusterConfigPtr /*oldConfig
     EnableTwoLevelCache_ = config->EnableTwoLevelCache;
     EnableLocalReadExecutor_ = config->EnableLocalReadExecutor && Config_->EnableLocalReadExecutor;
     ScheduleReplyRetryBackoff_ = config->ScheduleReplyRetryBackoff;
+
+    const auto& sequoiaConfig = Bootstrap_->GetConfigManager()->GetConfig()->SequoiaManager;
+    EnableCypressTransactionsInSequoia_.store(
+        sequoiaConfig->Enable && sequoiaConfig->EnableCypressTransactionsInSequoia,
+        std::memory_order::release);
 
     LocalReadExecutor_->Reconfigure(config->LocalReadWorkerCount);
     LocalReadOffloadPool_->Configure(config->LocalReadOffloadThreadCount);

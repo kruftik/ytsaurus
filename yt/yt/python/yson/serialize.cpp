@@ -136,7 +136,7 @@ void SerializeMapFragment(
     }
 
     auto onItem = [&] (PyObject* item) {
-        auto itemGuard = Finally([item] () { Py::_XDECREF(item); });
+        auto itemGuard = Finally([item] { Py::_XDECREF(item); });
 
         auto key = Py::Object(PyTuple_GetItem(item, 0), false);
         auto value = Py::Object(PyTuple_GetItem(item, 1), false);
@@ -199,8 +199,7 @@ void SerializePythonInteger(const Py::Object& obj, IYsonConsumer* consumer, TCon
         throw CreateYsonError(
             Format(
                 "Integer %v cannot be serialized to YSON since it is out of range [-2^63, 2^64 - 1]",
-                Py::Repr(obj)
-            ),
+                Py::Repr(obj)),
             context);
     }
 
@@ -367,8 +366,7 @@ void Serialize(
             Format(
                 "Value %v cannot be serialized to YSON since it has unsupported type %Qv",
                 Py::Repr(obj),
-                Py::Repr(obj.type())
-            ),
+                Py::Repr(obj.type())),
             context);
     }
 }

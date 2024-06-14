@@ -61,6 +61,12 @@ void ValidateSuperuserOnAttributeModification(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+int GetAccountShardIndex(TAccountId accountId);
+
+int GetAccountProfilingBucketIndex(TAccountId accountId);
+
+////////////////////////////////////////////////////////////////////////////////
+
 } // namespace NYT::NSecurityServer
 
 #define HELPERS_INL_H_

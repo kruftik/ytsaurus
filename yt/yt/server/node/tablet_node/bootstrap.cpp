@@ -1,6 +1,7 @@
 #include "bootstrap.h"
 
 #include "backing_store_cleaner.h"
+#include "chunk_replica_cache_pinger.h"
 #include "compression_dictionary_builder.h"
 #include "compression_dictionary_manager.h"
 #include "error_manager.h"
@@ -79,7 +80,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 static const TString BusXferThreadPoolName = "BusXfer";
 static const TString CompressionThreadPoolName = "Compression";
@@ -101,7 +102,7 @@ public:
         IInvokerPtr invoker)
         : TAsyncExpiringCache(
             std::move(config),
-            TabletNodeLogger.WithTag("Cache: PoolWeight"))
+            TabletNodeLogger().WithTag("Cache: PoolWeight"))
         , Client_(std::move(client))
         , Invoker_(std::move(invoker))
     { }
@@ -253,7 +254,7 @@ public:
                 LegacyRawThrottlers_[kind] = CreateNamedReconfigurableThroughputThrottler(
                     std::move(throttlerConfig),
                     ToString(kind),
-                    TabletNodeLogger,
+                    TabletNodeLogger(),
                     TabletNodeProfiler.WithPrefix("/throttlers"));
             }
 
@@ -302,8 +303,9 @@ public:
         PartitionBalancer_ = CreatePartitionBalancer(this);
         BackingStoreCleaner_ = CreateBackingStoreCleaner(this);
         LsmInterop_ = CreateLsmInterop(this, StoreCompactor_, PartitionBalancer_, StoreRotator_);
+        ChunkReplicaCachePinger_ = CreateChunkReplicaCachePinger(this);
         CompressionDictionaryBuilder_ = CreateCompressionDictionaryBuilder(this);
-        ErrorManager_ = New<TErrorManager>(this);
+        ErrorManager_ = CreateErrorManager(this);
         CompressionDictionaryManager_ = CreateCompressionDictionaryManager(
             GetConfig()->TabletNode->CompressionDictionaryCache,
             this);
@@ -320,7 +322,7 @@ public:
         DiskChangeChecker_ = New<TDiskChangeChecker>(
             DiskInfoProvider_,
             GetControlInvoker(),
-            TabletNodeLogger);
+            TabletNodeLogger());
 
         SlotManager_->Initialize();
         MasterConnector_->Initialize();
@@ -368,13 +370,13 @@ public:
             "/disk_monitoring",
             CreateVirtualNode(DiskChangeChecker_->GetOrchidService()));
 
-        StoreCompactor_->Start();
         StoreFlusher_->Start();
         StoreTrimmer_->Start();
         HunkChunkSweeper_->Start();
         StatisticsReporter_->Start();
         BackingStoreCleaner_->Start();
         LsmInterop_->Start();
+        ChunkReplicaCachePinger_->Start();
         HintManager_->Start();
         TableDynamicConfigManager_->Start();
         SlotManager_->Start();
@@ -441,7 +443,7 @@ public:
         return TableDynamicConfigManager_;
     }
 
-    const TErrorManagerPtr& GetErrorManager() const override
+    const IErrorManagerPtr& GetErrorManager() const override
     {
         return ErrorManager_;
     }
@@ -596,8 +598,9 @@ private:
     TStatisticsReporterPtr StatisticsReporter_;
     IBackingStoreCleanerPtr BackingStoreCleaner_;
     ILsmInteropPtr LsmInterop_;
+    IChunkReplicaCachePingerPtr ChunkReplicaCachePinger_;
     ICompressionDictionaryBuilderPtr CompressionDictionaryBuilder_;
-    TErrorManagerPtr ErrorManager_;
+    IErrorManagerPtr ErrorManager_;
     ICompressionDictionaryManagerPtr CompressionDictionaryManager_;
     TOverloadControllerPtr OverloadController_;
 

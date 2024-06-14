@@ -1,5 +1,6 @@
 #include "task.h"
 
+#include "input_manager.h"
 #include "job_info.h"
 #include "job_memory.h"
 #include "job_splitter.h"
@@ -68,7 +69,7 @@ using std::placeholders::_2;
 ////////////////////////////////////////////////////////////////////////////////
 
 TTask::TTask()
-    : Logger(ControllerLogger)
+    : Logger(ControllerLogger())
     , CachedPendingJobCount_{.DefaultCount = -1}
     , CachedTotalJobCount_(-1)
 { }
@@ -332,7 +333,7 @@ void TTask::AddInput(TChunkStripePtr stripe)
         // legacy sorted chunk pool or not.
     }
 
-    TaskHost_->RegisterInputStripe(stripe, this);
+    TaskHost_->GetInputManager()->RegisterInputStripe(stripe, this);
 
     UpdateTask();
 }
@@ -542,6 +543,12 @@ void TTask::ScheduleJob(
         joblet->OutputCookie = ExtractCookie(localityNodeId);
         if (joblet->OutputCookie == IChunkPoolOutput::NullCookie) {
             YT_LOG_DEBUG("Job input is empty");
+
+            if (TaskHost_->IsCompleted()) {
+                TaskHost_->OnOperationCompleted(/*interrupted*/ false);
+                YT_LOG_DEBUG("Completed operation while trying to schedule a job");
+            }
+
             scheduleAllocationResult->RecordFail(EScheduleAllocationFailReason::EmptyInput);
             return;
         }
@@ -674,9 +681,28 @@ void TTask::ScheduleJob(
 
     joblet->JobInterruptible = IsJobInterruptible();
 
-    scheduleAllocationResult->StartDescriptor.emplace(
-        AllocationIdFromJobId(joblet->JobId),
-        neededResources);
+    TAllocationStartDescriptor startDescriptor{
+        .Id = AllocationIdFromJobId(joblet->JobId),
+        .ResourceLimits = neededResources,
+        .AllocationAttributes = TAllocationAttributes{
+            .WaitingForResourcesOnNodeTimeout = InferWaitingForResourcesTimeout(
+                context->GetScheduleAllocationSpec()),
+        },
+    };
+
+    if (userJobSpec) {
+        auto& attributes = startDescriptor.AllocationAttributes;
+
+        attributes.CudaToolkitVersion = userJobSpec->CudaToolkitVersion;
+        if (auto& diskRequest = userJobSpec->DiskRequest) {
+            attributes.DiskRequest.MediumIndex = diskRequest->MediumIndex;
+            attributes.DiskRequest.DiskSpace = diskRequest->DiskSpace;
+            attributes.DiskRequest.InodeCount = diskRequest->InodeCount;
+        }
+        attributes.PortCount = userJobSpec->PortCount;
+    }
+
+    scheduleAllocationResult->StartDescriptor.emplace(std::move(startDescriptor));
 
     joblet->Restarted = restarted;
     joblet->NodeDescriptor = context->GetNodeDescriptor();
@@ -781,18 +807,6 @@ void TTask::ScheduleJob(
     })
         .AsyncVia(TaskHost_->GetJobSpecBuildInvoker())
         .Run();
-
-    NConcurrency::TDelayedExecutor::Submit(
-        BIND([weakTaskHost = MakeWeak(TaskHost_), weakJoblet = MakeWeak(joblet)] {
-            if (auto taskHost = weakTaskHost.Lock()) {
-                if (auto joblet = weakJoblet.Lock()) {
-                    if (joblet->JobSpecProtoFuture) {
-                        taskHost->AsyncAbortJob(joblet->JobId, EAbortReason::JobSettlementTimedOut);
-                    }
-                }
-            }
-        }),
-        TaskHost_->GetConfig()->JobSettlementTimeout);
 
     if (!StartTime_) {
         StartTime_ = TInstant::Now();
@@ -984,10 +998,8 @@ void TTask::Persist(const TPersistenceContext& context)
 
     Persist(context, AggregatedFinishedJobStatistics_);
 
-    if (context.GetVersion() >= ESnapshotVersion::SeparateMultipliers) {
-        Persist(context, UserJobMemoryMultiplier_);
-        Persist(context, JobProxyMemoryMultiplier_);
-    }
+    Persist(context, UserJobMemoryMultiplier_);
+    Persist(context, JobProxyMemoryMultiplier_);
 }
 
 void TTask::OnJobStarted(TJobletPtr joblet)
@@ -1483,6 +1495,7 @@ void TTask::AddChunksToInputSpec(
                 // For non-input tasks comparator is passed from the controller. Actually
                 // it's now used for sorted merge task in sort controller only.
                 comparator = inputTable->Comparator;
+                newChunkSpec->set_use_proxying_data_node_service(inputTable->UseReadViaExecNode() || TaskHost_->GetSpec()->ReadViaExecNode);
             }
 
             if (comparator) {
@@ -1627,6 +1640,21 @@ void TTask::UpdateMemoryDigests(const TJobletPtr& joblet, bool resourceOverdraft
             resourceOverdraft);
         digest->AddSample(actualFactor);
     }
+}
+
+std::optional<TDuration> TTask::InferWaitingForResourcesTimeout(
+    const NScheduler::NProto::TScheduleAllocationSpec& allocationSpec)
+{
+    if (TaskHost_->GetSpec()->WaitingJobTimeout && allocationSpec.has_waiting_for_resources_on_node_timeout()) {
+        return std::max(*TaskHost_->GetSpec()->WaitingJobTimeout, FromProto<TDuration>(allocationSpec.waiting_for_resources_on_node_timeout()));
+    }
+    if (TaskHost_->GetSpec()->WaitingJobTimeout) {
+        return *TaskHost_->GetSpec()->WaitingJobTimeout;
+    }
+    if (allocationSpec.waiting_for_resources_on_node_timeout()) {
+        return FromProto<TDuration>(allocationSpec.waiting_for_resources_on_node_timeout());
+    }
+    return std::nullopt;
 }
 
 TJobResources TTask::ApplyMemoryReserve(
@@ -1790,16 +1818,7 @@ TSharedRef TTask::BuildJobSpecProto(TJobletPtr joblet, const NScheduler::NProto:
         jobSpecExt->set_is_traced(true);
     }
 
-    std::optional<TDuration> waitingJobTimeout;
-    if (TaskHost_->GetSpec()->WaitingJobTimeout && scheduleAllocationSpec.has_waiting_for_resources_on_node_timeout()) {
-        waitingJobTimeout = std::max(*TaskHost_->GetSpec()->WaitingJobTimeout, FromProto<TDuration>(scheduleAllocationSpec.waiting_for_resources_on_node_timeout()));
-    } else if (TaskHost_->GetSpec()->WaitingJobTimeout) {
-        waitingJobTimeout = *TaskHost_->GetSpec()->WaitingJobTimeout;
-    } else if (scheduleAllocationSpec.waiting_for_resources_on_node_timeout()) {
-        waitingJobTimeout = FromProto<TDuration>(scheduleAllocationSpec.waiting_for_resources_on_node_timeout());
-    }
-
-    if (waitingJobTimeout) {
+    if (auto waitingJobTimeout = InferWaitingForResourcesTimeout(scheduleAllocationSpec)) {
         jobSpecExt->set_waiting_job_timeout(ToProto<i64>(*waitingJobTimeout));
     }
 
@@ -2297,11 +2316,7 @@ void TTask::TResourceOverdraftState::Persist(const TPersistenceContext& context)
     using NYT::Persist;
 
     Persist(context, UserJobStatus);
-    if (context.IsLoad() && context.GetVersion() < ESnapshotVersion::SeparateMultipliers) {
-        JobProxyStatus = UserJobStatus;
-    } else {
-        Persist(context, JobProxyStatus);
-    }
+    Persist(context, JobProxyStatus);
     Persist(context, DedicatedUserJobMemoryReserveFactor);
     Persist(context, DedicatedJobProxyMemoryReserveFactor);
 }

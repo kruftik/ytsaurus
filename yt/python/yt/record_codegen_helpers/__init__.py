@@ -9,14 +9,17 @@ class Field:
     cpp_type: str
     column_name: str
     column_type: str
+    required: Optional[bool]
     sort_order: Optional[str]
     lock: Optional[str]
     aggregate: Optional[str]
+    expression: Optional[str]
 
 
 @dataclass
 class RecordType:
     type_name: str
+    sorted: Optional[bool]
     fields: List[Field]
     table_name: Optional[str]
     table_group: Optional[str]

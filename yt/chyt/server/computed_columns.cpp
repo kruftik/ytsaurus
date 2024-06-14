@@ -114,9 +114,13 @@ std::vector<DB::FieldVector> Transpose(DB::FieldVector fields)
     return result;
 }
 
-TString ToString(const TInclusionStatement& statement)
+void FormatValue(TStringBuilderBase* builder, const TInclusionStatement& statement, TStringBuf /*spec*/)
 {
-    return Format("{Columns: %v, PossibleTuples: %v}", statement.ColumnNames, statement.PossibleTuples);
+    Format(
+        builder,
+        "{Columns: %v, PossibleTuples: %v}",
+        statement.ColumnNames,
+        statement.PossibleTuples);
 }
 
 std::optional<std::vector<TString>> IdentifierTupleToColumnNames(const DB::IAST& ast)
@@ -194,8 +198,8 @@ struct TComputedColumnPopulationMatcher
                 ToUnversionedValue(field, &referenceValue);
                 YT_LOG_TRACE(
                     "Converted reference field to YT unversioned value (Value: %v, Field: %v)",
-                    field,
-                    referenceValue);
+                    referenceValue,
+                    field);
             }
 
             TUnversionedValue resultValue{};
@@ -247,7 +251,6 @@ struct TComputedColumnPopulationMatcher
 
         YT_LOG_TRACE(
             "Deduced computed values (ResultStatement: %v)",
-            resultStatement,
             resultStatement);
 
         return resultStatement;
@@ -469,10 +472,10 @@ struct TComputedColumnPopulationMatcher
             DB::Field constField;
             DB::DataTypePtr constDataType;
             if (!EvaluateConstant(rhs, constField, constDataType, data.getContext())) {
-                YT_LOG_TRACE("Right-hand is non-constant (Rhs: %v, SwapAttempt: %v)", rhs);
+                YT_LOG_TRACE("Right-hand is non-constant (Rhs: %v)", rhs);
                 return nullptr;
             }
-            YT_LOG_TRACE("Right-hand is constant (Rhs: %v, Value: %v, SwapAttempt: %v)", rhs, constField);
+            YT_LOG_TRACE("Right-hand is constant (Rhs: %v, Value: %v)", rhs, constField);
 
             if (DB::Tuple tuple; constField.tryGet<DB::Tuple>(tuple)) {
                 constFields = tuple;

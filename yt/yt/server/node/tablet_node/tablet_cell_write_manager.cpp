@@ -414,13 +414,6 @@ public:
         const auto& transactionManager = Host_->GetTransactionManager();
         auto transactions = transactionManager->GetTransactions();
 
-        // COMPAT(gritukan)
-        if (transactionManager->GetSnapshotReign() < ETabletReign::ReworkTabletLocks) {
-            const auto& transactionManager = Host_->GetTransactionManager();
-            // If this fails, you forgot to suspend tablet cells before update.
-            YT_VERIFY(transactionManager->IsDecommissioned());
-        }
-
         for (auto* transaction : transactions) {
             YT_VERIFY(GetTransientAffectedTablets(transaction).empty());
             for (auto* tablet : GetPersistentAffectedTablets(transaction)) {
@@ -746,7 +739,7 @@ private:
         if (!tablet) {
             // NB: Tablet could be missing if it was, e.g., forcefully removed.
             YT_LOG_DEBUG(
-                "Received delayed rows for nonexistent tablet; ignored ",
+                "Received delayed rows for nonexistent tablet; ignored "
                 "(TabletId: %v, TransactionId: %v)",
                 tabletId,
                 transactionId);
@@ -951,7 +944,7 @@ private:
         }
 
         // Release transient locks.
-        for (auto* tablet : GetTransientAffectedTablets(transaction)) {
+        for (auto* tablet : GetTransientAffectedTablets(transaction, /*includeOrphaned*/ true)) {
             UnlockTablet(tablet, ETabletLockType::TransientTransaction);
         }
         transaction->TransientAffectedTabletIds().clear();
@@ -1094,7 +1087,7 @@ private:
         }
     }
 
-    std::vector<TTablet*> GetTabletByIds(const THashSet<TTabletId>& tabletIds)
+    std::vector<TTablet*> GetTabletByIds(const THashSet<TTabletId>& tabletIds, bool includeOrphaned = false)
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
 
@@ -1103,6 +1096,10 @@ private:
         for (auto tabletId : tabletIds) {
             if (auto* tablet = Host_->FindTablet(tabletId)) {
                 tablets.push_back(tablet);
+            } else if (includeOrphaned) {
+                if (auto* tablet = Host_->FindOrphanedTablet(tabletId)) {
+                    tablets.push_back(tablet);
+                }
             }
         }
 
@@ -1141,18 +1138,18 @@ private:
         }
     }
 
-    std::vector<TTablet*> GetTransientAffectedTablets(TTransaction* transaction)
+    std::vector<TTablet*> GetTransientAffectedTablets(TTransaction* transaction, bool includeOrphaned = false)
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
 
-        return GetTabletByIds(transaction->TransientAffectedTabletIds());
+        return GetTabletByIds(transaction->TransientAffectedTabletIds(), includeOrphaned);
     }
 
-    std::vector<TTablet*> GetPersistentAffectedTablets(TTransaction* transaction)
+    std::vector<TTablet*> GetPersistentAffectedTablets(TTransaction* transaction, bool includeOrphaned = false)
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
 
-        return GetTabletByIds(transaction->PersistentAffectedTabletIds());
+        return GetTabletByIds(transaction->PersistentAffectedTabletIds(), includeOrphaned);
     }
 
     std::vector<TTablet*> GetAffectedTablets(TTransaction* transaction)
@@ -1183,12 +1180,12 @@ private:
     {
         // NB: Transaction may hold both transient and persistent lock on tablet,
         // so #GetAffectedTablets cannot be used here.
-        for (auto* tablet : GetTransientAffectedTablets(transaction)) {
+        for (auto* tablet : GetTransientAffectedTablets(transaction, /*includeOrphaned*/ true)) {
             UnlockTablet(tablet, ETabletLockType::TransientTransaction);
         }
         transaction->TransientAffectedTabletIds().clear();
 
-        for (auto* tablet : GetPersistentAffectedTablets(transaction)) {
+        for (auto* tablet : GetPersistentAffectedTablets(transaction, /*includeOrphaned*/ true)) {
             UnlockTablet(tablet, ETabletLockType::PersistentTransaction);
         }
         transaction->PersistentAffectedTabletIds().clear();

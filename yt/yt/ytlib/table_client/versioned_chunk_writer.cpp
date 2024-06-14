@@ -73,13 +73,13 @@ public:
         IChunkWriterPtr chunkWriter,
         IBlockCachePtr blockCache,
         const std::optional<NChunkClient::TDataSink>& dataSink)
-        : Logger(TableClientLogger.WithTag("ChunkWriterId: %v", TGuid::Create()))
+        : Logger(TableClientLogger().WithTag("ChunkWriterId: %v", TGuid::Create()))
         , Options_(std::move(options))
         , Config_(std::move(config))
         , Schema_(std::move(schema))
         , SamplesMemoryUsageGuard_(
             TMemoryUsageTrackerGuard::Acquire(
-                Options_->MemoryTracker,
+                Options_->MemoryUsageTracker,
                 /*size*/ 0))
         , EncodingChunkWriter_(New<TEncodingChunkWriter>(
             Config_,
@@ -520,7 +520,7 @@ public:
             Schema_,
             Logger)
     {
-        ResetBlockWriter(Options_->MemoryTracker);
+        ResetBlockWriter(Options_->MemoryUsageTracker);
     }
 
     i64 GetCompressedDataSize() const override
@@ -597,7 +597,7 @@ private:
         }
 
         FinishBlock(row.Keys());
-        ResetBlockWriter(Options_->MemoryTracker);
+        ResetBlockWriter(Options_->MemoryUsageTracker);
     }
 
     void FinishBlock(TUnversionedValueRange keyRange)

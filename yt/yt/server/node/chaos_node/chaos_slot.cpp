@@ -11,6 +11,7 @@
 #include "coordinator_service.h"
 #include "transaction_manager.h"
 #include "replicated_table_tracker.h"
+#include "shortcut_snapshot_store.h"
 
 #include <yt/yt/server/lib/cellar_agent/automaton_invoker_hood.h>
 #include <yt/yt/server/lib/cellar_agent/occupant.h>
@@ -71,10 +72,11 @@ public:
         IBootstrap* bootstrap)
         : THood(Format("ChaosSlot:%v", slotIndex))
         , Config_(config)
+        , ShortcutSnapshotStore_(CreateShortcutSnapshotStore())
         , Bootstrap_(bootstrap)
         , SnapshotQueue_(New<TActionQueue>(
             Format("ChaosSnap:%v", slotIndex)))
-        , Logger(ChaosNodeLogger)
+        , Logger(ChaosNodeLogger())
     {
         VERIFY_INVOKER_THREAD_AFFINITY(GetAutomatonInvoker(), AutomatonThread);
 
@@ -171,6 +173,13 @@ public:
         return Occupant_->GetTransactionSupervisor();
     }
 
+    const NLeaseServer::ILeaseManagerPtr& GetLeaseManager() const override
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return Occupant_->GetLeaseManager();
+    }
+
     const IChaosManagerPtr& GetChaosManager() const override
     {
         VERIFY_THREAD_AFFINITY_ANY();
@@ -189,7 +198,7 @@ public:
     {
         VERIFY_THREAD_AFFINITY_ANY();
 
-        return Bootstrap_->GetShortcutSnapshotStore();
+        return ShortcutSnapshotStore_;
     }
 
     const IInvokerPtr& GetSnapshotStoreReadPoolInvoker() const override
@@ -198,6 +207,14 @@ public:
 
         return Bootstrap_->GetSnapshotStoreReadPoolInvoker();
     }
+
+    const IInvokerPtr& GetAsyncSnapshotInvoker() const override
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return SnapshotQueue_->GetInvoker();
+    }
+
 
     TObjectId GenerateId(EObjectType type) override
     {
@@ -210,10 +227,7 @@ public:
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
-        return New<TChaosAutomaton>(
-            GetCellId(),
-            SnapshotQueue_->GetInvoker(),
-            Occupant_->GetLeaseManager());
+        return New<TChaosAutomaton>(this);
     }
 
     void Configure(IDistributedHydraManagerPtr hydraManager) override
@@ -320,21 +334,15 @@ public:
 
     IInvokerPtr GetAutomatonInvoker(EAutomatonThreadQueue queue = EAutomatonThreadQueue::Default) const override
     {
+        VERIFY_THREAD_AFFINITY_ANY();
+
         return TAutomatonInvokerHood<EAutomatonThreadQueue>::GetAutomatonInvoker(queue);
-    }
-
-    IInvokerPtr GetEpochAutomatonInvoker(EAutomatonThreadQueue queue = EAutomatonThreadQueue::Default) const override
-    {
-        return TAutomatonInvokerHood<EAutomatonThreadQueue>::GetEpochAutomatonInvoker(queue);
-    }
-
-    IInvokerPtr GetGuardedAutomatonInvoker(EAutomatonThreadQueue queue = EAutomatonThreadQueue::Default) const override
-    {
-        return TAutomatonInvokerHood<EAutomatonThreadQueue>::GetGuardedAutomatonInvoker(queue);
     }
 
     IInvokerPtr GetOccupierAutomatonInvoker() override
     {
+        VERIFY_THREAD_AFFINITY_ANY();
+
         return GetAutomatonInvoker();
     }
 
@@ -343,13 +351,31 @@ public:
         return GetAutomatonInvoker(EAutomatonThreadQueue::Mutation);
     }
 
+    IInvokerPtr GetEpochAutomatonInvoker(EAutomatonThreadQueue queue = EAutomatonThreadQueue::Default) const override
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return TAutomatonInvokerHood<EAutomatonThreadQueue>::GetEpochAutomatonInvoker(queue);
+    }
+
+    IInvokerPtr GetGuardedAutomatonInvoker(EAutomatonThreadQueue queue = EAutomatonThreadQueue::Default) const override
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return TAutomatonInvokerHood<EAutomatonThreadQueue>::GetGuardedAutomatonInvoker(queue);
+    }
+
     ECellarType GetCellarType() override
     {
+        VERIFY_THREAD_AFFINITY_ANY();
+
         return IChaosSlot::CellarType;
     }
 
     NApi::IClientPtr CreateClusterClient(const TString& clusterName) const override
     {
+        VERIFY_THREAD_AFFINITY_ANY();
+
         const auto& clusterDirectory = Bootstrap_->GetClusterConnection()->GetClusterDirectory();
         auto connection = clusterDirectory->FindConnection(clusterName);
         // TODO(savrus): Consider employing specific user.
@@ -363,11 +389,6 @@ public:
         return ReplicatedTableTracker_;
     }
 
-    void SubscribeReplicatedTableTrackerConfigChanged(TReplicatedTableTrackerConfigUpdateCallback callback) const override
-    {
-        Bootstrap_->SubscribeReplicatedTableTrackerConfigChanged(std::move(callback));
-    }
-
     TDynamicReplicatedTableTrackerConfigPtr GetReplicatedTableTrackerConfig() const override
     {
         return Bootstrap_->GetReplicatedTableTrackerConfig();
@@ -375,6 +396,8 @@ public:
 
 private:
     const TChaosNodeConfigPtr Config_;
+    const IShortcutSnapshotStorePtr ShortcutSnapshotStore_;
+
     IBootstrap* const Bootstrap_;
 
     ICellarOccupantPtr Occupant_;

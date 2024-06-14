@@ -17,12 +17,7 @@ using namespace NProfiling;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TString ToString(const TDetailedFairShare& detailedFairShare)
-{
-    return ToStringViaBuilder(detailedFairShare);
-}
-
-void FormatValue(TStringBuilderBase* builder, const TDetailedFairShare& detailedFairShare, TStringBuf /*format*/)
+void FormatValue(TStringBuilderBase* builder, const TDetailedFairShare& detailedFairShare, TStringBuf /*spec*/)
 {
     builder->AppendFormat(
         "{StrongGuarantee: %.6g, IntegralGuarantee: %.6g, WeightProportional: %.6g}",
@@ -1289,6 +1284,7 @@ void TOperationElement::ComputeAndSetFairShare(double suggestion, EFairShareType
             "FitFactor: %.10g, "
             "FSBFFSegmentArguments: {%.10g, %.10g}, "
             "FSBFFSegmentValues: {%.10g, %.10g})",
+            fairShareType,
             suggestion,
             fairShare,
             fsbsSegment.LeftBound(), fsbsSegment.RightBound(),

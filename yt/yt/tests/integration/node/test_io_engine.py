@@ -36,6 +36,19 @@ class TestIoEngine(YTEnvSetup):
                 "type": "static",
                 "value": 0
             }
+        },
+        "data_node": {
+            "p2p": {
+                "enabled": False,
+            },
+            "block_cache": {
+                "compressed_data": {
+                    "capacity": 0,
+                },
+                "uncompressed_data": {
+                    "capacity": 0,
+                },
+            },
         }
     }
 
@@ -103,7 +116,6 @@ class TestIoEngine(YTEnvSetup):
 
         update_nodes_dynamic_config({
             "data_node": {
-                "track_memory_after_session_completion": True,
                 "testing_options": {
                     "delay_before_blob_session_block_free": 100000,
                 },
@@ -126,6 +138,66 @@ class TestIoEngine(YTEnvSetup):
         read_table("//tmp/test")
 
         wait(lambda: any(self.get_pending_read_memory(node) > 1024 for node in nodes))
+
+    @authors("don-dron")
+    def test_io_engine_request_limit(self):
+        path = "//tmp/table"
+        create("table", path)
+        write_table(path, [{"a": 1}])
+        update_nodes_dynamic_config({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        "io_config": {
+                            "read_request_limit": 0,
+                            "write_request_limit": 10000,
+                        }
+                    }
+                }
+            }
+        })
+
+        nodes = ls("//sys/cluster_nodes")
+
+        def seed_counter(node, path):
+            return profiler_factory().at_node(node).counter(path)
+
+        counters = [seed_counter(node, "location/throttled_reads") for node in nodes]
+        read_res = read_table(path, return_response=True, table_reader={"probe_peer_count": 1})
+        wait(lambda: any(counter.get_delta() > 0 for counter in counters))
+
+        update_nodes_dynamic_config({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        "io_config": {
+                            "read_request_limit": 10000,
+                            "write_request_limit": 0,
+                        }
+                    }
+                }
+            }
+        })
+
+        counters = [seed_counter(node, "location/throttled_writes") for node in nodes]
+        write_res = write_table(path, [{"a": 1}], return_response=True)
+        wait(lambda: any(counter.get_delta() > 0 for counter in counters))
+
+        update_nodes_dynamic_config({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        "io_config": {
+                            "read_request_limit": 10000,
+                            "write_request_limit": 10000,
+                        }
+                    }
+                }
+            }
+        })
+
+        read_res.wait()
+        write_res.wait()
 
     @authors("don-dron")
     def test_rpc_server_queue_size_limit(self):
@@ -164,6 +236,107 @@ class TestIoEngine(YTEnvSetup):
             wait(lambda: get_applied_node_dynamic_config(node) == {})
 
         write_table("//tmp/test", ys)
+
+    def _run_throttled(self, delta, is_read, need_throttle):
+        nodes = ls("//sys/cluster_nodes")
+
+        def seed_counter(node, path):
+            return profiler_factory().at_node(node).counter(path)
+
+        update_nodes_dynamic_config(delta)
+        counters = [seed_counter(node, "location/throttled_reads" if is_read else "location/throttled_writes") for node in nodes]
+
+        first_response = read_table("//tmp/test", return_response=True, table_reader={"probe_peer_count": 1}) if is_read else write_table("//tmp/test", [{"key": "x"}], return_response=True)
+        second_response = read_table("//tmp/test", return_response=True, table_reader={"probe_peer_count": 1}) if is_read else write_table("//tmp/test", [{"key": "x"}], return_response=True)
+
+        if need_throttle:
+            wait(lambda: any(counter.get_delta() > 0 for counter in counters))
+        else:
+            wait(lambda: all(counter.get_delta() == 0 for counter in counters))
+
+        update_nodes_dynamic_config({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        "read_memory_limit": 10000000,
+                        "write_memory_limit": 10000000,
+                        "pending_io_read_limit": 10000000,
+                        "pending_io_write_limit": 10000000,
+                        "session_count_limit": 10000000,
+                    }
+                }
+            }
+        })
+        first_response.wait()
+        second_response.wait()
+
+    @authors("don-dron")
+    def test_location_limits(self):
+        REPLICATION_FACTOR = self.NUM_NODES
+
+        create(
+            "table",
+            "//tmp/test",
+            attributes={
+                "primary_medium": "default",
+                "replication_factor": REPLICATION_FACTOR,
+            })
+
+        self._run_throttled({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        'write_memory_limit': 0,
+                    }
+                }
+            }
+        }, False, True)
+
+        self._run_throttled({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        "pending_io_write_limit": 0,
+                    }
+                }
+            }
+        }, False, True)
+
+        self._run_throttled({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {}
+                }
+            }
+        }, False, False)
+
+        self._run_throttled({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        'read_memory_limit': 0,
+                    }
+                }
+            }
+        }, True, True)
+
+        self._run_throttled({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {
+                        'pending_io_read_limit': 0,
+                    }
+                }
+            }
+        }, True, True)
+
+        self._run_throttled({
+            "data_node": {
+                "store_location_config_per_medium": {
+                    "default": {}
+                }
+            }
+        }, True, False)
 
     @authors("yuryalekseev")
     def test_rpc_server_queue_bytes_size_limit(self):
@@ -210,7 +383,6 @@ class TestIoEngine(YTEnvSetup):
 
         update_nodes_dynamic_config({
             "data_node": {
-                "track_memory_after_session_completion": True,
                 "testing_options": {
                     "delay_before_blob_session_block_free": 100000,
                 },
@@ -446,12 +618,9 @@ class TestRpcDecoderMemoryTracking(BaseTestRpcMemoryTracking):
             rct_read = find_in_rct("NYT::NBus::TTcpServerConnectionWriteBufferTag")
             rct_decoder = find_in_rct("NYT::NBus::TPacketDecoderTag")
 
-            if rct_read is None or rct_write is None or rct_decoder is None:
-                return False
-
-            rct_write_bytes_alive = rct_write['bytes_alive']
-            rct_read_bytes_alive = rct_read['bytes_alive']
-            rct_decoder_bytes_alive = rct_read['bytes_alive']
+            rct_write_bytes_alive = 0 if rct_write is None else rct_write['bytes_alive']
+            rct_read_bytes_alive = 0 if rct_read is None else rct_read['bytes_alive']
+            rct_decoder_bytes_alive = 0 if rct_decoder is None else rct_read['bytes_alive']
 
             used = self.get_rpc_memory_used(node)
 

@@ -679,49 +679,56 @@ class TestCompactionPartitioning(TestSortedDynamicTablesBase):
     @authors("dave11ar")
     def test_timestamp_digest_ttl_cleanup_expected(self):
         sync_create_cells(1)
-        self._create_simple_table(
-            "//tmp/t",
-            mount_config={
-                "row_digest_compaction": {
-                    "period": yson.YsonEntity(),
-                },
-                "min_data_ttl": 1000,
-                "max_data_ttl": 1000
-            },
-            chunk_writer={
-                "versioned_row_digest": {
-                    "enable": True,
-                }
-            },
-            compression_codec="none"
-        )
-        sync_mount_table("//tmp/t")
-
         update_nodes_dynamic_config({
             "tablet_node": {
                 "store_compactor": {
+                    "row_digest_fetch_period": 1,
                     "use_row_digests": True,
-                }
-            }
+                },
+            },
         })
 
+        table_id = 0
+
         def check(min_data_versions, max_data_versions, max_obsolete_timestamp_ratio):
-            for i in range(10):
-                insert_rows("//tmp/t", [{"key": 1, "value": "a" * i * 2**20}])
+            nonlocal table_id
+            table_path = f"//tmp/t{table_id}"
+            table_id += 1
 
-            sync_flush_table("//tmp/t")
+            chunk_ids_path = f"{table_path}/@chunk_ids"
 
-            wait(lambda: get("//tmp/t/@chunk_ids"))
-            chunk_id = get("//tmp/t/@chunk_ids")[0]
+            self._create_simple_table(
+                table_path,
+                mount_config={
+                    "min_data_ttl": 1e9,
+                    "max_data_ttl": 1e9,
+                },
+                chunk_writer={
+                    "versioned_row_digest": {
+                        "enable": True,
+                    },
+                },
+                compression_codec="none",
+            )
+            sync_mount_table(table_path)
+            for _ in range(10):
+                insert_rows(table_path, [{"key": 1, "value": "v"}])
 
-            set("//tmp/t/@min_data_versions", min_data_versions)
-            set("//tmp/t/@max_data_versions", max_data_versions)
-            set("//tmp/t/@mount_config/row_digest_compaction", {
+            sync_flush_table(table_path)
+
+            wait(lambda: get(chunk_ids_path))
+            chunk_id = get(chunk_ids_path)[0]
+
+            set(f"{table_path}/@min_data_ttl", 1)
+            set(f"{table_path}/@max_data_ttl", 1)
+            set(f"{table_path}/@min_data_versions", min_data_versions)
+            set(f"{table_path}/@max_data_versions", max_data_versions)
+            set(f"{table_path}/@mount_config/row_digest_compaction", {
                 "max_obsolete_timestamp_ratio": max_obsolete_timestamp_ratio,
             })
-            remount_table("//tmp/t")
+            remount_table(table_path)
 
-            wait(lambda: chunk_id not in get("//tmp/t/@chunk_ids"))
+            wait(lambda: chunk_id not in get(chunk_ids_path))
 
         check(1, 1, 0.89)
         check(0, 1, 0.99)
@@ -729,14 +736,25 @@ class TestCompactionPartitioning(TestSortedDynamicTablesBase):
 
     @authors("dave11ar")
     def test_compaction_hints_after_cell_moved(self):
+        def update_throttler_limit(limit):
+            update_nodes_dynamic_config({
+                "tablet_node": {
+                    "store_compactor": {
+                        "row_digest_fetch_period": 1,
+                        "row_digest_request_throttler": {
+                            "limit": limit,
+                        },
+                        "use_row_digests": True,
+                    },
+                }
+            })
+
         cell_id = sync_create_cells(1)[0]
+        cell_address = f"//sys/tablet_cells/{cell_id}"
 
         self._create_simple_table(
             "//tmp/t",
             mount_config={
-                "row_digest_compaction": {
-                    "max_obsolete_timestamp_ratio": 0,
-                },
                 "min_data_ttl": 5000,
                 "max_data_ttl": 5000,
             },
@@ -749,23 +767,16 @@ class TestCompactionPartitioning(TestSortedDynamicTablesBase):
         )
         sync_mount_table("//tmp/t")
 
-        update_nodes_dynamic_config({
-            "tablet_node": {
-                "store_compactor": {
-                    "row_digest_fetch_period": 5000,
-                    "row_digest_request_throttler": {
-                        "limit": 0.
-                    },
-                    "use_row_digests": True,
-                }
-            }
-        })
-        for i in range(10):
-            insert_rows("//tmp/t", [{"key": 1, "value": "a" * i * 1000}])
+        update_throttler_limit(0)
+        for _ in range(10):
+            insert_rows("//tmp/t", [{"key": 1, "value": "v"}])
 
         sync_flush_table("//tmp/t")
 
         tablet_id = get("//tmp/t/@tablets")[0]["tablet_id"]
+
+        wait(lambda: get("//tmp/t/@chunk_ids"))
+        chunk_id = get("//tmp/t/@chunk_ids")[0]
 
         def check_no_hint():
             store_orchid = self._find_tablet_orchid(
@@ -775,30 +786,16 @@ class TestCompactionPartitioning(TestSortedDynamicTablesBase):
             row_digest = store_orchid.get("compaction_hints")["row_digest"]
             return "compaction_hint" not in row_digest
 
-        wait(lambda: get("//tmp/t/@chunk_ids"))
-        chunk_id = get("//tmp/t/@chunk_ids")[0]
-
-        peer = get("//sys/tablet_cells/{}/@peers/0/address".format(cell_id))
+        peer = get(f"{cell_address}/@peers/0/address")
         set_node_banned(peer, True)
 
-        wait(lambda: get("//sys/tablet_cells/{}/@health".format(cell_id)) == "good")
-
-        update_nodes_dynamic_config({
-            "tablet_node": {
-                "store_compactor": {
-                    "row_digest_fetch_period": 5000,
-                    "row_digest_request_throttler": {
-                        "limit": 10000,
-                    },
-                    "use_row_digests": True,
-                }
-            }
-        })
+        wait(lambda: get(f"{cell_address}/@health") == "good")
 
         wait(lambda: get("//tmp/t/@chunk_ids"))
         assert chunk_id in get("//tmp/t/@chunk_ids")
         assert check_no_hint()
 
+        update_throttler_limit(10000)
         wait(lambda: chunk_id not in get("//tmp/t/@chunk_ids"))
 
 

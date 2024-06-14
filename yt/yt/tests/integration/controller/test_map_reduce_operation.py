@@ -11,7 +11,9 @@ from yt_commands import (
 
 from yt_type_helpers import struct_type, list_type, tuple_type, optional_type, make_schema, make_column
 
-from yt_helpers import skip_if_no_descending, skip_if_renaming_disabled
+from yt_helpers import skip_if_no_descending, skip_if_old, skip_if_renaming_disabled
+
+import yt_error_codes
 
 from yt.common import YtError
 from yt.environment.helpers import assert_items_equal
@@ -1218,6 +1220,8 @@ print "x={0}\ty={1}".format(x, y)
 
     @authors("max42", "galtsev")
     def test_data_balancing(self):
+        skip_if_old(self.Env, (24, 1), "Data balancing is broken in older versions")
+
         create("table", "//tmp/t1")
         create("table", "//tmp/t2")
         job_count = 20
@@ -1614,6 +1618,71 @@ for l in sys.stdin:
         result_rows = read_table("//tmp/t2")
         expected_rows = [{"a": r["a"], "struct": {"a": r["a"], "b": r["b"], "c": True}} for r in rows]
         assert sorted_dicts(expected_rows) == sorted_dicts(result_rows)
+
+    @authors("ermolovd")
+    def test_intermediate_schema_mapper_side_output(self):
+        is_compat = "23_2" in getattr(self, "ARTIFACT_COMPONENTS", {})
+        if is_compat:
+            pytest.skip()
+        schema = [
+            make_column("a", "int64", sort_order="ascending"),
+            make_column("struct", struct_type([("a", "int64"), ("b", "string"), ("c", "bool")])),
+        ]
+        reducer_output_schema = [
+            make_column("a", "int64"),
+            make_column("struct", struct_type([("a", "int64"), ("b", "string"), ("c", "bool")])),
+        ]
+
+        create("table", "//tmp/input")
+        create("table", "//tmp/reducer_output", attributes={"schema": reducer_output_schema})
+        create("table", "//tmp/mapper_output")
+
+        rows = [{"a": i, "b": str(i) * 3} for i in range(50)]
+        write_table("//tmp/input", rows)
+
+        create("file", "//tmp/mapper.py")
+        write_file("//tmp/mapper.py", b"""
+import json, os, sys
+for l in sys.stdin:
+    row = json.loads(l)
+    a, b = row["a"], row["b"]
+
+    intermediate_row = json.dumps({"a": a, "struct": {"a": a, "b": b, "c": True}})
+    sys.stdout.write(intermediate_row + "\\n")
+
+    mapper_side_out_row = json.dumps({"b": b})
+    os.write(4, mapper_side_out_row.encode("utf-8") + b"\\n")
+""")
+
+        map_reduce(
+            in_="//tmp/input",
+            out=["//tmp/mapper_output", "//tmp/reducer_output"],
+            mapper_file=["//tmp/mapper.py"],
+            mapper_command="python mapper.py",
+            reducer_command="cat",
+            reduce_by=["a"],
+            spec={
+                "mapper": {
+                    "output_streams": [
+                        {"schema": schema},
+                        {"schema": [make_column("b", "string")]},
+                    ],
+                    "format": "json",
+                },
+                "reducer": {"format": "json"},
+                "max_failed_job_count": 1,
+                "mapper_output_table_count": 1,
+            },
+        )
+
+        reducer_actual_rows = read_table("//tmp/reducer_output")
+        reducer_expected_rows = [{"a": r["a"], "struct": {"a": r["a"], "b": r["b"], "c": True}} for r in rows]
+        assert sorted_dicts(reducer_expected_rows) == sorted_dicts(reducer_actual_rows)
+
+        mapper_actual_rows = read_table("//tmp/mapper_output")
+
+        mapper_expected_rows = [{"b": r["b"]} for r in rows]
+        assert mapper_expected_rows == mapper_actual_rows
 
     @authors("levysotsky")
     def test_single_intermediate_schema_trivial_mapper(self):
@@ -3335,6 +3404,55 @@ done
         )
 
         assert read_table("//tmp/t_out") == []
+
+    @authors("whatsername")
+    def test_map_reduce_any(self):
+        is_compat = "23_2" in getattr(self, "ARTIFACT_COMPONENTS", {})
+        if is_compat:
+            pytest.skip()
+
+        create(
+            "table",
+            "//tmp/t_in",
+            attributes={"schema": [{"name": "key", "type": "any"}]},
+        )
+        create("table", "//tmp/t_out")
+
+        values = [
+            [3, 3],
+            [1, 1],
+        ]
+
+        def gen_data(values):
+            data = []
+            for v in values:
+                data.append({"key": v})
+            return data
+
+        write_table("//tmp/t_in", gen_data(values))
+
+        map_reduce(
+            in_="//tmp/t_in",
+            out="//tmp/t_out",
+            reduce_by="key",
+            sort_by="key",
+            reducer_command="cat",
+        )
+        assert read_table("//tmp/t_out") == gen_data([values[1], values[0]])
+
+        wrong_values = [
+            [2, {}],
+        ]
+        write_table("//tmp/t_in", gen_data(wrong_values))
+
+        with raises_yt_error(yt_error_codes.SchemaViolation):
+            map_reduce(
+                in_="//tmp/t_in",
+                out="//tmp/t_out",
+                reduce_by="key",
+                sort_by="key",
+                reducer_command="cat",
+            )
 
 
 ##################################################################

@@ -87,7 +87,7 @@ TSimulatorControlThread::TSimulatorControlThread(
     , SharedSchedulerStrategy_(SchedulerStrategy_, StrategyHost_, ActionQueue_->GetInvoker())
     , OperationStatistics_(operations)
     , JobAndOperationCounter_(operations.size())
-    , Logger(SchedulerSimulatorLogger.WithTag("ControlThread"))
+    , Logger(SchedulerSimulatorLogger().WithTag("ControlThread"))
 {
     for (const auto& operation : operations) {
         InsertControlThreadEvent(TControlThreadEvent::OperationStarted(operation.StartTime, operation.Id));
@@ -308,7 +308,7 @@ void TSimulatorControlThread::OnLogNodes(const TControlThreadEvent& event)
     std::vector<TFuture<TYsonString>> nodeListFutures;
     for (const auto& nodeShard : NodeShards_) {
         nodeListFutures.push_back(
-            BIND([nodeShard] () {
+            BIND([nodeShard] {
                 return BuildYsonStringFluently<EYsonType::MapFragment>()
                     .Do(BIND(&TSimulatorNodeShard::BuildNodesYson, nodeShard))
                     .Finish();
@@ -322,7 +322,7 @@ void TSimulatorControlThread::OnLogNodes(const TControlThreadEvent& event)
 
     StrategyHost_.LogEventFluently(StrategyHost_.GetEventLogger(), ELogEventType::NodesInfo, event.Time)
         .Item("nodes")
-        .DoMapFor(nodeLists, [](TFluentMap fluent, const auto& nodeList) {
+        .DoMapFor(nodeLists, [] (TFluentMap fluent, const auto& nodeList) {
             fluent.Items(nodeList);
         });
 

@@ -60,7 +60,7 @@ TContext::TContext(
     : Api_(std::move(api))
     , Request_(std::move(request))
     , Response_(std::move(response))
-    , Logger(HttpProxyLogger.WithTag("RequestId: %v", Request_->GetRequestId()))
+    , Logger(HttpProxyLogger().WithTag("RequestId: %v", Request_->GetRequestId()))
 {
     DriverRequest_.Id = RandomNumber<ui64>();
 }
@@ -317,7 +317,7 @@ bool TContext::TryGetInputCompression()
     auto header = Request_->GetHeaders()->Find("Content-Encoding");
     if (header) {
         auto compression = StripString(*header);
-        if (!IsCompressionSupported(compression)) {
+        if (!IsContentEncodingSupported(compression)) {
             Response_->SetStatus(EStatusCode::UnsupportedMediaType);
             ReplyError(TError{"Unsupported Content-Encoding"});
             return false;
@@ -358,7 +358,7 @@ bool TContext::TryGetOutputCompression()
 {
     auto acceptEncodingHeader = Request_->GetHeaders()->Find("Accept-Encoding");
     if (acceptEncodingHeader) {
-        auto contentEncoding = GetBestAcceptedEncoding(*acceptEncodingHeader);
+        auto contentEncoding = GetBestAcceptedContentEncoding(*acceptEncodingHeader);
 
         if (!contentEncoding.IsOK()) {
             Response_->SetStatus(EStatusCode::UnsupportedMediaType);
@@ -462,8 +462,8 @@ void TContext::SetContentDispositionAndMimeType()
         TString filename;
         if (Descriptor_->CommandName == "download" ||
             Descriptor_->CommandName == "read_table" ||
-            Descriptor_->CommandName == "read_file"
-        ) {
+            Descriptor_->CommandName == "read_file")
+        {
             if (auto pathNode = DriverRequest_.Parameters->FindChild("path")) {
                 filename = "yt_" + pathNode->GetValue<TString>();
             }
@@ -612,9 +612,15 @@ void TContext::LogStructuredRequest()
 void TContext::SetupInputStream()
 {
     if (IdentityContentEncoding == InputContentEncoding_) {
-        DriverRequest_.InputStream = CreateCopyingAdapter(Request_);
+        DriverRequest_.InputStream = Request_;
     } else {
-        DriverRequest_.InputStream = CreateDecompressingAdapter(Request_, *InputContentEncoding_);
+        DriverRequest_.InputStream = CreateZeroCopyAdapter(
+            CreateDecompressingAdapter(
+                Request_,
+                *InputContentEncoding_,
+                // TODO(babenko): consider using compression pool
+                Api_->GetPoller()->GetInvoker()),
+            /*blockSize*/ 1_MB);
     }
 }
 
@@ -633,7 +639,9 @@ void TContext::SetupOutputStream()
     if (IdentityContentEncoding != OutputContentEncoding_) {
         DriverRequest_.OutputStream = CreateCompressingAdapter(
             DriverRequest_.OutputStream,
-            *OutputContentEncoding_);
+            *OutputContentEncoding_,
+            // TODO(babenko): consider using compression pool
+            Api_->GetPoller()->GetInvoker());
     }
 
     if (IsFramingEnabled_) {
@@ -642,12 +650,12 @@ void TContext::SetupOutputStream()
         DriverRequest_.OutputStream = FramingStream_;
 
         // NB: This lambda should not capture |this| (by strong reference) to avoid cyclic references.
-        auto sendKeepAliveFrame = [Logger=Logger] (const TFramingAsyncOutputStreamPtr& stream) {
+        auto sendKeepAliveFrame = [Logger = Logger] (const TFramingAsyncOutputStreamPtr& stream) {
             // All errors are ignored.
             YT_LOG_DEBUG("Sending keep-alive frame");
             auto error = WaitFor(stream->WriteKeepAliveFrame());
             if (!error.IsOK()) {
-                YT_LOG_ERROR("Error sending keep-alive frame", error);
+                YT_LOG_ERROR(error, "Error sending keep-alive frame");
                 return;
             }
             Y_UNUSED(WaitFor(stream->Flush()));
@@ -670,8 +678,8 @@ void TContext::SetupOutputParameters()
     OutputParametersConsumer_->OnBeginMap();
     DriverRequest_.ResponseParametersConsumer = OutputParametersConsumer_.get();
     DriverRequest_.ResponseParametersFinishedCallback = [this, weakThis = MakeWeak(this)] {
-        auto strongThis = weakThis.Lock();
-        if (!strongThis) {
+        auto this_ = weakThis.Lock();
+        if (!this_) {
             return;
         }
 
@@ -816,7 +824,7 @@ void TContext::Run()
         WaitFor(DriverRequest_.OutputStream->Close())
             .ThrowOnError();
         Response_->GetHeaders()->Remove("Trailer");
-        WaitFor(Response_->WriteBody(MergeRefsToRef<TDefaultSharedBlobTag>(MemoryOutput_->GetRefs())))
+        WaitFor(Response_->WriteBody(MergeRefsToRef<TDefaultSharedBlobTag>(MemoryOutput_->Finish())))
             .ThrowOnError();
     } else {
         WaitFor(DriverRequest_.OutputStream->Close())

@@ -16,21 +16,16 @@ from .transaction import null_transaction_id
 from .retries import Retrier, default_chaos_monkey
 from .batch_helpers import create_batch_client
 
-try:
-    from cStringIO import StringIO as BytesIO
-except ImportError:  # Python 3
-    from io import BytesIO
-
-try:
-    from yt.packages.six import iteritems
-except ImportError:
-    from six import iteritems
+from io import BytesIO
 
 import yt.logger as logger
 
 from copy import deepcopy
 import time
 
+SYNC_LAST_COMMITTED_TIMESTAMP = 0x3fffffffffffff01
+ASYNC_LAST_COMMITTED_TIMESTAMP = 0x3fffffffffffff04
+# COMPAT(ignat)
 SYNC_LAST_COMMITED_TIMESTAMP = 0x3fffffffffffff01
 ASYNC_LAST_COMMITED_TIMESTAMP = 0x3fffffffffffff04
 
@@ -578,7 +573,7 @@ def remount_table(path, first_tablet_index=None, last_tablet_index=None, client=
     unmount+mount and does not cause any downtime.
     """
 
-    params = {"path": path}
+    params = {"path": TablePath(path, client=client)}
     set_param(params, "first_tablet_index", first_tablet_index)
     set_param(params, "last_tablet_index", last_tablet_index)
 
@@ -744,12 +739,13 @@ def trim_rows(path, tablet_index, trimmed_row_count, client=None):
     return make_request("trim_rows", params, client=client)
 
 
-def alter_table_replica(replica_id, enabled=None, mode=None, client=None):
-    """Changes mode and enables or disables a table replica.
+def alter_table_replica(replica_id, enabled=None, mode=None, enable_replicated_table_tracker=None, client=None):
+    """Changes mode and enables or disables a table replica or replicated table tracker for table replica.
 
     :param str replica_id: replica id.
     :param bool enabled: enable or disable the replica.
     :param str mode: switch the replica to sync or async mode.
+    :param bool enable_replicated_table_tracker: enable or disable replicated table tracker.
     """
 
     if mode is not None:
@@ -758,6 +754,7 @@ def alter_table_replica(replica_id, enabled=None, mode=None, client=None):
     params = {"replica_id": replica_id}
     set_param(params, "mode", mode)
     set_param(params, "enabled", enabled)
+    set_param(params, "enable_replicated_table_tracker", enable_replicated_table_tracker)
 
     return make_request("alter_table_replica", params, client=client)
 
@@ -816,7 +813,7 @@ def get_tablet_infos(path, tablet_indexes, format=None, client=None):
     :param indexes: tablet indexes.
     """
 
-    params = {"path": path, "tablet_indexes": tablet_indexes}
+    params = {"path": TablePath(path, client=client), "tablet_indexes": tablet_indexes}
     return make_formatted_request("get_tablet_infos", params, format=format, client=client)
 
 
@@ -827,7 +824,7 @@ def get_tablet_errors(path, limit=None, format=None, client=None):
     :param int limit: maximum number of returned errors of any kind.
     """
 
-    params = {"path": path}
+    params = {"path": TablePath(path, client=client)}
     set_param(params, "limit", limit)
 
     return make_formatted_request("get_tablet_errors", params, format=format, client=client)
@@ -899,7 +896,7 @@ class BackupManifest(object):
     def merge(self, other):
         assert isinstance(other, BackupManifest)
 
-        for cluster_name, cluster_manifest in iteritems(other.clusters):
+        for cluster_name, cluster_manifest in other.clusters.items():
             self.update_cluster(cluster_name, cluster_manifest)
         return self
 
@@ -907,7 +904,7 @@ class BackupManifest(object):
         clusters = {
             name: cluster._serialize()
             for name, cluster
-            in iteritems(self.clusters)
+            in self.clusters.items()
         }
         return {"clusters": clusters}
 

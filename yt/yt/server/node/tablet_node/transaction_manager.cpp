@@ -7,6 +7,7 @@
 #include "transaction.h"
 // COMPAT(aleksandra-zh)
 #include "tablet_manager.h"
+#include "serialize.h"
 
 #include <yt/yt/server/node/cluster_node/bootstrap.h>
 #include <yt/yt/server/node/cluster_node/config.h>
@@ -118,30 +119,26 @@ public:
     {
         VERIFY_INVOKER_THREAD_AFFINITY(host->GetAutomatonInvoker(), AutomatonThread);
 
-        Logger = TabletNodeLogger.WithTag("CellId: %v", host->GetCellId());
+        Logger = TabletNodeLogger().WithTag("CellId: %v", host->GetCellId());
 
         YT_LOG_INFO("Set transaction manager clock cluster tag (ClockClusterTag: %v)",
             ClockClusterTag_);
 
         RegisterLoader(
             "TransactionManager.Keys",
-            BIND(&TTransactionManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "TransactionManager.Values",
-            BIND(&TTransactionManager::LoadValues, Unretained(this)));
-        // COMPAT(gritukan)
-        RegisterLoader(
-            "TransactionManager.Async",
-            BIND(&TTransactionManager::LoadAsync, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "TransactionManager.Keys",
-            BIND(&TTransactionManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "TransactionManager.Values",
-            BIND(&TTransactionManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::SaveValues, Unretained(this)));
 
         // COMPAT(babenko)
         RegisterMethod(BIND_NO_PROPAGATE(&TTransactionManager::HydraRegisterTransactionActions, Unretained(this)), {"NYT.NTabletNode.NProto.TReqRegisterTransactionActions"});
@@ -697,7 +694,8 @@ public:
     void RegisterTransactionActionHandlers(
         TTransactionActionDescriptor<TTransaction> descriptor) override
     {
-        TTransactionManagerBase<TTransaction>::RegisterTransactionActionHandlers(std::move(descriptor));
+        TTransactionManagerBase<TTransaction>::DoRegisterTransactionActionHandlers(
+            std::move(descriptor));
     }
 
 private:
@@ -996,24 +994,6 @@ private:
         Load(context, Decommission_);
         Load(context, Removing_);
     }
-
-    void LoadAsync(TLoadContext& context)
-    {
-        VERIFY_THREAD_AFFINITY(AutomatonThread);
-
-        SERIALIZATION_DUMP_WRITE(context, "transactions[%v]", PersistentTransactionMap_.size());
-        SERIALIZATION_DUMP_INDENT(context) {
-            for (int index = 0; index < std::ssize(PersistentTransactionMap_); ++index) {
-                auto transactionId = Load<TTransactionId>(context);
-                SERIALIZATION_DUMP_WRITE(context, "%v =>", transactionId);
-                SERIALIZATION_DUMP_INDENT(context) {
-                    auto* transaction = GetPersistentTransaction(transactionId);
-                    transaction->AsyncLoad(context);
-                }
-            }
-        }
-    }
-
 
     void Clear() override
     {

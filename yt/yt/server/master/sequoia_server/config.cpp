@@ -23,11 +23,11 @@ void TDynamicSequoiaManagerConfig::Register(TRegistrar registrar)
     registrar.Parameter("enable", &TThis::Enable)
         .Default(false);
 
-    registrar.Parameter("fetch_chunk_meta_from_sequoia", &TThis::FetchChunkMetaFromSequoia)
-        .Default(false);
-
     registrar.Parameter("sequoia_queue", &TThis::SequoiaQueue)
         .DefaultNew();
+
+    registrar.Parameter("enable_cypress_transactions_in_sequoia", &TThis::EnableCypressTransactionsInSequoia)
+        .Default(false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

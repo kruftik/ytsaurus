@@ -33,11 +33,11 @@ public:
 
     //! Runs single health check.
     //! Don't call after #Start(), otherwise two checks may interfere.
-    TFuture<void> RunCheck();
+    void RunCheck();
 
     void Start();
 
-    void Stop();
+    TFuture<void> Stop();
 
     DEFINE_SIGNAL(void(const TError&), Failed);
 
@@ -47,17 +47,19 @@ private:
     const IInvokerPtr CheckInvoker_;
 
     NLogging::TLogger Logger;
+
     NProfiling::TEventTimer TotalTimer_;
     NProfiling::TEventTimer ReadTimer_;
     NProfiling::TEventTimer WriteTimer_;
 
-    NConcurrency::TDelayedExecutorCookie CheckerCookie_;
+    const NConcurrency::TPeriodicExecutorPtr PeriodicExecutor_;
+
+    TError RunCheckWithTimeout();
 
     void OnCheck();
     void OnCheckCompleted(const TError& error);
 
     void DoRunCheck();
-
 };
 
 DEFINE_REFCOUNTED_TYPE(TDiskHealthChecker)

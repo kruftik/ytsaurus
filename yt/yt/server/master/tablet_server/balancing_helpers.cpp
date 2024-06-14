@@ -21,7 +21,7 @@ using namespace NObjectServer;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletServerLogger;
+static constexpr auto& Logger = TabletServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -42,8 +42,8 @@ TTabletSizeConfig GetTabletSizeConfig(const TTableNode* table)
     const auto& tableConfig = table->TabletBalancerConfig();
     const auto statistics = table->ComputeTotalStatistics();
     i64 tableSize = table->GetInMemoryMode() == EInMemoryMode::Compressed
-        ? statistics.compressed_data_size()
-        : statistics.uncompressed_data_size();
+        ? statistics.CompressedDataSize
+        : statistics.UncompressedDataSize;
     bool enableVerboseLogging = tableConfig->EnableVerboseLogging || bundleConfig->EnableVerboseLogging;
 
     if (tableConfig->DesiredTabletCount) {
@@ -187,7 +187,7 @@ std::optional<TReshardDescriptor> MergeSplitTablet(
     int startIndex = tablet->GetIndex();
     int endIndex = tablet->GetIndex();
 
-    auto sizeGood = [&] () {
+    auto sizeGood = [&] {
         int tabletCount = std::clamp<i64>(DivRound(size, desiredSize), 1, MaxTabletCount);
         i64 tabletSize = size / tabletCount;
         return tabletSize >= bounds.MinTabletSize && tabletSize <= bounds.MaxTabletSize;

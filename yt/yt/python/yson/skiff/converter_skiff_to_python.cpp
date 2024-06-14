@@ -246,7 +246,7 @@ TSkiffToPythonConverter CreatePrimitiveSkiffToPythonConverterImpl(
 TSkiffToPythonConverter WrapWithMiddlewareConverter(TSkiffToPythonConverter converter, Py::Callable middlewareConverter, bool forceOptional)
 {
     if (forceOptional) {
-        return [converter = std::move(converter), middlewareConverter = std::move(middlewareConverter)](TCheckedInDebugSkiffParser* parser) mutable {
+        return [converter = std::move(converter), middlewareConverter = std::move(middlewareConverter)] (TCheckedInDebugSkiffParser* parser) mutable {
             auto originalPyObject = converter(parser);
             if (originalPyObject.get() == Py_None) {
                 // The middleware may not be ready to handle None, so we avoid calling it here.
@@ -260,7 +260,7 @@ TSkiffToPythonConverter WrapWithMiddlewareConverter(TSkiffToPythonConverter conv
             return PyObjectPtr(pyObject.ptr());
         };
     } else {
-        return [converter = std::move(converter), middlewareConverter = std::move(middlewareConverter)](TCheckedInDebugSkiffParser* parser) mutable {
+        return [converter = std::move(converter), middlewareConverter = std::move(middlewareConverter)] (TCheckedInDebugSkiffParser* parser) mutable {
             Py::Tuple args(1);
             args[0] = Py::Object(converter(parser).release(), true);
             auto pyObject = middlewareConverter.apply(args);
@@ -318,8 +318,7 @@ public:
                     CreateSkiffToPythonConverter(
                         fieldDescription,
                         GetAttr(field, PySchemaFieldName),
-                        validateOptionalOnRuntime)
-                );
+                        validateOptionalOnRuntime));
                 FieldNames_.push_back(fieldName);
             } else if (PyObject_IsInstance(field.ptr(), FieldMissingFromSchemaClass.get())) {
                 FieldsMissingFromSchema_.emplace_back(GetAttr(field, NameFieldName).as_string());
@@ -444,8 +443,7 @@ public:
         int i = 0;
         for (const auto& pyElementSchema: Py::List(GetAttr(pySchema, ElementsFieldName))) {
             ElementConverters_.push_back(
-                CreateSkiffToPythonConverter(Format("%v.<tuple-element-%v>", description, i), pyElementSchema, validateOptionalOnRuntime)
-            );
+                CreateSkiffToPythonConverter(Format("%v.<tuple-element-%v>", description, i), pyElementSchema, validateOptionalOnRuntime));
         }
     }
 
@@ -536,8 +534,7 @@ public:
         : RowClassName_(GetRowClassName(pySchema))
         , ValidateOptionalOnRuntime_(
             FindAttr(pySchema, SchemaRuntimeContextFieldName)
-            && GetAttr(GetAttr(pySchema, SchemaRuntimeContextFieldName), ValidateOptionalOnRuntimeFieldName).as_bool()
-        )
+            && GetAttr(GetAttr(pySchema, SchemaRuntimeContextFieldName), ValidateOptionalOnRuntimeFieldName).as_bool())
         , StructConverter_(RowClassName_, GetAttr(pySchema, StructSchemaFieldName), ValidateOptionalOnRuntime_)
     {
         auto systemColumns = Py::Tuple(GetAttr(pySchema, SystemColumnsFieldName));

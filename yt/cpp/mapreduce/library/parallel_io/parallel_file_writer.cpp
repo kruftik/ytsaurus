@@ -18,6 +18,7 @@
 #include <util/system/info.h>
 #include <util/system/mutex.h>
 #include <util/system/thread.h>
+#include <util/generic/size_literals.h>
 
 #include <util/thread/pool.h>
 
@@ -58,8 +59,7 @@ private:
     void DoWriteTask(
         std::unique_ptr<IWriteTask>&& task,
         const TRichYPath& filePath,
-        std::optional<TResourceGuard> &&preallocatedGuard
-    );
+        std::optional<TResourceGuard> &&preallocatedGuard);
 
     TRichYPath CreateFilePath(const std::pair<size_t, size_t>& taskId);
 
@@ -145,20 +145,23 @@ private:
     };
 
 private:
-    std::shared_ptr<IThreadPool> ThreadPool_;
+    const std::shared_ptr<IThreadPool> ThreadPool_;
+    const TParallelFileWriterOptions Options_;
+    const TRichYPath Path_;
+    const TString TemporaryDirectory_;
+
     ITransactionPtr Transaction_;
-    TRichYPath Path_;
-    TParallelFileWriterOptions Options_;
     IResourceLimiterPtr RamLimiter_;
-    bool AcquireRamForBuffers_;
-    TMutex MutexForException_;
+    TMutex ExceptionLock_;
     std::exception_ptr Exception_ = nullptr;
     std::atomic<bool> HasException_ = false;
     std::atomic<bool> Finished_ = false;
     std::vector<TTaskDescription> Tasks_;
     std::vector<NThreading::TFuture<void>> Futures_;
-    TString TmpPathPrefix_;
     size_t NextBlobId_ = 0;
+
+    // Temporary debug code to investigate YT-21457
+    std::atomic<i64> TaskCount_ = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -169,16 +172,16 @@ TParallelFileWriter::TParallelFileWriter(
     const std::shared_ptr<IThreadPool>& threadPool,
     const TParallelFileWriterOptions& options)
     : ThreadPool_(threadPool)
-    , Transaction_(client->StartTransaction())
-    , Path_(path)
     , Options_(options)
-    , RamLimiter_(options.RamLimiter_)
-    , AcquireRamForBuffers_(options.AcquireRamForBuffers_)
-    , TmpPathPrefix_(Options_.TmpDirectory_
+    , Path_(path)
+    , TemporaryDirectory_(Options_.TmpDirectory_
         ? *Options_.TmpDirectory_ + "/" + CreateGuidAsString()
-        : Path_.Path_)
+        : Path_.Path_ + "__ParallelFileWriter__/" + CreateGuidAsString())
+    , Transaction_(client->StartTransaction())
+    , RamLimiter_(options.RamLimiter_)
 {
-    static constexpr size_t DefaultRamLimit = 2ull * 1ull << 30ull;  // 2 GiB
+    Transaction_->Create(TemporaryDirectory_, NYT::NT_MAP, NYT::TCreateOptions().Recursive(true));
+    static constexpr size_t DefaultRamLimit = 2_GB;
 
     if (RamLimiter_ == nullptr) {
         RamLimiter_ = MakeIntrusive<TResourceLimiter>(DefaultRamLimit, ::TStringBuilder() << "TParallelFileWriter[" << NodeToYsonString(PathToNode(Path_)) << "]");
@@ -200,9 +203,10 @@ TParallelFileWriter::~TParallelFileWriter()
     }
 }
 
-TResourceGuard TParallelFileWriter::LockRamForTask(const std::unique_ptr<IWriteTask>& task) {
+TResourceGuard TParallelFileWriter::LockRamForTask(const std::unique_ptr<IWriteTask>& task)
+{
     size_t lockAmount = task->GetDataSize();
-    if (AcquireRamForBuffers_) {
+    if (Options_.AcquireRamForBuffers_) {
         // fixme cannot properly do it without heuristic
         // exact lock amount for inner buffer will require us to create writer
         // AFTER locking
@@ -214,8 +218,8 @@ TResourceGuard TParallelFileWriter::LockRamForTask(const std::unique_ptr<IWriteT
 void TParallelFileWriter::DoWriteTask(
     std::unique_ptr<IWriteTask>&& task,
     const TRichYPath& filePath,
-    std::optional<TResourceGuard> &&guard
-) {
+    std::optional<TResourceGuard>&& guard)
+{
     if (HasException_) {
         return;
     }
@@ -231,27 +235,29 @@ void TParallelFileWriter::DoWriteTask(
             // fail-fast after unlocking
             return;
         }
+        Transaction_->Create(filePath.Path_, NT_FILE, TCreateOptions().Attributes(Options_.FileAttributes_));
         IFileWriterPtr writer = Transaction_->CreateFileWriter(filePath, TFileWriterOptions().WriterOptions(Options_.WriterOptions_.GetOrElse({})));
         // DO NOT take additional softLimiter lock here for difference betweeh heuristic and exact buffer size!
         // It's deadlockable scheme!
         task->Write(writer, HasException_);
         writer->Finish();
     } catch (const std::exception& e) {
-        auto guard = Guard(MutexForException_);
+        auto guard = Guard(ExceptionLock_);
         HasException_ = true;
-        Exception_ = std::current_exception();
+        if (!Exception_) {
+            Exception_ = std::current_exception();
+        }
         try {
             Transaction_->Abort();
         } catch (...) {
             // Never mind if tx is already dead - we won't commit it anyway => no data will be written.
         }
-        Finished_ = true;
     }
 }
 
 TRichYPath TParallelFileWriter::CreateFilePath(const std::pair<size_t, size_t>& taskId)
 {
-    TString filePathStr = TmpPathPrefix_ + "__ParallelFileWriter__" + ToString(taskId.first) + "_" + ToString(taskId.second);
+    TString filePathStr = TemporaryDirectory_ + "/" + "__ParallelFileWriter__" + ToString(taskId.first) + "_" + ToString(taskId.second);
     auto filePath = Path_;
     filePath.Path(filePathStr).Append(false);
     return filePath;
@@ -260,7 +266,7 @@ TRichYPath TParallelFileWriter::CreateFilePath(const std::pair<size_t, size_t>& 
 void TParallelFileWriter::Write(TSharedRef blob)
 {
     ThrowIfDead();
-    Y_ENSURE(!Finished_, "Tried to push blob to already finished writer");
+    Y_ABORT_IF(Finished_, "Tried to push blob to already finished writer");
 
     auto blobId = NextBlobId_++;
 
@@ -275,19 +281,20 @@ void TParallelFileWriter::Write(TSharedRef blob)
         auto future = NThreading::Async([this, task=std::move(task), ramGuard=std::move(ramGuard), filePath]() mutable {
             DoWriteTask(std::move(task), filePath, std::move(ramGuard));
         }, *ThreadPool_);
+        ++TaskCount_;
 
-        Tasks_.emplace_back(TTaskDescription{
+        Tasks_.push_back({
             .Path = std::move(filePath),
             .Order = std::move(taskId)
         });
-        Futures_.emplace_back(std::move(future));
+        Futures_.push_back(std::move(future));
     }
 }
 
 void TParallelFileWriter::WriteFile(const TString& fileName)
 {
     ThrowIfDead();
-    Y_ENSURE(!Finished_, "Tried to push file to already finished writer");
+    Y_ABORT_IF(Finished_, "Tried to push file to already finished writer");
 
     auto blobId = NextBlobId_++;
 
@@ -308,18 +315,19 @@ void TParallelFileWriter::WriteFile(const TString& fileName)
         auto future = NThreading::Async([this, task=std::move(task), filePath]() mutable {
             DoWriteTask(std::move(task), filePath, std::nullopt);
         }, *ThreadPool_);
+        ++TaskCount_;
 
-        Tasks_.emplace_back(TTaskDescription{
+        Tasks_.push_back({
             .Path = std::move(filePath),
             .Order = std::move(taskId)
         });
-        Futures_.emplace_back(std::move(future));
+        Futures_.push_back(std::move(future));
     }
 }
 
 void TParallelFileWriter::ThrowIfDead() {
     if (HasException_) {
-        auto guard = Guard(MutexForException_);
+        auto guard = Guard(ExceptionLock_);
         std::rethrow_exception(Exception_);
     }
 }
@@ -337,6 +345,10 @@ void TParallelFileWriter::DoFinish(bool commit)
     Finished_ = true;
 
     NThreading::WaitAll(Futures_).GetValueSync();
+    Y_ABORT_IF(std::ssize(Futures_) != TaskCount_.load());
+    for (const auto& f : Futures_) {
+        Y_ABORT_IF(!f.HasValue() && !f.HasException());
+    }
 
     if (Exception_ || !commit) {
         Transaction_->Abort();
@@ -347,7 +359,7 @@ void TParallelFileWriter::DoFinish(bool commit)
             std::rethrow_exception(Exception_);
         }
     }
-    auto createOptions = TCreateOptions();
+    auto createOptions = TCreateOptions().Attributes(Options_.FileAttributes_);
     auto concatenateOptions = TConcatenateOptions();
     if (Path_.Append_.GetOrElse(false)) {
         createOptions.IgnoreExisting(true);
@@ -358,7 +370,7 @@ void TParallelFileWriter::DoFinish(bool commit)
     }
     Transaction_->Create(Path_.Path_, NT_FILE, createOptions);
 
-    Sort(Tasks_, [](const TTaskDescription& lhs, const TTaskDescription& rhs) {
+    Sort(Tasks_, [] (const TTaskDescription& lhs, const TTaskDescription& rhs) {
         return lhs.Order < rhs.Order;
     });
 
@@ -369,9 +381,7 @@ void TParallelFileWriter::DoFinish(bool commit)
     }
 
     Transaction_->Concatenate(tempPaths, Path_.Path_, concatenateOptions);
-    for (const auto& path : tempPaths) {
-        Transaction_->Remove(path);
-    }
+    Transaction_->Remove(TemporaryDirectory_, NYT::TRemoveOptions().Recursive(true).Force(true));
     Transaction_->Commit();
 }
 

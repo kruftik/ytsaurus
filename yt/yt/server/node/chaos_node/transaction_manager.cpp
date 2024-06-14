@@ -76,26 +76,26 @@ public:
     {
         VERIFY_INVOKER_THREAD_AFFINITY(Slot_->GetAutomatonInvoker(), AutomatonThread);
 
-        Logger = ChaosNodeLogger.WithTag("CellId: %v", slot->GetCellId());
+        Logger = ChaosNodeLogger().WithTag("CellId: %v", slot->GetCellId());
 
         YT_LOG_INFO("Set transaction manager clock cluster tag (ClockClusterTag: %v)",
             ClockClusterTag_);
 
         RegisterLoader(
             "TransactionManager.Keys",
-            BIND(&TTransactionManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "TransactionManager.Values",
-            BIND(&TTransactionManager::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "TransactionManager.Keys",
-            BIND(&TTransactionManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "TransactionManager.Values",
-            BIND(&TTransactionManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTransactionManager::SaveValues, Unretained(this)));
 
         RegisterMethod(BIND_NO_PROPAGATE(&TTransactionManager::HydraRegisterTransactionActions, Unretained(this)));
 
@@ -111,7 +111,7 @@ public:
     void RegisterTransactionActionHandlers(
         TTransactionActionDescriptor<TTransaction> descriptor) override
     {
-        TTransactionManagerBase<TTransaction>::RegisterTransactionActionHandlers(std::move(descriptor));
+        TTransactionManagerBase<TTransaction>::DoRegisterTransactionActionHandlers(std::move(descriptor));
     }
 
     // ITransactionManager implementation.

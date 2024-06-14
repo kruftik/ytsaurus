@@ -103,13 +103,14 @@ class TReadTransform
     : public NPrivate::IWithAttributes
 {
 public:
-    explicit TReadTransform(NPrivate::IRawReadPtr rawRead)
+    explicit TReadTransform(NPrivate::IRawReadPtr rawRead, const TString& name = "")
         : RawRead_(rawRead)
+        , Name_(!name.empty() ? name : "Read")
     { }
 
     TString GetName() const
     {
-        return "Read";
+        return Name_;
     }
 
     TPCollection<TOutputRow> ApplyTo(const TPipeline& pipeline) const
@@ -134,12 +135,13 @@ private:
 
 private:
     const NPrivate::IRawReadPtr RawRead_;
+    const TString Name_;
 };
 
 template <typename T>
-TReadTransform<T> DummyRead()
+TReadTransform<T> DummyRead(const TString& name = "")
 {
-    return TReadTransform<T>{MakeIntrusive<NPrivate::TRawDummyRead>(NPrivate::MakeRowVtable<T>())};
+    return TReadTransform<T>{MakeIntrusive<NPrivate::TRawDummyRead>(NPrivate::MakeRowVtable<T>()), name};
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -258,7 +260,7 @@ auto ParDo(F func, const TFnAttributes& attributes)
         return TParDoTransform<TInputRow, TOutputRow>(rawParDo);
     } else {
         using TInputRow = typename std::decay_t<TFunctionArg<TDecayedF, 0>>;
-        if constexpr (std::is_invocable_v<TDecayedF, TInputRow>) {
+        if constexpr (std::invocable<TDecayedF, TInputRow>) {
             using TOutputRow = std::invoke_result_t<TDecayedF, TInputRow>;
             static_assert(std::is_convertible_v<F, TOutputRow(*)(const TInputRow&)>);
             auto rawParDo = NPrivate::TLambda1RawParDo::MakeIntrusive<TInputRow, TOutputRow>(func, attributes);
@@ -293,6 +295,7 @@ auto MakeParDo(Args... args)
 
 template <typename TInput, typename TOutput, typename TState>
 class TStatefulParDoTransform
+    : public NPrivate::IWithAttributes
 {
 public:
     TStatefulParDoTransform(NPrivate::IRawStatefulParDoPtr fn, NPrivate::TRawPStateNodePtr pState)
@@ -322,6 +325,18 @@ public:
             return NPrivate::MakePCollection<TOutput>(rawNode, rawPipeline);
         }
     }
+
+private:
+    void SetAttribute(const TString& key, const std::any& value) override
+    {
+        RawStatefulParDo_->SetAttribute(key, value);
+    }
+
+    const std::any* GetAttribute(const TString& key) const override
+    {
+        return RawStatefulParDo_->GetAttribute(key);
+    }
+
 
 private:
     const NPrivate::IRawStatefulParDoPtr RawStatefulParDo_;

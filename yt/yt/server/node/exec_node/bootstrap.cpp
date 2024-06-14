@@ -18,6 +18,9 @@
 #include <yt/yt/server/node/cluster_node/config.h>
 #include <yt/yt/server/node/cluster_node/dynamic_config_manager.h>
 
+#include <yt/yt/server/node/exec_node/job_input_cache.h>
+#include <yt/yt/server/node/exec_node/proxying_data_node_service.h>
+
 #include <yt/yt/server/node/data_node/bootstrap.h>
 #include <yt/yt/server/node/data_node/ytree_integration.h>
 
@@ -65,7 +68,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ExecNodeLogger;
+static constexpr auto& Logger = ExecNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -129,7 +132,7 @@ public:
                 RawThrottlers_[kind] = CreateNamedReconfigurableThroughputThrottler(
                     std::move(config),
                     ToString(kind),
-                    ExecNodeLogger,
+                    ExecNodeLogger(),
                     ExecNodeProfiler.WithPrefix("/throttlers"));
 
                 auto throttler = IThroughputThrottlerPtr(RawThrottlers_[kind]);
@@ -141,6 +144,10 @@ public:
                 Throttlers_[kind] = throttler;
             }
         }
+
+        JobInputCache_ = CreateJobInputCache(this);
+
+        GetRpcServer()->RegisterService(CreateProxyingDataNodeService(this));
 
         GetRpcServer()->RegisterService(CreateJobProberService(this));
 
@@ -168,7 +175,7 @@ public:
         DiskChangeChecker_ = New<TDiskChangeChecker>(
             DiskInfoProvider_,
             GetControlInvoker(),
-            ExecNodeLogger);
+            ExecNodeLogger());
 
         // NB(psushin): initialize chunk cache first because slot manager (and root
         // volume manager inside it) can start using it to populate tmpfs layers cache.
@@ -191,8 +198,7 @@ public:
         SetNodeByYPath(
             GetOrchidRoot(),
             "/exec_node",
-            CreateVirtualNode(GetOrchidService(this))
-        );
+            CreateVirtualNode(GetOrchidService(this)));
 
         SetNodeByYPath(
             GetOrchidRoot(),
@@ -209,6 +215,11 @@ public:
 
         ControllerAgentConnectorPool_->Start();
         DiskChangeChecker_->Start();
+    }
+
+    const IJobInputCachePtr& GetJobInputCache() const override
+    {
+        return JobInputCache_;
     }
 
     const TGpuManagerPtr& GetGpuManager() const override
@@ -286,6 +297,8 @@ private:
 
     const TActionQueuePtr DnsOverRpcActionQueue_ = New<TActionQueue>("DnsOverRpc");
 
+    IJobInputCachePtr JobInputCache_;
+
     TSlotManagerPtr SlotManager_;
 
     TGpuManagerPtr GpuManager_;
@@ -353,10 +366,10 @@ private:
 
         JobProxyConfigTemplate_->JobEnvironment = SlotManager_->GetJobEnvironmentConfig();
 
-        JobProxyConfigTemplate_->Logging = GetConfig()->ExecNode->JobProxy->JobProxyLogging;
+        JobProxyConfigTemplate_->Logging = GetConfig()->ExecNode->JobProxy->JobProxyLogging->LogManagerTemplate;
         JobProxyConfigTemplate_->Jaeger = GetConfig()->ExecNode->JobProxy->JobProxyJaeger;
-        JobProxyConfigTemplate_->StderrPath = GetConfig()->ExecNode->JobProxy->JobProxyStderrPath;
-        JobProxyConfigTemplate_->ExecutorStderrPath = GetConfig()->ExecNode->JobProxy->ExecutorStderrPath;
+        JobProxyConfigTemplate_->StderrPath = GetConfig()->ExecNode->JobProxy->JobProxyLogging->JobProxyStderrPath;
+        JobProxyConfigTemplate_->ExecutorStderrPath = GetConfig()->ExecNode->JobProxy->JobProxyLogging->ExecutorStderrPath;
         JobProxyConfigTemplate_->TestRootFS = GetConfig()->ExecNode->JobProxy->TestRootFS;
         JobProxyConfigTemplate_->AlwaysAbortOnMemoryReserveOverdraft = GetConfig()->ExecNode->JobProxy->AlwaysAbortOnMemoryReserveOverdraft;
 
@@ -366,6 +379,7 @@ private:
 
         JobProxyConfigTemplate_->DoNotSetUserId = !SlotManager_->ShouldSetUserId();
         JobProxyConfigTemplate_->CheckUserJobMemoryLimit = GetConfig()->ExecNode->JobProxy->CheckUserJobMemoryLimit;
+        JobProxyConfigTemplate_->ForwardAllEnvironmentVariables = GetConfig()->ExecNode->JobProxy->ForwardAllEnvironmentVariables;
 
         if (auto tvmService = NAuth::TNativeAuthenticationManager::Get()->GetTvmService()) {
             JobProxyConfigTemplate_->TvmBridgeConnection = New<NYT::NBus::TBusClientConfig>();
@@ -395,6 +409,7 @@ private:
             }
         }
 
+        JobInputCache_->Reconfigure(newConfig->ExecNode->JobInputCache);
         JobController_->OnDynamicConfigChanged(
             oldConfig->ExecNode->JobController,
             newConfig->ExecNode->JobController);
@@ -443,7 +458,8 @@ private:
         blockCacheConfig->CompressedData->Capacity = nbdConfig->BlockCacheCompressedDataCapacity;
         connectionOptions.BlockCache = CreateClientBlockCache(
             std::move(blockCacheConfig),
-            NChunkClient::EBlockType::CompressedData);
+            NChunkClient::EBlockType::CompressedData,
+            GetNullMemoryUsageTracker());
         connectionOptions.ConnectionInvoker = invoker;
         auto connection = CreateConnection(TBootstrapBase::GetConnection()->GetCompoundConfig(), std::move(connectionOptions));
         connection->GetNodeDirectorySynchronizer()->Start();

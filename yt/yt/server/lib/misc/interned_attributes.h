@@ -20,7 +20,6 @@
     XX(ActualTabletState, actual_tablet_state) \
     XX(AcquisitionTime, acquisition_time) \
     XX(Addresses, addresses) \
-    XX(Aevum, aevum) \
     XX(AlertCount, alert_count) \
     XX(AllowIdleCpuPolicy, allow_idle_cpu_policy) \
     XX(Alerts, alerts) \
@@ -112,6 +111,7 @@
     XX(ComputePromisedGuaranteeFairShare, compute_promised_guarantee_fair_share) \
     XX(Config, config) \
     XX(ConfigPreset, config_preset) \
+    XX(ConfigPresets, config_presets) \
     XX(ConfigVersion, config_version) \
     XX(Confirmed, confirmed) \
     XX(UsePoolSatisfactionForScheduling, use_pool_satisfaction_for_scheduling) \
@@ -152,6 +152,7 @@
     XX(DiskSpace, disk_space) \
     XX(Domestic, domestic) \
     XX(Dynamic, dynamic) \
+    XX(DynamicallyPropagatedMastersCellTags, dynamically_propagated_masters_cell_tags) \
     XX(DynamicConfigVersion, dynamic_config_version) \
     XX(DynamicOptions, dynamic_options) \
     XX(Eden, eden) \
@@ -171,7 +172,6 @@
     XX(EnablePrioritySchedulingSegmentModuleAssignment, enable_priority_scheduling_segment_module_assignment) \
     XX(EnableReplicatedTableTracker, enable_replicated_table_tracker) \
     XX(EnableSequoiaReplicas, enable_sequoia_replicas) \
-    XX(EnableSharedWriteLocks, enable_shared_write_locks) \
     XX(EnableSkynetSharing, enable_skynet_sharing) \
     XX(EnableStripedErasure, enable_striped_erasure) \
     XX(EndorsementRequired, endorsement_required) \
@@ -264,6 +264,7 @@
     XX(JobProxyVersion, job_proxy_build_version) \
     XX(PendingAclsUpdate, pending_acls_update) \
     XX(PendingRestart, pending_restart) \
+    XX(PendingRemoval, pending_removal) \
     XX(KeepFinished, keep_finished) \
     XX(Key, key) \
     XX(KeyColumns, key_columns) \
@@ -383,6 +384,7 @@
     XX(PivotKey, pivot_key) \
     XX(PivotKeys, pivot_keys) \
     XX(PoolConfigPresets, pool_config_presets) \
+    XX(Predicate, predicate) \
     XX(PreloadState, preload_state) \
     XX(PrerequisiteTransactionId, prerequisite_transaction_id) \
     XX(PrerequisiteTransactionIds, prerequisite_transaction_ids) \
@@ -406,6 +408,8 @@
     XX(QueueConsumerPartitions, queue_consumer_partitions) \
     XX(QueueStatus, queue_status) \
     XX(QueuePartitions, queue_partitions) \
+    XX(QueueProducerPartitions, queue_producer_partitions) \
+    XX(QueueProducerStatus, queue_producer_status) \
     XX(QuorumInfo, quorum_info) \
     XX(QuorumRowCount, quorum_row_count) \
     XX(Rack, rack) \
@@ -537,6 +541,7 @@
     XX(Transient, transient) \
     XX(TransientMasterMemoryUsage, transient_master_memory_usage) \
     XX(TreatAsQueueConsumer, treat_as_queue_consumer) \
+    XX(TreatAsQueueProducer, treat_as_queue_producer) \
     XX(Tree, tree) \
     XX(TrimmedChildCount, trimmed_child_count) \
     XX(TrimmedRowCount, trimmed_row_count) \
@@ -559,6 +564,7 @@
     XX(UsedSpacePerMedium, used_space_per_medium) \
     XX(UserAttributes, user_attributes) \
     XX(UserAttributeKeys, user_attribute_keys) \
+    XX(CustomRuntimeData, custom_runtime_data) \
     XX(UserTags, user_tags) \
     XX(AssociatedNodes, associated_nodes) \
     XX(Value, value) \

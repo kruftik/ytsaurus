@@ -26,6 +26,8 @@
 
 #include <yt/yt/client/api/transaction.h>
 
+#include <yt/yt/ytlib/api/native/connection.h>
+
 #include <yt/yt/ytlib/chunk_client/chunk_scraper.h>
 #include <yt/yt/ytlib/chunk_client/legacy_data_slice.h>
 #include <yt/yt/ytlib/chunk_client/input_chunk.h>
@@ -44,6 +46,8 @@
 #include <yt/yt/client/table_client/logical_type.h>
 #include <yt/yt/client/table_client/row_buffer.h>
 #include <yt/yt/client/table_client/unversioned_row.h>
+
+#include <yt/yt/library/query/base/query_preparer.h>
 
 #include <yt/yt/core/ytree/permission.h>
 
@@ -183,10 +187,7 @@ public:
         Persist(context, UnorderedMergeTask);
         Persist(context, SortedMergeTask);
 
-        // COMPAT(galtsev)
-        if (context.GetVersion() >= ESnapshotVersion::SwitchIntermediateMedium) {
-            Persist(context, SwitchedToSlowIntermediateMedium);
-        }
+        Persist(context, SwitchedToSlowIntermediateMedium);
 
         if (context.IsLoad()) {
             SetupPartitioningCompletedCallbacks();
@@ -627,7 +628,7 @@ protected:
             return Format("Partition(%v)", Level_);
         }
 
-        TString GetVertexDescriptor() const override
+        TDataFlowGraph::TVertexDescriptor GetVertexDescriptor() const override
         {
             return Format("%v(%v)", TTask::GetVertexDescriptor(), Level_);
         }
@@ -1034,7 +1035,7 @@ protected:
 
             config->EnableJobSplitting &=
                 (IsJobInterruptible() &&
-                std::ssize(Controller_->InputTables_) <= Controller_->Options->JobSplitter->MaxInputTableCount);
+                std::ssize(Controller_->InputManager->GetInputTables()) <= Controller_->Options->JobSplitter->MaxInputTableCount);
 
             return config;
         }
@@ -2309,7 +2310,7 @@ protected:
             options.MaxTotalSliceCount = Config->MaxTotalSliceCount;
             options.EnablePeriodicYielder = true;
             options.ShouldSliceByRowIndices = true;
-            options.Logger = Logger.WithTag("Name: RootPartition");
+            options.Logger = Logger().WithTag("Name: RootPartition");
 
             RootPartitionPool = CreateOrderedChunkPool(
                 std::move(options),
@@ -2319,7 +2320,7 @@ protected:
             options.RowBuffer = RowBuffer;
             options.JobSizeConstraints = std::move(jobSizeConstraints);
             options.JobSizeAdjusterConfig = std::move(jobSizeAdjusterConfig);
-            options.Logger = Logger.WithTag("Name: RootPartition");
+            options.Logger = Logger().WithTag("Name: RootPartition");
 
             RootPartitionPool = CreateUnorderedChunkPool(
                 std::move(options),
@@ -2371,7 +2372,7 @@ protected:
         TUnorderedChunkPoolOptions options;
         options.RowBuffer = RowBuffer;
         options.JobSizeConstraints = std::move(jobSizeConstraints);
-        options.Logger = Logger.WithTag("Name: SimpleSort");
+        options.Logger = Logger().WithTag("Name: SimpleSort");
 
         SimpleSortPool = CreateUnorderedChunkPool(
             std::move(options),
@@ -2438,6 +2439,11 @@ protected:
         }
 
         TOperationControllerBase::OnOperationCompleted(interrupted);
+    }
+
+    TError GetUseChunkSliceStatisticsError() const override
+    {
+        return TError();
     }
 
     void OnFinalPartitionCompleted(TPartitionPtr partition)
@@ -2651,7 +2657,7 @@ protected:
         int versionedSlices = 0;
         // TODO(max42): use CollectPrimaryInputDataSlices() here?
         for (auto& chunk : CollectPrimaryUnversionedChunks()) {
-            const auto& comparator = InputTables_[chunk->GetTableIndex()]->Comparator;
+            const auto& comparator = InputManager->GetInputTables()[chunk->GetTableIndex()]->Comparator;
 
             const auto& dataSlice = CreateUnversionedInputDataSlice(CreateInputChunkSlice(chunk));
             dataSlice->SetInputStreamIndex(InputStreamDirectory_.GetInputStreamIndex(chunk->GetTableIndex(), chunk->GetRangeIndex()));
@@ -2956,7 +2962,7 @@ protected:
 
         ValidateAccountPermission(Spec->IntermediateDataAccount, EPermission::Use);
 
-        for (const auto& table : InputTables_) {
+        for (const auto& table : InputManager->GetInputTables()) {
             for (const auto& sortColumn : Spec->SortBy) {
                 if (auto column = table->Schema->FindColumn(sortColumn.Name)) {
                     if (column->Aggregate()) {
@@ -3009,7 +3015,7 @@ protected:
             Spec,
             Options,
             GetOutputTablePaths().size());
-        chunkPoolOptions.Logger = Logger.WithTag("Name: %v", name);
+        chunkPoolOptions.Logger = Logger().WithTag("Name: %v", name);
 
         if (Spec->UseNewSortedPool) {
             YT_LOG_DEBUG("Creating new sorted pool");
@@ -3088,7 +3094,7 @@ protected:
             if (key.GetCount() == 0) {
                 continue;
             }
-            auto upperBound = TKeyBound::FromRow(RowBuffer->CaptureRow(key), /*isInclusive*/true, /*isUpper*/false);
+            auto upperBound = TKeyBound::FromRow(RowBuffer->CaptureRow(key), /*isInclusive*/ true, /*isUpper*/ false);
             partitionKeys.emplace_back(upperBound);
         }
 
@@ -3099,7 +3105,7 @@ protected:
     {
         const auto& finalPartitions = GetFinalPartitions();
         YT_VERIFY(finalPartitions.size() == partitionKeys.size() + 1);
-        finalPartitions[0]->LowerBound = TKeyBound::MakeUniversal(/*isUpper*/false);
+        finalPartitions[0]->LowerBound = TKeyBound::MakeUniversal(/*isUpper*/ false);
         for (int finalPartitionIndex = 1; finalPartitionIndex < std::ssize(finalPartitions); ++finalPartitionIndex) {
             const auto& partition = finalPartitions[finalPartitionIndex];
             const auto& partitionKey = partitionKeys[finalPartitionIndex - 1];
@@ -3233,7 +3239,7 @@ private:
                     InferSchemaFromInput(Spec->SortBy);
                 } else {
                     table->TableUploadOptions.TableSchema = table->TableUploadOptions.TableSchema->ToSorted(Spec->SortBy);
-                    ValidateOutputSchemaCompatibility(true, true);
+                    ValidateOutputSchemaCompatibility(/*ignoreSortOrder*/ true, /*forbidExtraComputedColumns*/ false);
                     ValidateOutputSchemaComputedColumnsCompatibility();
                 }
                 break;
@@ -3281,7 +3287,8 @@ private:
         std::vector<TPartitionKey> partitionKeys;
 
         if (Spec->PivotKeys.empty()) {
-            auto samples = FetchSamples();
+            auto sampleSchema = GetSampleSchema();
+            auto samples = FetchSamples(sampleSchema);
 
             YT_LOG_INFO("Suggested partition count (PartitionCount: %v, SampleCount: %v)", PartitionCount, samples.size());
 
@@ -3319,11 +3326,12 @@ private:
 
             YT_PROFILE_TIMING("/operations/sort/samples_processing_time") {
                 if (!SimpleSort) {
-                    auto comparator = OutputTables_[0]->TableUploadOptions.GetUploadSchema()->ToComparator();
                     partitionKeys = BuildPartitionKeysBySamples(
                         samples,
+                        sampleSchema,
+                        OutputTables_[0]->TableUploadOptions.GetUploadSchema(),
+                        Host->GetClient()->GetNativeConnection()->GetExpressionEvaluatorCache(),
                         PartitionCount,
-                        comparator,
                         RowBuffer,
                         Logger);
                 }
@@ -3484,7 +3492,34 @@ private:
         UnorderedMergeTask->RegisterInGraph();
     }
 
-    std::vector<TSample> FetchSamples()
+    TTableSchemaPtr GetSampleSchema() const
+    {
+        THashSet<TString> uniqueColumns;
+        auto schema = OutputTables_[0]->TableUploadOptions.GetUploadSchema();
+
+        for (const auto& sortColumn : Spec->SortBy) {
+            const auto& column = schema->GetColumn(sortColumn.Name);
+
+            if (const auto& expression = column.Expression()) {
+                THashSet<TString> references;
+                NQueryClient::PrepareExpression(*expression, *schema, NQueryClient::GetBuiltinTypeInferrers(), &references);
+
+                uniqueColumns.insert(references.begin(), references.end());
+            } else {
+                uniqueColumns.insert(column.Name());
+            }
+        }
+
+        std::vector<TColumnSchema> columns;
+        columns.reserve(uniqueColumns.size());
+        for (const auto& column : uniqueColumns) {
+            columns.push_back(schema->GetColumn(column));
+        }
+
+        return New<TTableSchema>(std::move(columns));
+    }
+
+    std::vector<TSample> FetchSamples(const TTableSchemaPtr& sampleSchema)
     {
         TFuture<void> asyncSamplesResult;
         YT_PROFILE_TIMING("/operations/sort/input_processing_time") {
@@ -3496,7 +3531,7 @@ private:
             }
             i64 sampleCount = static_cast<i64>(PartitionCount) * Spec->SamplesPerPartition;
 
-            FetcherChunkScraper = CreateFetcherChunkScraper();
+            FetcherChunkScraper = InputManager->CreateFetcherChunkScraper();
 
             auto samplesRowBuffer = New<TRowBuffer>(
                 TRowBufferTag(),
@@ -3506,9 +3541,9 @@ private:
                 Config->Fetcher,
                 ESamplingPolicy::Sorting,
                 sampleCount,
-                GetColumnNames(Spec->SortBy),
+                sampleSchema->GetColumnNames(),
                 Options->MaxSampleSize,
-                InputNodeDirectory_,
+                InputManager->GetInputNodeDirectory(),
                 GetCancelableInvoker(),
                 samplesRowBuffer,
                 FetcherChunkScraper,
@@ -3599,7 +3634,7 @@ private:
             jobSpecExt->set_io_config(ConvertToYsonString(RootPartitionJobIOConfig).ToString());
             SetProtoExtension<NChunkClient::NProto::TDataSourceDirectoryExt>(
                 jobSpecExt->mutable_extensions(),
-                BuildDataSourceDirectoryFromInputTables(InputTables_));
+                BuildDataSourceDirectoryFromInputTables(InputManager->GetInputTables()));
             SetProtoExtension<NChunkClient::NProto::TDataSinkDirectoryExt>(
                 jobSpecExt->mutable_extensions(),
                 BuildIntermediateDataSinkDirectory(GetSpec()->IntermediateDataAccount));
@@ -3636,7 +3671,7 @@ private:
                 jobSpecExt->set_table_reader_options(ConvertToYsonString(CreateTableReaderOptions(Spec->PartitionJobIO)).ToString());
                 SetProtoExtension<NChunkClient::NProto::TDataSourceDirectoryExt>(
                     jobSpecExt->mutable_extensions(),
-                    BuildDataSourceDirectoryFromInputTables(InputTables_));
+                    BuildDataSourceDirectoryFromInputTables(InputManager->GetInputTables()));
             } else {
                 jobSpecExt->set_table_reader_options(ConvertToYsonString(intermediateReaderOptions).ToString());
                 SetProtoExtension<NChunkClient::NProto::TDataSourceDirectoryExt>(
@@ -4195,15 +4230,15 @@ private:
                 chunkSchemaColumns = IntermediateStreamSchemas_.front()->Filter(GetColumnNames(Spec->SortBy))->Columns();
             }
         } else {
-            YT_VERIFY(!InputTables_.empty());
-            for (const auto& inputTable : InputTables_) {
+            YT_VERIFY(!InputManager->GetInputTables().empty());
+            for (const auto& inputTable : InputManager->GetInputTables()) {
                 IntermediateStreamSchemas_.push_back(toStreamSchema(inputTable->Schema, Spec->SortBy));
             }
             if (AreAllEqual(IntermediateStreamSchemas_)) {
                 chunkSchemaColumns = IntermediateStreamSchemas_.front()->Columns();
             } else {
                 for (const auto& sortColumn : Spec->SortBy) {
-                    auto type = InferColumnType(InputTables_, sortColumn.Name);
+                    auto type = InferColumnType(InputManager->GetInputTables(), sortColumn.Name);
                     chunkSchemaColumns.emplace_back(sortColumn.Name, std::move(type), sortColumn.SortOrder);
                 }
             }
@@ -4435,14 +4470,14 @@ private:
     void InitJobSpecTemplates()
     {
         {
-            RootPartitionJobSpecTemplate.set_type(static_cast<int>(GetPartitionJobType(/*isRoot=*/true)));
+            RootPartitionJobSpecTemplate.set_type(static_cast<int>(GetPartitionJobType(/*isRoot*/ true)));
 
             auto* jobSpecExt = RootPartitionJobSpecTemplate.MutableExtension(TJobSpecExt::job_spec_ext);
 
             jobSpecExt->set_table_reader_options(ConvertToYsonString(CreateTableReaderOptions(RootPartitionJobIOConfig)).ToString());
             SetProtoExtension<NChunkClient::NProto::TDataSourceDirectoryExt>(
                 jobSpecExt->mutable_extensions(),
-                BuildDataSourceDirectoryFromInputTables(InputTables_));
+                BuildDataSourceDirectoryFromInputTables(InputManager->GetInputTables()));
             SetProtoExtension<NChunkClient::NProto::TDataSinkDirectoryExt>(
                 jobSpecExt->mutable_extensions(),
                 BuildDataSinkDirectoryForMapper());
@@ -4802,7 +4837,7 @@ private:
         fluent
             .Do(BIND(&TMapReduceController::BuildPartitionsProgressYson, Unretained(this)))
             // TODO(gritukan): What should I do here?
-            .Item(JobTypeAsKey(GetPartitionJobType(/*isRoot=*/true))).Value(GetPartitionJobCounter())
+            .Item(JobTypeAsKey(GetPartitionJobType(/*isRoot*/ true))).Value(GetPartitionJobCounter())
             .Item(JobTypeAsKey(GetIntermediateSortJobType())).Value(IntermediateSortJobCounter)
             .Item(JobTypeAsKey(GetFinalSortJobType())).Value(FinalSortJobCounter)
             .Item(JobTypeAsKey(GetSortedMergeJobType())).Value(SortedMergeJobCounter)

@@ -23,14 +23,6 @@ using namespace NYPath;
 
 namespace {
 
-inline const NLogging::TLogger Logger("FilterMatcher");
-
-} // anonymous namespace
-
-////////////////////////////////////////////////////////////////////////////////
-
-namespace {
-
 class TFilterMatcher
     : public IFilterMatcher
 {
@@ -38,7 +30,7 @@ public:
     TFilterMatcher(
         TString filterQuery,
         std::vector<TTypedAttributePath> attributePaths)
-        : Evaluator_(CreateExpressionEvaluator(
+        : Evaluator_(CreateOrmExpressionEvaluator(
             std::move(filterQuery),
             std::move(attributePaths)))
     { }

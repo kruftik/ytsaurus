@@ -1,0 +1,15 @@
+#pragma once
+
+#include "public.h"
+
+#include <yt/yt/core/logging/log_manager.h>
+
+namespace NYT::NKafkaProxy {
+
+////////////////////////////////////////////////////////////////////////////////
+
+YT_DEFINE_GLOBAL(const NLogging::TLogger, KafkaProxyLogger, "KafkaProxy");
+
+////////////////////////////////////////////////////////////////////////////////
+
+} // namespace NYT::NKafkaProxy

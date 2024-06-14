@@ -21,7 +21,7 @@ from yt_scheduler_helpers import (
     scheduler_orchid_operation_path, scheduler_orchid_default_pool_tree_config_path,
     scheduler_orchid_path, scheduler_orchid_node_path)
 
-from yt_helpers import profiler_factory
+from yt_helpers import profiler_factory, read_structured_log
 
 from yt.test_helpers import are_almost_equal
 
@@ -33,6 +33,8 @@ import yt.yson as yson
 import pytest
 
 import time
+import datetime
+import builtins
 
 from copy import deepcopy
 
@@ -150,7 +152,7 @@ class TestSchedulingSegments(YTEnvSetup):
             "preemptive_scheduling_backoff": 0,
             "fair_share_starvation_timeout": 100,
             "fair_share_starvation_tolerance": 0.95,
-            "max_unpreemptible_running_allocation_count": 0,
+            "non_preemptible_resource_usage_threshold": {"user_slots": 0},
         })
 
         # NB(eshcherbin): This is done to reset node segments.
@@ -978,6 +980,41 @@ class TestSchedulingSegments(YTEnvSetup):
 
         wait(lambda: get(scheduler_orchid_operation_path(op.id) + "/scheduling_segment", default=None) == "default")
 
+    @authors("omgronny")
+    def test_gpu_event_log(self):
+        before_start_time = datetime.datetime.utcnow()
+        op = run_sleeping_vanilla(
+            job_count=4,
+            spec={"pool": "large_gpu"},
+            task_patch={"gpu_limit": 8, "enable_gpu_layers": False},
+        )
+        wait(lambda: len(op.get_running_jobs()) > 0)
+
+        def collect_allocations_info_event():
+            scheduler_log_file = self.path_to_run + "/logs/scheduler-0.json.log"
+            structured_log = read_structured_log(scheduler_log_file)
+            operation_ids = builtins.set()
+            allocation_ids = builtins.set()
+            for event in structured_log:
+                if datetime.datetime.strptime(event["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ") < before_start_time or \
+                    "event_type" not in event or \
+                        event["event_type"] != "scheduling_segments_info" or \
+                        "nodes_info" not in event:
+                    continue
+                for info in event["nodes_info"].values():
+                    for allocation_id, allocation in info["running_allocations"].items():
+                        allocation_ids.add(allocation_id)
+                        operation_ids.add(allocation["operation_id"])
+
+            return allocation_ids, operation_ids
+
+        @wait_no_assert
+        def check_allocation_ids():
+            allocation_ids, operation_ids = collect_allocations_info_event()
+            assert len(allocation_ids) == 4
+            assert len(operation_ids) == 1
+            assert op.id in operation_ids
+
 ##################################################################
 
 
@@ -1140,7 +1177,7 @@ class BaseTestSchedulingSegmentsMultiModule(YTEnvSetup):
             "preemptive_scheduling_backoff": 0,
             "fair_share_starvation_timeout": 100,
             "fair_share_starvation_tolerance": 0.95,
-            "max_unpreemptible_running_allocation_count": 0,
+            "non_preemptible_resource_usage_threshold": {"user_slots": 0},
         })
 
         # NB(eshcherbin): This is done to reset node segments.
@@ -2023,7 +2060,7 @@ class TestRunningJobStatistics(YTEnvSetup):
             "preemptive_scheduling_backoff": 0,
             "fair_share_starvation_timeout": 100,
             "fair_share_starvation_tolerance": 0.95,
-            "max_unpreemptible_running_allocation_count": 0,
+            "non_preemptible_resource_usage_threshold": {"user_slots": 0},
         })
 
         # NB(eshcherbin): This is done to reset node segments.

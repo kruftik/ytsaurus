@@ -3,6 +3,7 @@
 #include "private.h"
 #include "chunk_merger_traversal_info.h"
 #include "chunk_replacer.h"
+#include "chunk_owner_data_statistics.h"
 #include "job.h"
 #include "job_controller.h"
 
@@ -47,7 +48,6 @@ struct TMergeJobInfo
     // TODO(shakurov): ephemeral ptr?
     NCypressClient::TObjectId NodeId;
     TChunkListId ParentChunkListId;
-    TChunkListId RootChunkListId;
 
     std::vector<TChunkId> InputChunkIds;
     TChunkId OutputChunkId;
@@ -65,7 +65,7 @@ struct TChunkMergerSession
 
     NCypressClient::TObjectId AccountId;
 
-    TChunkMergerTraversalInfo TraversalInfo;
+    TChunkMergerTraversalStatistics TraversalStatistics;
     bool TraversalFinished = false;
 
     int JobCount = 0;
@@ -127,7 +127,7 @@ struct IMergeChunkVisitorHost
     virtual void OnTraversalFinished(
         NCypressClient::TObjectId nodeId,
         EMergeSessionResult result,
-        TChunkMergerTraversalInfo traversalInfo) = 0;
+        TChunkMergerTraversalStatistics traversalStatistics) = 0;
 };
 
 class TChunkMerger
@@ -221,7 +221,7 @@ private:
     {
         NCypressClient::TObjectId NodeId;
         EMergeSessionResult Result;
-        TChunkMergerTraversalInfo TraversalInfo;
+        TChunkMergerTraversalStatistics TraversalStatistics;
         int JobCount = 0;
         NSecurityServer::TAccountId AccountId;
         TInstant SessionCreationTime;
@@ -273,7 +273,7 @@ private:
     void OnTraversalFinished(
         NCypressClient::TObjectId nodeId,
         EMergeSessionResult result,
-        TChunkMergerTraversalInfo traversalInfo) override;
+        TChunkMergerTraversalStatistics traversalStatistics) override;
 
     void ScheduleSessionFinalization(NCypressClient::TObjectId nodeId, EMergeSessionResult result);
     void FinalizeSessions();
@@ -323,8 +323,8 @@ private:
 
     void ValidateStatistics(
         NCypressClient::TObjectId nodeId,
-        const NChunkClient::NProto::TDataStatistics& oldStatistics,
-        const NChunkClient::NProto::TDataStatistics& newStatistics);
+        const TChunkOwnerDataStatistics& oldStatistics,
+        const TChunkOwnerDataStatistics& newStatistics);
 
     void RemoveNodeFromRescheduleMaps(NSecurityServer::TAccountId accountId, NCypressClient::TNodeId nodeId);
 

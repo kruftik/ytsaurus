@@ -20,7 +20,7 @@ using namespace NCoreDump;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ControllerAgentLogger;
+static constexpr auto& Logger = ControllerAgentLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -42,8 +42,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateCompleted
     return TAgentToSchedulerOperationEvent(
         EAgentToSchedulerOperationEventType::Completed,
         operationId,
-        controllerEpoch
-    );
+        controllerEpoch);
 }
 
 TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateSuspendedEvent(
@@ -55,8 +54,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateSuspended
         EAgentToSchedulerOperationEventType::Suspended,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
 }
 
 TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateFailedEvent(
@@ -68,8 +66,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateFailedEve
         EAgentToSchedulerOperationEventType::Failed,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
 }
 
 TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateAbortedEvent(
@@ -81,8 +78,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateAbortedEv
         EAgentToSchedulerOperationEventType::Aborted,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
 }
 
 TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateBannedInTentativeTreeEvent(
@@ -94,8 +90,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateBannedInT
     TAgentToSchedulerOperationEvent event(
         EAgentToSchedulerOperationEventType::BannedInTentativeTree,
         operationId,
-        controllerEpoch
-    );
+        controllerEpoch);
     event.TentativeTreeId = std::move(treeId);
     event.TentativeTreeAllocationIds = std::move(allocationIds);
     return event;
@@ -111,8 +106,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateHeavyCont
         EAgentToSchedulerOperationEventType::InitializationFinished,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
     event.InitializeResult = maybeResult;
     return event;
 }
@@ -128,8 +122,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateHeavyCont
         EAgentToSchedulerOperationEventType::PreparationFinished,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
     event.PrepareResult = maybeResult;
     return event;
 }
@@ -144,8 +137,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateHeavyCont
         EAgentToSchedulerOperationEventType::MaterializationFinished,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
     event.MaterializeResult = maybeResult;
     return event;
 }
@@ -160,8 +152,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateHeavyCont
         EAgentToSchedulerOperationEventType::RevivalFinished,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
     event.ReviveResult = maybeResult;
     return event;
 }
@@ -176,8 +167,7 @@ TAgentToSchedulerOperationEvent TAgentToSchedulerOperationEvent::CreateHeavyCont
         EAgentToSchedulerOperationEventType::CommitFinished,
         operationId,
         controllerEpoch,
-        std::move(error)
-    );
+        std::move(error));
     event.CommitResult = maybeResult;
     return event;
 }
@@ -253,14 +243,19 @@ void TOperationControllerHost::UpdateRunningAllocationsStatistics(
         runningAllocationStatisticsUpdatesCount);
 }
 
+void TOperationControllerHost::RegisterAllocation(TStartedAllocationInfo allocationInfo)
+{
+    JobTrackerOperationHandler_->RegisterAllocation(std::move(allocationInfo));
+}
+
 void TOperationControllerHost::RegisterJob(TStartedJobInfo jobInfo)
 {
     JobTrackerOperationHandler_->RegisterJob(std::move(jobInfo));
 }
 
-void TOperationControllerHost::ReviveJobs(std::vector<TStartedJobInfo> jobs)
+void TOperationControllerHost::Revive(std::vector<TStartedAllocationInfo> allocations)
 {
-    JobTrackerOperationHandler_->ReviveJobs(std::move(jobs));
+    JobTrackerOperationHandler_->Revive(std::move(allocations));
 }
 
 void TOperationControllerHost::ReleaseJobs(std::vector<TJobToRelease> jobsToRelease)
@@ -371,6 +366,11 @@ const IInvokerPtr& TOperationControllerHost::GetControllerThreadPoolInvoker()
     return Bootstrap_->GetControllerAgent()->GetControllerThreadPoolInvoker();
 }
 
+const IInvokerPtr& TOperationControllerHost::GetChunkScraperThreadPoolInvoker()
+{
+    return Bootstrap_->GetControllerAgent()->GetChunkScraperThreadPoolInvoker();
+}
+
 const IInvokerPtr& TOperationControllerHost::GetJobSpecBuildPoolInvoker()
 {
     return Bootstrap_->GetControllerAgent()->GetJobSpecBuildPoolInvoker();
@@ -468,8 +468,7 @@ void TOperationControllerHost::OnOperationAborted(const TError& error)
     YT_LOG_DEBUG(
         error,
         "Operation abort notification enqueued (OperationId: %v)",
-        OperationId_,
-        error);
+        OperationId_);
 }
 
 void TOperationControllerHost::OnOperationFailed(const TError& error)

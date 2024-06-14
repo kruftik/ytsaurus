@@ -119,19 +119,19 @@ public:
         , EstimatedOutBytesCounter_(profiler.Counter("/estimated_out_bytes_counter"))
     { }
 
-    void RegisterPayloadWrite(int payload) override
+    void RegisterPayloadWrite(i64 payload) override
     {
         PayloadWrittenBytes_.fetch_add(payload, std::memory_order::relaxed);
         PayloadWrittenBytesCounter_.Increment(payload);
     }
 
-    void RegisterJournalWrite(int /*journalWrittenBytes*/, int mediaWrittenBytes) override
+    void RegisterJournalWrite(i64 /*journalWrittenBytes*/, i64 mediaWrittenBytes) override
     {
         MediaWrittenBytes_.fetch_add(mediaWrittenBytes, std::memory_order::relaxed);
         MediaWrittenBytesCounter_.Increment(mediaWrittenBytes);
     }
 
-    int EstimateMediaBytes(int payloadBytes) const
+    i64 EstimateMediaBytes(i64 payloadBytes) const
     {
         static constexpr auto AccumulatedStatisticsThreshold = 1_MBs;
 
@@ -749,7 +749,7 @@ public:
         return SnapshotLocalIOQueue_->GetInvoker();
     }
 
-    int EstimateChangelogMediumBytes(int payload) const override
+    i64 EstimateChangelogMediumBytes(i64 payload) const override
     {
         return ChangelogMediumUsageTracker_->EstimateMediaBytes(payload);
     }
@@ -882,7 +882,7 @@ private:
         return PrerequisiteTransactionId_;
     }
 
-    static TFuture<void> OnLeaderLeaseCheckThunk(TWeakPtr<TCellarOccupant> weakThis)
+    static TFuture<void> OnLeaderLeaseCheckThunk(const TWeakPtr<TCellarOccupant>& weakThis)
     {
         auto this_ = weakThis.Lock();
         return this_ ? this_->OnLeaderLeaseCheck() : VoidFuture;
@@ -939,8 +939,6 @@ private:
 
         auto rpcServer = Bootstrap_->GetRpcServer();
 
-        Automaton_.Reset();
-
         if (TransactionSupervisor_) {
             for (const auto& service : TransactionSupervisor_->GetRpcServices()) {
                 rpcServer->UnregisterService(service);
@@ -957,6 +955,8 @@ private:
             rpcServer->UnregisterService(LeaseManager_->GetRpcService());
         }
         LeaseManager_.Reset();
+
+        Automaton_.Reset();
     }
 
     void OnRecoveryComplete()
@@ -982,7 +982,7 @@ private:
 
     NLogging::TLogger MakeLogger() const
     {
-        return CellarAgentLogger.WithTag("CellId: %v, PeerId: %v",
+        return CellarAgentLogger().WithTag("CellId: %v, PeerId: %v",
             CellDescriptor_.CellId,
             PeerId_);
     }

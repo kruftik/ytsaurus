@@ -41,6 +41,10 @@ class TCompositeSettings
 public:
     EExtendedYsonFormat DefaultYsonFormat;
 
+    bool ConvertUnsupportedTypesToString;
+
+    static TCompositeSettingsPtr Create(bool convertUnsupportedTypesToString);
+
     REGISTER_YSON_STRUCT(TCompositeSettings);
 
     static void Register(TRegistrar registrar);
@@ -93,11 +97,10 @@ public:
 
     bool CheckCHYTBanned;
 
-    TDuration ChunkSpecFetcherSleepDuration;
-    TDuration InputStreamFactorySleepDuration;
-    TDuration ConcatTablesRangeSleepDuration;
-    TDuration ListDirsSleepDuration;
-    TDuration FetchTableAttributesSleepDuration;
+    std::optional<NYPath::TYPath> ChunkSpecFetcherBreakpoint;
+    std::optional<NYPath::TYPath> InputStreamFactoryBreakpoint;
+    std::optional<NYPath::TYPath> ConcatTableRangeBreakpoint;
+    std::optional<NYPath::TYPath> ListDirsBreakpoint;
 
     REGISTER_YSON_STRUCT(TTestingSettings);
 
@@ -519,23 +522,6 @@ DEFINE_REFCOUNTED_TYPE(TClickHouseTableConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TQueryLogConfig
-    : public NYTree::TYsonStruct
-{
-public:
-    //! AdditionalTables is a list of tables (except system.query_log itself)
-    //! which should be created for proper query_log operation.
-    std::vector<TClickHouseTableConfigPtr> AdditionalTables;
-
-    REGISTER_YSON_STRUCT(TQueryLogConfig);
-
-    static void Register(TRegistrar registrar);
-};
-
-DEFINE_REFCOUNTED_TYPE(TQueryLogConfig)
-
-////////////////////////////////////////////////////////////////////////////////
-
 class TUserDefinedSqlObjectsStorageConfig
     : public NYTree::TYsonStruct
 {
@@ -552,6 +538,52 @@ public:
 
 DEFINE_REFCOUNTED_TYPE(TUserDefinedSqlObjectsStorageConfig)
 
+////////////////////////////////////////////////////////////////////////////////
+
+class TSystemLogTableExporterConfig
+    : public TArchiveReporterConfig
+{
+public:
+    //! Max unflushed data size in ArchiveReporter.
+    i64 MaxInProgressDataSize;
+
+    //! Max bytes to keep in memory in a circular buffer.
+    i64 MaxBytesToKeep;
+    //! Max rows to keep in memory in a circular buffer.
+    i64 MaxRowsToKeep;
+
+    //! Table attributes specified during creation of a new table.
+    NYTree::IMapNodePtr CreateTableAttributes;
+
+    REGISTER_YSON_STRUCT(TSystemLogTableExporterConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TSystemLogTableExporterConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TSystemLogTableExportersConfig
+    : public NYTree::TYsonStruct
+{
+public:
+    //! A cypress directory where to store all exporter tables.
+    //! A system user (aka yt-clickhouse) should have [read; write; remove; mount] permissions to
+    //! this directory and the "use" permission to the corresponding account and tablet cell bundle.
+    NYPath::TYPath CypressRootDirectory;
+
+    //! Custom exporter configs for every table by its name.
+    THashMap<TString, TSystemLogTableExporterConfigPtr> Tables;
+    //! Default exporter config for tables not present in `Tables`.
+    TSystemLogTableExporterConfigPtr Default;
+
+    REGISTER_YSON_STRUCT(TSystemLogTableExportersConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TSystemLogTableExportersConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -634,9 +666,9 @@ public:
 
     TQuerySamplingConfigPtr QuerySampling;
 
-    TQueryLogConfigPtr QueryLog;
-
     TUserDefinedSqlObjectsStorageConfigPtr UserDefinedSqlObjectsStorage;
+
+    TSystemLogTableExportersConfigPtr SystemLogTableExporters;
 
     REGISTER_YSON_STRUCT(TYtConfig);
 

@@ -463,10 +463,9 @@ void TClusterNodeDynamicConfig::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("io_tracker", &TThis::IOTracker)
         .DefaultNew();
-    registrar.Parameter("enable_memory_reference_tracker", &TThis::EnableMemoryReferenceTracker)
-        .Alias("enable_block_tracker")
-        .Default(true);
     registrar.Parameter("rpc_server", &TThis::RpcServer)
+        .DefaultNew();
+    registrar.Parameter("chunk_replica_cache", &TThis::ChunkReplicaCacheConfig)
         .DefaultNew();
     registrar.Parameter("throttler_free_bandwidth_ratio", &TThis::ThrottlerFreeBandwidthRatio)
         .InRange(0.0, 1.0)
@@ -479,6 +478,16 @@ void TClusterNodeDynamicConfig::Register(TRegistrar registrar)
         .Default(1.0);
     registrar.Parameter("memory_limit_exceeded_for_category_threshold", &TThis::MemoryLimitExceededForCategoryThreshold)
         .Default(1.1);
+
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TChunkReplicaCacheDynamicConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("expiration_time", &TThis::ExpirationTime)
+        .GreaterThanOrEqual(TDuration::Zero())
+        .Optional();
 }
 
 ////////////////////////////////////////////////////////////////////////////////

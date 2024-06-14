@@ -27,7 +27,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CypressSynchronizerLogger;
+static constexpr auto& Logger = CypressSynchronizerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -597,7 +597,7 @@ private:
                 if (!responseOrError.IsOK()) {
                     YT_LOG_ERROR(
                         responseOrError,
-                        "Error fetching attributes for object ",
+                        "Error fetching attributes for object (Object: %v)",
                         object.Object);
                     RowsWithErrors_.AppendObjectWithError(object, responseOrError);
                     continue;
@@ -798,7 +798,7 @@ public:
                 DynamicState_,
                 ClientDirectory_,
                 AlertCollector_,
-                Logger.WithTag("PassIndex: %v", PassIndex_))
+                Logger().WithTag("PassIndex: %v", PassIndex_))
                 .Build();
             PassError_ = TError();
         } catch (const std::exception& ex) {

@@ -23,6 +23,7 @@ RECURSE(
     operations_snapshots
     proxy
     queue_agent_alerts
+    queue_api
     query_tracker_alerts
     query_tracker_yql_liveness
     query_tracker_chyt_liveness
@@ -43,7 +44,7 @@ RECURSE(
     tablet_cell_snapshots
     chaos_cells
     unaware_nodes
-    wrapper_files_count
+    wrapper_node_count
 )
 
 IF (NOT OPENSOURCE)

@@ -1051,8 +1051,7 @@ class TestTables(YTEnvSetup):
         assert read_table("//tmp/t", tx=tx) == [{"a": "b"}]
         t2_id = copy("//tmp/t", "//tmp/t2", tx=tx)
         wait(
-            lambda: sorted(get("#%s/@owning_nodes" % chunk_id))
-            == sorted(
+            lambda: sorted(get(f"#{chunk_id}/@owning_nodes")) == sorted(
                 [
                     "#" + t2_id,
                     "//tmp/t",
@@ -1068,7 +1067,7 @@ class TestTables(YTEnvSetup):
 
         remove("//tmp/t")
         assert read_table("//tmp/t2") == [{"a": "b"}]
-        assert get("#{}/@owning_nodes".format(chunk_id)) == ["//tmp/t2"]
+        assert get(f"#{chunk_id}/@owning_nodes") == ["//tmp/t2"]
 
         remove("//tmp/t2")
 
@@ -3039,6 +3038,72 @@ class TestTablesMulticell(TestTables):
         assert get("//tmp/t/@snapshot_statistics/chunk_count") == 2
         assert get("//tmp/t/@delta_statistics/chunk_count") == 0
 
+    @authors("whatsername")
+    def test_write_sorted_any(self):
+        create(
+            "table",
+            "//tmp/t",
+            attributes={"schema": [{"name": "key", "type": "any", "sort_order": "ascending"}]},
+        )
+
+        wrong_values = [
+            [1, {}],
+            [2, {}],
+        ]
+        values = [
+            [1, []],
+            [2, ["abc"]],
+        ]
+
+        def gen_data(values):
+            data = []
+            for v in values:
+                data.append({"key": v})
+            return data
+
+        write_table("<append=%true>//tmp/t", gen_data(values))
+        with raises_yt_error("Error validating column"):
+            write_table("<append=%true>//tmp/t", gen_data(wrong_values))
+
+        write_table("//tmp/t", gen_data(values))
+        with raises_yt_error("Error validating column"):
+            write_table("//tmp/t", gen_data(wrong_values))
+
+    @authors("whatsername")
+    def test_lookup_sorted_any(self):
+        create(
+            "table",
+            "//tmp/t",
+            attributes={"schema": [
+                {"name": "key", "type": "any", "sort_order": "ascending"},
+                {"name": "value", "type": "any"},
+            ]},
+        )
+
+        values = [
+            (321, "a"),
+            ([1, []], "a"),
+            ([1, []], 321),
+            ([2, ["abc"]], "a"),
+            ([3, 123], "a"),
+        ]
+
+        def gen_data(values):
+            data = []
+            for k, v in values:
+                data.append({"key": k, "value": v})
+            return data
+
+        write_table("<append=%true>//tmp/t", gen_data(values))
+
+        actual = read_table(
+            '<ranges=[{\
+                lower_limit={row_index=1;};\
+                upper_limit={row_index=3;}}]>//tmp/t')
+
+        assert actual == gen_data([values[1], values[2]])
+
+
 ##################################################################
 
 
@@ -3072,6 +3137,23 @@ class TestTablesShardedTxCTxS(TestTablesShardedTx):
             "transaction_manager": {
                 "use_cypress_transaction_service": True,
             }
+        }
+    }
+
+
+class TestTablesMirroredTx(TestTablesShardedTxCTxS):
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+    NUM_CYPRESS_PROXIES = 1
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    DELTA_DYNAMIC_MASTER_CONFIG = {
+        "transaction_manager": {
+            "forbid_transaction_actions_for_cypress_transactions": True,
         }
     }
 

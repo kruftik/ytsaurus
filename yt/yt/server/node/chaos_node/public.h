@@ -24,6 +24,7 @@ struct IBootstrap;
 
 DECLARE_REFCOUNTED_CLASS(TChaosAutomaton)
 DECLARE_REFCOUNTED_STRUCT(ISlotManager)
+DECLARE_REFCOUNTED_STRUCT(IChaosAutomatonHost)
 DECLARE_REFCOUNTED_STRUCT(IChaosSlot)
 DECLARE_REFCOUNTED_STRUCT(IChaosManager)
 DECLARE_REFCOUNTED_STRUCT(ICoordinatorManager)
@@ -48,10 +49,10 @@ DEFINE_ENUM(EAutomatonThreadQueue,
 );
 
 using TReplicationCardId = NChaosClient::TReplicationCardId;
-DECLARE_ENTITY_TYPE(TReplicationCard, NChaosClient::TReplicationCardId, NObjectClient::TDirectObjectIdHash)
+DECLARE_ENTITY_TYPE(TReplicationCard, NChaosClient::TReplicationCardId, NObjectClient::TObjectIdEntropyHash)
 
 using TReplicationCardCollocationId = NChaosClient::TReplicationCardCollocationId;
-DECLARE_ENTITY_TYPE(TReplicationCardCollocation, NChaosClient::TReplicationCardCollocationId, NObjectClient::TDirectObjectIdHash)
+DECLARE_ENTITY_TYPE(TReplicationCardCollocation, NChaosClient::TReplicationCardCollocationId, NObjectClient::TObjectIdEntropyHash)
 
 using TTransactionId = NTransactionClient::TTransactionId;
 DECLARE_ENTITY_TYPE(TTransaction, TTransactionId, ::THash<TTransactionId>)

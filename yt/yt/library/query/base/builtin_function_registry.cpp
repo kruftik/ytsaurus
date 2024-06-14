@@ -145,6 +145,13 @@ void RegisterBuiltinFunctions(IFunctionRegistryBuilder* builder)
         ECallingConvention::UnversionedValue);
 
     builder->RegisterFunction(
+        "is_finite",
+        std::vector<TType>{EValueType::Double},
+        EValueType::Boolean,
+        "is_finite",
+        ECallingConvention::Simple);
+
+    builder->RegisterFunction(
         "regex_full_match",
         "regex_full_match",
         std::unordered_map<TTypeParameter, TUnionType>(),
@@ -269,6 +276,15 @@ void RegisterBuiltinFunctions(IFunctionRegistryBuilder* builder)
         "hyperloglog",
         ECallingConvention::UnversionedValue);
 
+    builder->RegisterAggregate(
+        "dict_sum",
+        std::unordered_map<TTypeParameter, TUnionType>{},
+        EValueType::Any,
+        EValueType::Any,
+        EValueType::Any,
+        "dict_sum",
+        ECallingConvention::UnversionedValue);
+
     builder->RegisterFunction(
         "format_timestamp",
         std::vector<TType>{EValueType::Int64, EValueType::String},
@@ -341,6 +357,13 @@ void RegisterBuiltinFunctions(IFunctionRegistryBuilder* builder)
         },
         EValueType::Any,
         "to_any",
+        ECallingConvention::UnversionedValue);
+
+    builder->RegisterFunction(
+        "yson_string_to_any",
+        std::vector<TType>{TUnionType{EValueType::String}},
+        EValueType::Any,
+        "yson_string_to_any",
         ECallingConvention::UnversionedValue);
 
     builder->RegisterFunction(

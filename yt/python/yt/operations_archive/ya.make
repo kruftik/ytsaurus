@@ -1,13 +1,19 @@
 PY23_LIBRARY()
 
-NO_LINT()
+INCLUDE(${ARCADIA_ROOT}/yt/opensource.inc)
 
-PY_SRCS(
-    NAMESPACE yt.operations_archive
+IF (PYTHON2)
+    PEERDIR(yt/python_py2/yt/operations_archive)
+ELSE()
+    NO_LINT()
 
-    __init__.py
-    clear_operations.py
-    queues.py
-)
+    PY_SRCS(
+        NAMESPACE yt.operations_archive
+
+        __init__.py
+        clear_operations.py
+        queues.py
+    )
+ENDIF()
 
 END()

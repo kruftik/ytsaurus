@@ -172,10 +172,9 @@ TEST(TFilterMatcherTest, HashInFilter)
     EXPECT_TRUE(matcherLabelHash->Match(BuildYsonStringFluently().Entity()).ValueOrThrow());
     EXPECT_TRUE(matcherLabelHash->Match(TYsonStringBuf("#")).ValueOrThrow());
 
-    // Uncomment this code after (YT-15191)
-    // auto matcherWithIn = CreateFilterMatcher("[/labels/a] IN (#)", {"/labels"});
-    // EXPECT_FALSE(matcherWithIn->Match(TYsonStringBuf("{a=1}")).ValueOrThrow());
-    // EXPECT_TRUE(matcherWithIn->Match(TYsonStringBuf("{b=1}")).ValueOrThrow());
+    EXPECT_THROW_WITH_SUBSTRING(
+        CreateFilterMatcher("[/labels/a] IN (#)", {"/labels"}),
+        "Cannot use expression of type");
 
     auto matcherSpecHash = CreateFilterMatcher("[/spec/records] = #", {"/spec"});
     EXPECT_TRUE(matcherSpecHash->Match(TYsonStringBuf("{}")).ValueOrThrow());
@@ -189,8 +188,7 @@ TEST(TFilterMatcherTest, HashInFilter)
                     .Item("ttl").Value(1)
                 .EndMap()
             .EndList()
-        .EndMap()
-    ).ValueOrThrow());
+        .EndMap()).ValueOrThrow());
 
     auto matcherSpecRecordsHash = CreateFilterMatcher("[/spec/records] = #", {"/spec/records"});
     EXPECT_TRUE(matcherSpecRecordsHash->Match(TYsonStringBuf("#")).ValueOrThrow());
@@ -202,8 +200,7 @@ TEST(TFilterMatcherTest, HashInFilter)
                 .Item("class").Value("my_class")
                 .Item("ttl").Value(1)
             .EndMap()
-        .EndList()
-    ).ValueOrThrow());
+        .EndList()).ValueOrThrow());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -234,7 +231,7 @@ TEST(TFilterMatcherTest, ThreadSafety)
     const size_t iterationCount = 10'000;
     const size_t threadCount = 10;
 
-    auto task = [=] () {
+    auto task = [=] {
         for (size_t i = 0; i < iterationCount; ++i) {
             if (RandomNumber<bool>()) {
                 EXPECT_FALSE(matcher->Match(TYsonStringBuf("{deploy_engine=\"QYP\"}")).ValueOrThrow());
@@ -329,16 +326,13 @@ TEST(TFilterMatcherTest, FullAttributePaths)
                         BuildYsonStringFluently()
                             .BeginMap()
                                 .Item("id").Value(15)
-                            .EndMap()
-                    )
+                            .EndMap())
                     .Item("labels").Value(
                         BuildYsonStringFluently()
                             .BeginMap()
                                 .Item("a").Value("1")
-                            .EndMap()
-                    )
-                .EndMap()
-        ).ValueOrThrow());
+                            .EndMap())
+                .EndMap()).ValueOrThrow());
     }
 }
 

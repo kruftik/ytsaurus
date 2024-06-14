@@ -50,6 +50,16 @@
 // TQueryCoordinateTest
 // TQueryEvaluateTest
 
+namespace NYT::NTableClient {
+
+////////////////////////////////////////////////////////////////////////////////
+
+DECLARE_REFCOUNTED_CLASS(TSchemafulPipe)
+
+////////////////////////////////////////////////////////////////////////////////
+
+} // namespace NYT::NTableClient
+
 namespace NYT::NQueryClient {
 namespace {
 
@@ -123,7 +133,7 @@ protected:
         int syntaxVersion = 1)
     {
         EXPECT_THROW_THAT(
-            BIND([&] () {
+            BIND([&] {
                 PreparePlanFragment(&PrepareMock_, query, DefaultFetchFunctions, placeholderValues, syntaxVersion);
             })
             .AsyncVia(ActionQueue_->GetInvoker())
@@ -193,6 +203,73 @@ TEST_F(TQueryPrepareTest, BadTypecheck)
     ExpectPrepareThrowsWithDiagnostics(
         "k from [//t] where a > \"xyz\"",
         ContainsRegex("Type mismatch in expression"));
+}
+
+TEST_F(TQueryPrepareTest, KeywordAlias)
+{
+    const auto Keywords = {
+        "select",
+        "from",
+        "where",
+        "having",
+        "offset",
+        "limit",
+        "join",
+        "array",
+        "using",
+        "asc",
+        "desc",
+        "left",
+        "as",
+        "on",
+        "and",
+        "or",
+        "is",
+        "not",
+        "null",
+        "between",
+        "in",
+        "transform",
+        "like",
+        "ilike",
+        "rlike",
+        "regexp",
+        "escape",
+        "false",
+        "true",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "inf"
+    };
+
+    for (const auto* keyword : Keywords) {
+        ExpectPrepareThrowsWithDiagnostics(
+            Format("k as %v from [//t]", keyword),
+            HasSubstr("unexpected keyword"));
+    }
+}
+
+TEST_F(TQueryPrepareTest, AnyInNull)
+{
+    {
+        TDataSplit dataSplit;
+
+        SetObjectId(&dataSplit, MakeId(EObjectType::Table, TCellTag(0x42), 0, 0xdeadbabe));
+
+        dataSplit.TableSchema = New<TTableSchema>(std::vector{
+            TColumnSchema("any_value", EValueType::Any).SetRequired(false),
+        });
+
+        EXPECT_CALL(PrepareMock_, GetInitialSplit("//t"))
+            .WillRepeatedly(Return(MakeFuture(dataSplit)));
+    }
+
+    ExpectPrepareThrowsWithDiagnostics(
+        "* from [//t] where any_value in (#)",
+        ContainsRegex("Cannot use expression of type"));
 }
 
 #if !defined(_asan_enabled_) && !defined(_msan_enabled_)
@@ -854,6 +931,45 @@ TEST_F(TQueryPrepareTest, DisjointGroupBy)
     EXPECT_NE(id1, id2);
 }
 
+TEST_F(TQueryPrepareTest, GroupByWithLimitFolding)
+{
+    TDataSplit dataSplit;
+
+    SetObjectId(&dataSplit, MakeId(EObjectType::Table, TCellTag(0x42), 0, 0xeeeeeeee));
+
+    auto schema = New<TTableSchema>(std::vector{
+        TColumnSchema("a", EValueType::Int64, ESortOrder::Ascending),
+        TColumnSchema("b", EValueType::Int64),
+    });
+
+    dataSplit.TableSchema = schema;
+
+    EXPECT_CALL(PrepareMock_, GetInitialSplit("//t"))
+        .WillRepeatedly(Return(MakeFuture(dataSplit)));
+
+    llvm::FoldingSetNodeID id1;
+    {
+        auto query = PreparePlanFragment(&PrepareMock_, "* from [//t] group by 1")->Query;
+
+        TCGVariables variables;
+        ProfileForBothExecutionBackends(query, &id1, &variables, [] (TQueryPtr, TConstJoinClausePtr) -> TJoinSubqueryEvaluator {
+            return {};
+        });
+    }
+
+    llvm::FoldingSetNodeID id2;
+    {
+        auto query = PreparePlanFragment(&PrepareMock_, "* from [//t] group by 1 limit 1")->Query;
+
+        TCGVariables variables;
+        ProfileForBothExecutionBackends(query, &id2, &variables, [] (TQueryPtr, TConstJoinClausePtr) -> TJoinSubqueryEvaluator {
+            return {};
+        });
+    }
+
+    EXPECT_NE(id1, id2);
+}
+
 TEST_F(TQueryPrepareTest, GroupByPrimaryKey)
 {
     {
@@ -1033,7 +1149,7 @@ TEST_F(TQueryPrepareTest, InvalidUdfImpl)
                 nullptr,
                 &variables,
                 /*useCanonicalNullRelations*/ false,
-                /*executionBackend*/ EExecutionBackend::Native,
+                EExecutionBackend::Native,
                 FunctionProfilers_);
             auto callback = codegen();
         }, HasSubstr("LLVM bitcode"));
@@ -1051,7 +1167,7 @@ TEST_F(TQueryPrepareTest, InvalidUdfImpl)
                 nullptr,
                 &variables,
                 /*useCanonicalNullRelations*/ false,
-                /*executionBackend*/ EExecutionBackend::Native,
+                EExecutionBackend::Native,
                 FunctionProfilers_);
             auto callback = codegen();
         }, HasSubstr("LLVM bitcode"));
@@ -1069,7 +1185,7 @@ TEST_F(TQueryPrepareTest, InvalidUdfImpl)
                 nullptr,
                 &variables,
                 /*useCanonicalNullRelations*/ false,
-                /*executionBackend*/ EExecutionBackend::Native,
+                EExecutionBackend::Native,
                 FunctionProfilers_);
             auto callback = codegen();
         }, HasSubstr("LLVM bitcode"));
@@ -1156,10 +1272,10 @@ protected:
         auto config = New<TColumnEvaluatorCacheConfig>();
         ColumnEvaluatorCache_ = CreateColumnEvaluatorCache(config);
 
-        MergeFrom(RangeExtractorMap.Get(), *GetBuiltinRangeExtractors());
+        MergeFrom(RangeExtractorMap_.Get(), *GetBuiltinRangeExtractors());
     }
 
-    void Coordinate(const TString& source, const TDataSplits& dataSplits, size_t subqueriesCount)
+    void Coordinate(const TString& source, size_t subqueriesCount)
     {
         auto fragment = PreparePlanFragment(
             &PrepareMock_,
@@ -1167,11 +1283,6 @@ protected:
 
         auto buffer = New<TRowBuffer>();
         TRowRanges sources;
-        for (const auto& split : dataSplits) {
-            sources.emplace_back(
-                buffer->CaptureRow(split.LowerBound),
-                buffer->CaptureRow(split.UpperBound));
-        }
 
         auto rowBuffer = New<TRowBuffer>();
 
@@ -1185,7 +1296,7 @@ protected:
             MakeSharedRange(std::move(sources), buffer),
             rowBuffer,
             ColumnEvaluatorCache_,
-            RangeExtractorMap,
+            RangeExtractorMap_,
             options);
 
         EXPECT_EQ(prunedRanges.size(), subqueriesCount);
@@ -1194,56 +1305,34 @@ protected:
     StrictMock<TPrepareCallbacksMock> PrepareMock_;
     IColumnEvaluatorCachePtr ColumnEvaluatorCache_;
 
-    TRangeExtractorMapPtr RangeExtractorMap = New<TRangeExtractorMap>();
+    TRangeExtractorMapPtr RangeExtractorMap_ = New<TRangeExtractorMap>();
 };
 
 TEST_F(TQueryCoordinateTest, EmptySplit)
 {
-    TDataSplits emptySplits;
-
     EXPECT_NO_THROW({
-        Coordinate("k from [//t]", emptySplits, 0);
+        Coordinate("k from [//t] where false", 0);
     });
 }
 
 TEST_F(TQueryCoordinateTest, SingleSplit)
 {
-    TDataSplits singleSplit;
-    singleSplit.emplace_back(MakeSimpleSplit("//t", 1));
-
     EXPECT_NO_THROW({
-        Coordinate("k from [//t]", singleSplit, 1);
+        Coordinate("k from [//t]", 1);
     });
 }
 
 TEST_F(TQueryCoordinateTest, UsesKeyToPruneSplits)
 {
-    TDataSplits splits;
-
-    splits.emplace_back(MakeSimpleSplit("//t", 1));
-    splits.back().LowerBound = YsonToKey("0;0;0");
-    splits.back().UpperBound = YsonToKey("1;0;0");
-
-    splits.emplace_back(MakeSimpleSplit("//t", 2));
-    splits.back().LowerBound = YsonToKey("1;0;0");
-    splits.back().UpperBound = YsonToKey("2;0;0");
-
-    splits.emplace_back(MakeSimpleSplit("//t", 3));
-    splits.back().LowerBound = YsonToKey("2;0;0");
-    splits.back().UpperBound = YsonToKey("3;0;0");
-
     EXPECT_NO_THROW({
-        Coordinate("a from [//t] where k = 1 and l = 2 and m = 3", splits, 1);
+        Coordinate("a from [//t] where k = 1 and l = 2 and m = 3", 1);
     });
 }
 
 TEST_F(TQueryCoordinateTest, SimpleIn)
 {
-    TDataSplits singleSplit;
-    singleSplit.emplace_back(MakeSimpleSplit("//t", 1));
-
     EXPECT_NO_THROW({
-        Coordinate("k from [//t] where k in (1u, 2.0, 3)", singleSplit, 3);
+        Coordinate("k from [//t] where k in (1u, 2.0, 3)", 3);
     });
 }
 
@@ -1566,7 +1655,7 @@ protected:
             dataSplits,
             owningSources,
             resultMatcher,
-            /*executionBackend*/ EExecutionBackend::WebAssembly,
+            EExecutionBackend::WebAssembly,
             inputRowLimit,
             outputRowLimit,
             placeholderValues);
@@ -1576,7 +1665,7 @@ protected:
             dataSplits,
             owningSources,
             resultMatcher,
-            /*executionBackend*/ EExecutionBackend::Native,
+            EExecutionBackend::Native,
             inputRowLimit,
             outputRowLimit,
             placeholderValues,
@@ -1607,7 +1696,7 @@ protected:
             dataSplits,
             owningSources,
             resultMatcher,
-            /*executionBackend*/ EExecutionBackend::WebAssembly,
+            EExecutionBackend::WebAssembly,
             inputRowLimit,
             outputRowLimit,
             placeholderValues,
@@ -1619,7 +1708,7 @@ protected:
             dataSplits,
             owningSources,
             resultMatcher,
-            /*executionBackend*/ EExecutionBackend::Native,
+            EExecutionBackend::Native,
             inputRowLimit,
             outputRowLimit,
             placeholderValues,
@@ -1695,7 +1784,7 @@ protected:
             dataSplits,
             owningSources,
             resultMatcher,
-            /*executionBackend*/ EExecutionBackend::Native,
+            EExecutionBackend::Native,
             inputRowLimit,
             outputRowLimit,
             placeholderValues,
@@ -1728,7 +1817,7 @@ protected:
                 dataSplits,
                 owningSources,
                 resultMatcher,
-                /*executionBackend*/ EExecutionBackend::WebAssembly,
+                EExecutionBackend::WebAssembly,
                 inputRowLimit,
                 outputRowLimit,
                 true,
@@ -1745,7 +1834,7 @@ protected:
                 dataSplits,
                 owningSources,
                 resultMatcher,
-                /*executionBackend*/ EExecutionBackend::Native,
+                EExecutionBackend::Native,
                 inputRowLimit,
                 outputRowLimit,
                 true,
@@ -1847,7 +1936,7 @@ protected:
             };
         };
 
-        auto prepareAndExecute = [&] () {
+        auto prepareAndExecute = [&] {
             IUnversionedRowsetWriterPtr writer;
             TFuture<IUnversionedRowsetPtr> asyncResultRowset;
 
@@ -1899,34 +1988,26 @@ protected:
         auto primaryQuery = Prepare(query, std::map<TString, TDataSplit>{{"//t", dataSplit}}, {}, /*syntaxVersion*/ 1);
         YT_VERIFY(primaryQuery->GroupClause);
 
-        int tablets = owningSources.size();
+        int tabletCount = owningSources.size();
 
-        std::vector<TRefiner> refiners(
-            tablets,
-            [] (TConstExpressionPtr expr, const TKeyColumns& /*keyColumns*/) {
-                return expr;
-            });
+        auto [frontQuery, bottomQuery] = GetDistributedQueryPattern(primaryQuery);
 
-        TConstFrontQueryPtr frontQuery;
-        std::vector<TConstQueryPtr> subqueries;
-        std::tie(frontQuery, subqueries) = CoordinateQuery(primaryQuery, refiners);
-
-        std::vector<std::vector<TOwningRow>> owningSourceRows(tablets);
-        std::vector<std::vector<TRow>> sourceRows(tablets);
-        for (int index = 0; index < tablets; ++index) {
+        std::vector<std::vector<TOwningRow>> owningSourceRows(tabletCount);
+        std::vector<std::vector<TRow>> sourceRows(tabletCount);
+        for (int index = 0; index < tabletCount; ++index) {
             for (const auto& row : owningSources[index]) {
                 owningSourceRows[index].push_back(
-                    NTableClient::YsonToSchemafulRow(row, *subqueries[index]->GetReadSchema(), true));
+                    NTableClient::YsonToSchemafulRow(row, *bottomQuery->GetReadSchema(), true));
                 sourceRows[index].push_back(TRow(owningSourceRows[index].back()));
             }
         }
 
         int tabletIndex = 0;
-        std::vector<int> tabletReadProgress(tablets, 0);
-        std::vector<TQueryStatistics> resultStatistics(tablets);
-        auto getNextReader = [&] () -> ISchemafulUnversionedReaderPtr {
+        std::vector<int> tabletReadProgress(tabletCount, 0);
+        std::vector<TQueryStatistics> resultStatistics(tabletCount);
+        auto getNextReader = [&, bottomQuery = bottomQuery] () -> ISchemafulUnversionedReaderPtr {
             int index = tabletIndex++;
-            if (index == tablets) {
+            if (index == tabletCount) {
                 return nullptr;
             }
 
@@ -1957,7 +2038,7 @@ protected:
 
             auto pipe = New<NTableClient::TSchemafulPipe>(GetDefaultMemoryChunkProvider());
             resultStatistics[index] = Evaluator_->Run(
-                subqueries[index],
+                bottomQuery,
                 readerMock,
                 pipe->GetWriter(),
                 /*joinProfiler*/ nullptr,
@@ -2006,8 +2087,201 @@ protected:
         const std::vector<std::vector<TString>>& owningSources,
         const TResultMatcher& resultMatcher)
     {
-        EvaluateCoordinatedGroupByImpl(query, dataSplit, owningSources, resultMatcher, /*executionBackend*/ EExecutionBackend::WebAssembly);
-        return EvaluateCoordinatedGroupByImpl(query, dataSplit, owningSources, resultMatcher, /*executionBackend*/ EExecutionBackend::Native);
+        EvaluateCoordinatedGroupByImpl(query, dataSplit, owningSources, resultMatcher, EExecutionBackend::WebAssembly);
+        return EvaluateCoordinatedGroupByImpl(query, dataSplit, owningSources, resultMatcher, EExecutionBackend::Native);
+    }
+
+    TSchemafulPipePtr RunOnNodeThread(
+        TConstQueryPtr query,
+        const std::vector<TString>& rows,
+        EExecutionBackend executionBackend)
+    {
+        i64 progress = 0;
+
+        auto owningBatch = std::vector<TOwningRow>();
+
+        auto readRows = [&] (const TRowBatchReadOptions& options) {
+            i64 size = std::min(options.MaxRowsPerRead, std::ssize(rows) - progress);
+
+            owningBatch.resize(size);
+            auto batch = std::vector<TRow>(size);
+
+            for (i64 index = 0; index < size; ++index) {
+                owningBatch[index] = YsonToSchemafulRow(rows[progress + index], *query->GetReadSchema(), true);
+                batch[index] = owningBatch[index];
+            }
+
+            progress += size;
+
+            return (size == 0)
+                ? nullptr
+                : CreateBatchFromUnversionedRows(MakeSharedRange(std::move(batch)));
+        };
+
+        auto readerMock = New<NiceMock<TReaderMock>>();
+        EXPECT_CALL(*readerMock, Read(_))
+            .WillRepeatedly(Invoke(readRows));
+        ON_CALL(*readerMock, GetReadyEvent())
+            .WillByDefault(Return(VoidFuture));
+
+        auto pipe = New<TSchemafulPipe>(GetDefaultMemoryChunkProvider());
+
+        Evaluator_->Run(
+            query,
+            readerMock,
+            pipe->GetWriter(),
+            /*joinProfiler*/ nullptr,
+            FunctionProfilers_,
+            AggregateProfilers_,
+            GetDefaultMemoryChunkProvider(),
+            TQueryBaseOptions{.ExecutionBackend = executionBackend});
+
+        return pipe;
+    }
+
+    TSchemafulPipePtr RunOnNode(
+        TConstQueryPtr nodeQuery,
+        const std::vector<std::vector<TString>>& tabletData,
+        EExecutionBackend executionBackend)
+    {
+        int partCount = std::ssize(tabletData);
+
+        auto [query, bottomQuery] = GetDistributedQueryPattern(nodeQuery);
+
+        int partIndex = 0;
+
+        auto nextReader = [&, bottomQuery = bottomQuery] () -> ISchemafulUnversionedReaderPtr {
+            if (partIndex == partCount) {
+                return nullptr;
+            }
+
+            auto pipe = RunOnNodeThread(
+                bottomQuery,
+                tabletData[partIndex],
+                executionBackend);
+
+            ++partIndex;
+
+            return pipe->GetReader();
+        };
+
+        auto reader = query->IsOrdered()
+            ? CreateFullPrefetchingOrderedSchemafulReader(nextReader)
+            : CreateFullPrefetchingShufflingSchemafulReader(nextReader);
+
+        auto pipe = New<TSchemafulPipe>(GetDefaultMemoryChunkProvider());
+
+        Evaluator_->Run(
+            query,
+            reader,
+            pipe->GetWriter(),
+            /*joinProfiler*/ nullptr,
+            FunctionProfilers_,
+            AggregateProfilers_,
+            GetDefaultMemoryChunkProvider(),
+            TQueryBaseOptions{.ExecutionBackend = executionBackend});
+
+        return pipe;
+    }
+
+    TSharedRange<TUnversionedRow> RunOnCoordinator(
+        TQueryPtr primary,
+        const std::vector<std::vector<std::vector<TString>>>& tabletsData,
+        EExecutionBackend executionBackend)
+    {
+        int tabletCount = std::ssize(tabletsData);
+
+        auto [frontQuery, nodeQuery] = GetDistributedQueryPattern(primary);
+
+        int tabletIndex = 0;
+
+        auto nextReader = [&, nodeQuery = nodeQuery] () -> ISchemafulUnversionedReaderPtr {
+            if (tabletIndex == tabletCount) {
+                return nullptr;
+            }
+
+            auto pipe = RunOnNode(nodeQuery, tabletsData[tabletIndex], executionBackend);
+
+            ++tabletIndex;
+
+            return pipe->GetReader();
+        };
+
+        auto reader = frontQuery->IsOrdered()
+            ? CreateFullPrefetchingOrderedSchemafulReader(nextReader)
+            : CreateFullPrefetchingShufflingSchemafulReader(nextReader);
+
+        auto [writer, asyncResultRowset] = CreateSchemafulRowsetWriter(frontQuery->GetTableSchema());
+
+        Evaluator_->Run(
+            frontQuery,
+            reader,
+            writer,
+            /*joinProfiler*/ nullptr,
+            FunctionProfilers_,
+            AggregateProfilers_,
+            GetDefaultMemoryChunkProvider(),
+            TQueryBaseOptions{.ExecutionBackend = executionBackend});
+
+        auto rows = WaitFor(asyncResultRowset).ValueOrThrow()->GetRows();
+
+        return rows;
+    }
+
+    void EvaluateFullCoordinatedGroupByImpl(
+        const TString& queryString,
+        const TDataSplit& dataSplit,
+        const std::vector<std::vector<std::vector<TString>>>& data,
+        const TResultMatcher& resultMatcher,
+        EExecutionBackend executionBackend)
+    {
+        auto query = Prepare(queryString, std::map<TString, TDataSplit>{{"//t", dataSplit}}, {}, /*syntaxVersion*/ 1);
+        auto rows = RunOnCoordinator(query, data, executionBackend);
+
+        resultMatcher(rows, *query->GetTableSchema());
+    }
+
+    std::vector<std::vector<std::vector<TString>>> RandomSplitData(const std::vector<TString>& data)
+    {
+        auto result = std::vector<std::vector<std::vector<TString>>>();
+
+        result.emplace_back();
+        result.back().emplace_back();
+
+        for (auto& row : data) {
+            if (rand() % 400 == 0) {
+                result.emplace_back();
+                result.back().emplace_back();
+            }
+
+            if (rand() % 400 == 0) {
+                result.back().emplace_back();
+            }
+
+            result.back().back().emplace_back(row);
+        }
+
+        return result;
+    }
+
+    void EvaluateFullCoordinatedGroupBy(
+        const TString& query,
+        const TDataSplit& dataSplit,
+        const std::vector<TString>& data,
+        const TResultMatcher& resultMatcher,
+        int iterations = 100)
+    {
+        for (int i = 0; i < iterations; ++i) {
+            auto sources = RandomSplitData(data);
+            EvaluateFullCoordinatedGroupByImpl(query, dataSplit, sources, resultMatcher, EExecutionBackend::Native);
+        }
+
+        if (EnableWebAssemblyInUnitTests()) {
+            for (int i = 0; i < iterations; ++i) {
+                auto sources = RandomSplitData(data);
+                EvaluateFullCoordinatedGroupByImpl(query, dataSplit, sources, resultMatcher, EExecutionBackend::WebAssembly);
+            }
+        }
     }
 
     const IEvaluatorPtr Evaluator_ = CreateEvaluator(New<TExecutorConfig>());
@@ -2875,6 +3149,96 @@ TEST_F(TQueryEvaluateTest, GroupByString)
     SUCCEED();
 }
 
+TEST_F(TQueryEvaluateTest, GroupByWithAvgCoordinated)
+{
+    auto split = MakeSplit({
+        {"k", EValueType::Int64, ESortOrder::Ascending},
+        {"v", EValueType::Int64},
+    });
+
+    std::vector<std::vector<TString>> source;
+
+    for (int i = 0; i < 6; ++i) {
+        if (i % 2 == 0) {
+            source.emplace_back();
+        }
+        source.back().push_back(Format("k=%v;v=%v", i, i));
+    }
+
+    {
+        auto resultSplit = MakeSplit({
+            {"av", EValueType::Double},
+        });
+
+        auto result = YsonToRows({
+            "av=0.0",
+            "av=1.0",
+            "av=2.0",
+            "av=3.0",
+            "av=4.0",
+            "av=5.0",
+        }, resultSplit);
+
+        EvaluateCoordinatedGroupBy(
+            "avg(v) as av FROM [//t] group by k",
+            split,
+            source,
+            OrderedResultMatcher(result, {"av"}));
+    }
+}
+
+TEST_F(TQueryEvaluateTest, GroupByWithAvgFullCoordinated)
+{
+    auto split = MakeSplit({
+        {"k0", EValueType::Int64, ESortOrder::Ascending},
+        {"k1", EValueType::Int64, ESortOrder::Ascending},
+        {"v", EValueType::Int64},
+    });
+
+    auto source = [] {
+        auto source = std::vector<TString>();
+        int k0 = 0;
+        for (int cardinality = 0; cardinality < 100; ++cardinality) {
+            int k1 = 0;
+            for (int identical = 0; identical < 3; ++identical) {
+                for (int value = 0; value < cardinality; ++value) {
+                    source.push_back(Format("k0=%v;k1=%v;v=%v", k0, k1, value));
+                    ++k1;
+                }
+            }
+            ++k0;
+        }
+        return source;
+    }();
+
+    {
+        auto resultSplit = MakeSplit({
+            {"av", EValueType::Uint64},
+        });
+
+        auto resultRows = std::vector<TString>();
+        for (int i = 1; i < 100; ++i) {
+            resultRows.push_back(Format("av=%vu", i));
+        }
+
+        auto result = YsonToRows(resultRows, resultSplit);
+
+        EvaluateFullCoordinatedGroupBy(
+            "cardinality(v) as av FROM [//t] group by k0",
+            split,
+            source,
+            OrderedResultMatcher(result, {"av"}),
+            /*iterations*/ 1);
+
+        EvaluateFullCoordinatedGroupBy(
+            "cardinality(v) as av FROM [//t] group by k0 limit 10000",
+            split,
+            source,
+            ResultMatcher(result),
+            /*iterations*/ 1);
+    }
+}
+
 TEST_F(TQueryEvaluateTest, GroupByOrderByCoordinated1)
 {
     auto split = MakeSplit({
@@ -3217,23 +3581,6 @@ TEST_F(TQueryEvaluateTest, GroupByWithNoKeyColumnsInTableSchema)
 }
 
 // TODO(dtorilov): Coordinated tests for totals.
-
-TEST_F(TQueryEvaluateTest, GroupByAny)
-{
-    auto split = MakeSplit({
-        {"a", EValueType::Int64},
-        {"b", EValueType::Int64}
-    });
-
-    std::vector<TString> source;
-
-    EXPECT_THROW_THAT(
-        Evaluate("x, sum(b) as t FROM [//t] group by to_any(a) as x",
-            split, source,  [] (TRange<TRow> /*result*/, const TTableSchema& /*tableSchema*/) { }),
-        HasSubstr("Type mismatch in expression"));
-
-    SUCCEED();
-}
 
 TEST_F(TQueryEvaluateTest, GroupByAlias)
 {
@@ -6126,9 +6473,13 @@ TEST_F(TQueryEvaluateTest, YPathGetInt64Fail)
         "yson={b={c=4};d=[1;2]};ypath=\"/b/d\"",
         "yson={b={c=4};d=[1;2]};ypath=\"/d/2\"",
         "yson={b={c=4};d=[1;2u]};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4}d=[1;2}};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/d1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"//d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/@d/1\"",
     };
 
@@ -6215,9 +6566,13 @@ TEST_F(TQueryEvaluateTest, YPathGetUint64Fail)
         "yson={b={c=4u};d=[1u;2u]};ypath=\"/b/d\"",
         "yson={b={c=4u};d=[1u;2u]};ypath=\"/d/2\"",
         "yson={b={c=4u};d=[1u;2]};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4u}d=[1u;2u}};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4u};d=[1u;2u}};ypath=\"/d1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4u};d=[1u;2u}};ypath=\"//d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4u};d=[1u;2u}};ypath=\"/@d/1\"",
     };
 
@@ -6304,9 +6659,13 @@ TEST_F(TQueryEvaluateTest, YPathGetDoubleFail)
         "yson={b={c=4};d=[1;2]};ypath=\"/b/d\"",
         "yson={b={c=4};d=[1;2]};ypath=\"/d/2\"",
         "yson={b={c=4};d=[1;2u]};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4}d=[1;2}};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/d1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"//d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/@d/1\"",
     };
 
@@ -6393,9 +6752,13 @@ TEST_F(TQueryEvaluateTest, YPathGetBooleanFail)
         "yson={b={c=4};d=[1;2]};ypath=\"/b/d\"",
         "yson={b={c=4};d=[1;2]};ypath=\"/d/2\"",
         "yson={b={c=4};d=[1;2u]};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4}d=[1;2}};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/d1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"//d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/@d/1\"",
     };
 
@@ -6483,9 +6846,13 @@ TEST_F(TQueryEvaluateTest, YPathGetStringFail)
         "yson={b={c=4};d=[1;2]};ypath=\"/b/d\"",
         "yson={b={c=4};d=[1;2]};ypath=\"/d/2\"",
         "yson={b={c=4};d=[1;2u]};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4}d=[1;2}};ypath=\"/d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/d1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"//d/1\"",
+        /* Balancing curly bracket to fix text editor navigation { */
         "yson={b={c=4};d=[1;2}};ypath=\"/@d/1\"",
     };
 
@@ -6550,6 +6917,8 @@ TEST_F(TQueryEvaluateTest, CompareAny)
         "a=1.0;b=1.0;",
         "a=x;b=y;",
         "a=x;b=x;",
+        "a=[1;2;3];b=[1;2;3];",
+        "a=[1;2;3];b=[1;3;4];",
     };
 
     auto resultSplit = MakeSplit({
@@ -6572,6 +6941,8 @@ TEST_F(TQueryEvaluateTest, CompareAny)
         "r1=%false;r2=%false;r3=%true;r4=%true;r5=%true;r6=%false",
         "r1=%true;r2=%false;r3=%true;r4=%false;r5=%false;r6=%true",
         "r1=%false;r2=%false;r3=%true;r4=%true;r5=%true;r6=%false",
+        "r1=%false;r2=%false;r3=%true;r4=%true;r5=%true;r6=%false",
+        "r1=%true;r2=%false;r3=%true;r4=%false;r5=%false;r6=%true",
     }, resultSplit);
 
     Evaluate("a < b as r1, a > b as r2, a <= b as r3, a >= b as r4, a = b as r5, a != b as r6 FROM [//t]",
@@ -6686,6 +7057,135 @@ TEST_F(TQueryEvaluateTest, ToAnyAndCompare)
         }), {
             "a=x;"},
         ResultMatcher(result));
+
+    SUCCEED();
+}
+
+TEST_F(TQueryEvaluateTest, YsonStringToAny)
+{
+    // TODO(dtorilov): Add WebAssembly UDF.
+    {
+        auto split = MakeSplit({{"a", EValueType::String}});
+        auto source = std::vector<TString>{
+            R"(a="1")",
+            R"(a="1u")",
+            R"(a="1.0")",
+            R"(a="abc")",
+            R"(a="%true")",
+
+            R"(a="{}")",
+            R"(a="{b=1}")",
+            R"(a="{b=1u}")",
+            R"(a="{b=1.0}")",
+            R"(a="{b=abc}")",
+            R"(a="{b=%true}")",
+            R"(a="{b=[]}")",
+            R"(a="{b=[1;2;3]}")",
+            R"(a="{b=[1;abc;3.14;%false]}")",
+            R"(a="{b=[1;2;3];c=42u}")",
+
+            R"(a="[]")",
+            R"(a="[1]")",
+            R"(a="[1u]")",
+            R"(a="[1.0]")",
+            R"(a="[abc]")",
+            R"(a="[%true]")",
+            R"(a="[[]]")",
+            R"(a="[[1;2;3]]")",
+            R"(a="[[1;abc;3.14;%false]]")",
+            R"(a="[[1;2;3];42u]")",
+        };
+
+        auto resultSplit = MakeSplit({{"r", EValueType::Any}});
+        auto result = YsonToRows({
+            R"(r=1)",
+            R"(r=1u)",
+            R"(r=1.0)",
+            R"(r=abc)",
+            R"(r=%true)",
+
+            R"(r={})",
+            R"(r={b=1})",
+            R"(r={b=1u})",
+            R"(r={b=1.0})",
+            R"(r={b=abc})",
+            R"(r={b=%true})",
+            R"(r={b=[]})",
+            R"(r={b=[1;2;3]})",
+            R"(r={b=[1;abc;3.14;%false]})",
+            R"(r={b=[1;2;3];c=42u})",
+
+            R"(r=[])",
+            R"(r=[1])",
+            R"(r=[1u])",
+            R"(r=[1.0])",
+            R"(r=[abc])",
+            R"(r=[%true])",
+            R"(r=[[]])",
+            R"(r=[[1;2;3]])",
+            R"(r=[[1;abc;3.14;%false]])",
+            R"(r=[[1;2;3];42u])",
+        }, resultSplit);
+
+        auto query = "yson_string_to_any(a) as r FROM [//t]";
+        EvaluateOnlyViaNativeExecutionBackend(query, split, source, ResultMatcher(result));
+    }
+    {
+        auto split = MakeSplit({{"a", EValueType::String}});
+        auto source = std::vector<TString>{R"(a="#")"};
+
+        auto resultSplit = MakeSplit({{"r", EValueType::Boolean}});
+        auto result = YsonToRows({R"(r=%true)"}, resultSplit);
+
+        auto query = "yson_string_to_any(a) = make_entity() as r FROM [//t]";
+        EvaluateOnlyViaNativeExecutionBackend(query, split, source, ResultMatcher(result));
+    }
+    {
+        auto split = MakeSplit({{"a", EValueType::String}});
+        auto source = std::vector<TString>{R"(a=dummy)"};
+
+        auto resultSplit = MakeSplit({{"r", EValueType::Any}});
+        auto result = YsonToRows({R"(r=[""])"}, resultSplit);
+
+        auto query = "make_list(yson_string_to_any('\"\"')) as r FROM [//t]";
+        EvaluateOnlyViaNativeExecutionBackend(query, split, source, ResultMatcher(result));
+    }
+    {
+        auto split = MakeSplit({{"a", EValueType::String}});
+        auto source = std::vector<TString>{R"(a=dummy)"};
+
+        auto resultSplit = MakeSplit({});
+        auto result = YsonToRows({}, resultSplit);
+
+        auto query = "yson_string_to_any('') as r FROM [//t]";
+        EXPECT_THROW_THAT(
+            EvaluateOnlyViaNativeExecutionBackend(query, split, source, ResultMatcher(result)),
+            HasSubstr("Error occurred while parsing YSON"));
+    }
+    {
+        auto split = MakeSplit({{"a", EValueType::String}});
+        auto source = std::vector<TString>{R"(a=dummy)"};
+
+        auto resultSplit = MakeSplit({});
+        auto result = YsonToRows({}, resultSplit);
+
+        auto query = "yson_string_to_any('[[1;2;3]') as r FROM [//t]";
+        EXPECT_THROW_THAT(
+            EvaluateOnlyViaNativeExecutionBackend(query, split, source, ResultMatcher(result)),
+            HasSubstr("Unexpected \"finish\""));
+    }
+    {
+        auto split = MakeSplit({{"a", EValueType::String}});
+        auto source = std::vector<TString>{R"(a="")"};
+
+        auto resultSplit = MakeSplit({});
+        auto result = YsonToRows({}, resultSplit);
+
+        auto query = "yson_string_to_any(a) as r FROM [//t]";
+        EXPECT_THROW_THAT(
+            EvaluateOnlyViaNativeExecutionBackend(query, split, source, ResultMatcher(result)),
+            HasSubstr("Error occurred while parsing YSON"));
+    }
 
     SUCCEED();
 }
@@ -7777,9 +8277,7 @@ TEST_F(TQueryEvaluateTest, ListExpr)
 
     auto result = YsonToRows(source, split);
 
-    Evaluate("a FROM [//t]", split, source, ResultMatcher(result, New<TTableSchema>(std::vector<TColumnSchema>{
-        {"a", ListLogicalType(SimpleLogicalType(ESimpleLogicalValueType::Int32))}
-    })));
+    Evaluate("a FROM [//t]", split, source, ResultMatcher(result));
 }
 
 TEST_F(TQueryEvaluateTest, ListExprToAny)
@@ -7793,9 +8291,7 @@ TEST_F(TQueryEvaluateTest, ListExprToAny)
 
     auto result = YsonToRows(source, split);
 
-    Evaluate("to_any(a) as b FROM [//t]", split, source, ResultMatcher(result, New<TTableSchema>(std::vector<TColumnSchema>{
-        {"b", ESimpleLogicalValueType::Any}
-    })));
+    Evaluate("to_any(a) as b FROM [//t]", split, source, ResultMatcher(result));
 }
 
 TEST_F(TQueryEvaluateTest, CoordinatedMaxGroupBy)
@@ -8715,6 +9211,7 @@ INSTANTIATE_TEST_SUITE_P(
         std::tuple("any=<attribute=attribute>", "Unexpected \"finish\""),
         std::tuple("any={", "Unexpected \"finish\""),
         std::tuple("any=}", "Error occurred while parsing YSON"),
+        /* Balancing curly bracket to fix text editor navigation { */
         std::tuple("any={a=}", "Unexpected \"}\""),
         std::tuple("any={<attribute=attribute>}", "Unexpected \"<\""),
         std::tuple("any=[<attribute=attribute>]", "Unexpected \"]\""),
@@ -9318,15 +9815,19 @@ TEST_F(TQueryEvaluateTest, ListHasIntersection)
         {"b", EValueType::Any},
     });
     std::vector<TString> source = {
-        "a=[1;2;3];b=[4;6;2]",
+        "a=[1;2;3];b=[4;6;2;#]",
         "a=[\"a\"; \"b\"];b=[\"a\"]",
         "a=[1;2;3];b=[4;6]",
         "a=[%true];b=[]",
+        "a=[#];b=[#]",
+        "a=[1;#;3];b=[#;2;#]",
     };
 
     auto result = YsonToRows({
         "has_intersection=%true",
         "has_intersection=%true",
+        "has_intersection=%false",
+        "has_intersection=%false",
         "has_intersection=%false",
         "has_intersection=%false",
     }, MakeSplit({{"has_intersection", EValueType::Boolean},}));
@@ -9337,8 +9838,70 @@ TEST_F(TQueryEvaluateTest, ListHasIntersection)
         source,
         ResultMatcher(result));
 
+    EvaluateOnlyViaNativeExecutionBackend(
+        "list_has_intersection(b, a) as has_intersection from [//t]",
+        split,
+        source,
+        ResultMatcher(result));
+
     SUCCEED();
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(TQueryEvaluateTest, OrderByAny)
+{
+    auto split = MakeSplit({{"a", EValueType::Any}});
+    auto source = std::vector<TString>{
+        "a=[1;2;3]",
+        "a=[2;4;5]",
+        "a=[2;3;4]",
+        "a=[0]",
+    };
+
+    auto resultSplit = MakeSplit({{"a", EValueType::Any}});
+    auto result = YsonToRows({
+        "a=[0]",
+        "a=[1;2;3]",
+        "a=[2;3;4]",
+        "a=[2;4;5]",
+    }, resultSplit);
+
+    Evaluate("a FROM [//t] order by a limit 4", split, source,  ResultMatcher(result)),
+    SUCCEED();
+}
+
+TEST_F(TQueryEvaluateTest, GroupByAny)
+{
+    auto split = MakeSplit({{"a", EValueType::Any}});
+    auto source = std::vector<TString>{
+        "a=[1;2;3]",
+        "a=[2;4;5]",
+        "a=[2;3;4]",
+        "a=[0]",
+
+        "a=[2;3;4]",
+        "a=[2;4;5]",
+        "a=[1;2;3]",
+
+        "a=[0]",
+        "a=[0]",
+
+        "a=[1;2;3]",
+    };
+
+    auto resultSplit = MakeSplit({{"a", EValueType::Any}});
+    auto result = YsonToRows({
+        "a=[0]",
+        "a=[1;2;3]",
+        "a=[2;3;4]",
+        "a=[2;4;5]",
+    }, resultSplit);
+
+    Evaluate("a FROM [//t] group by a order by a limit 4", split, source,  ResultMatcher(result)),
+    SUCCEED();
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 } // namespace

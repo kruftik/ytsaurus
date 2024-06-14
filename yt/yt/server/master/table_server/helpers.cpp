@@ -55,31 +55,35 @@ TFuture<TYsonString> GetQueueAgentAttributeAsync(
         case EInternedAttributeKey::QueueConsumerPartitions:
             objectKind = "consumer";
             break;
+        case EInternedAttributeKey::QueueProducerStatus:
+        case EInternedAttributeKey::QueueProducerPartitions:
+            objectKind = "producer";
+            break;
         default:
             YT_ABORT();
     }
 
     auto queueAgentStage = GetEffectiveQueueAgentStage(bootstrap, queueAgentStageOptional);
 
-    auto getQueueAgentChannelFromClusterOrNull = [&](TString clusterName) -> IChannelPtr {
+    auto findQueueAgentChannelFromCluster = [&] (TString clusterName) -> IChannelPtr {
         // NB: instead of using cluster connection from our bootstrap, we take it
         // from the cluster directory. This works as a poor man's dynamic cluster connection
         // allowing us to reconfigure queue agent stages without need to update master config.
         auto dynamicConnection = connection->GetClusterDirectory()->FindConnection(clusterName);
 
-        return dynamicConnection->GetQueueAgentChannelOrNull(queueAgentStage);
+        return dynamicConnection->FindQueueAgentChannel(queueAgentStage);
     };
 
     IChannelPtr queueAgentChannel = nullptr;
 
-    queueAgentChannel = getQueueAgentChannelFromClusterOrNull(*currentClusterName);
+    queueAgentChannel = findQueueAgentChannelFromCluster(*currentClusterName);
 
     if (!queueAgentChannel) {
         for (const auto& clusterName : connection->GetClusterDirectory()->GetClusterNames()) {
             if (clusterName == *currentClusterName) {
                 continue;
             }
-            queueAgentChannel = getQueueAgentChannelFromClusterOrNull(clusterName);
+            queueAgentChannel = findQueueAgentChannelFromCluster(clusterName);
             if (queueAgentChannel) {
                 break;
             }
@@ -100,10 +104,12 @@ TFuture<TYsonString> GetQueueAgentAttributeAsync(
     switch (key) {
         case EInternedAttributeKey::QueueStatus:
         case EInternedAttributeKey::QueueConsumerStatus:
+        case EInternedAttributeKey::QueueProducerStatus:
             remoteKey = "/status";
             break;
         case EInternedAttributeKey::QueuePartitions:
         case EInternedAttributeKey::QueueConsumerPartitions:
+        case EInternedAttributeKey::QueueProducerPartitions:
             remoteKey = "/partitions";
             break;
         default:

@@ -12,6 +12,8 @@
 
 #include <yt/yt/core/yson/null_consumer.h>
 
+#include <yt/yt/library/vector_hdrf/resource_helpers.h>
+
 #include <library/cpp/testing/gtest/gtest.h>
 
 namespace NYT::NScheduler {
@@ -26,9 +28,9 @@ using namespace NControllerAgent;
 
 // NB(eshcherbin): Set to true, when in pain.
 static constexpr bool EnableDebugLogging = false;
-static const NLogging::TLogger Logger = EnableDebugLogging
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, EnableDebugLogging
     ? NLogging::TLogger("TestDebug")
-    : NLogging::TLogger();
+    : NLogging::TLogger());
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -150,12 +152,6 @@ public:
         return result;
     }
 
-    TRefCountedExecNodeDescriptorMapPtr CalculateExecNodeDescriptors(
-        const TSchedulingTagFilter& /*filter*/) const override
-    {
-        YT_UNIMPLEMENTED();
-    }
-
     void AbortAllocationsAtNode(NNodeTrackerClient::TNodeId /*nodeId*/, EAbortReason /*reason*/) override
     {
         YT_UNIMPLEMENTED();
@@ -249,6 +245,11 @@ public:
         return stub;
     }
 
+    bool IsFairSharePreUpdateOffloadingEnabled() const override
+    {
+        return true;
+    }
+
     TFairShareTreeAllocationSchedulerNodeState* GetNodeState(const TExecNodePtr node)
     {
         return &GetOrCrash(NodeToState_, node);
@@ -321,7 +322,7 @@ class TOperationControllerStrategyHostMock
 {
 public:
     explicit TOperationControllerStrategyHostMock(TJobResourcesWithQuotaList allocationResourcesList)
-        : AllocationResourcesList(std::move(allocationResourcesList))
+        : AllocationResourcesList_(std::move(allocationResourcesList))
     { }
 
     TControllerEpoch GetEpoch() const override
@@ -342,7 +343,7 @@ public:
     TCompositeNeededResources GetNeededResources() const override
     {
         TJobResources totalResources;
-        for (const auto& resources : AllocationResourcesList) {
+        for (const auto& resources : AllocationResourcesList_) {
             totalResources += resources.ToJobResources();
         }
         return TCompositeNeededResources{.DefaultResources = totalResources};
@@ -354,7 +355,7 @@ public:
     TJobResourcesWithQuotaList GetMinNeededAllocationResources() const override
     {
         TJobResourcesWithQuotaList minNeededResourcesList;
-        for (const auto& resources : AllocationResourcesList) {
+        for (const auto& resources : AllocationResourcesList_) {
             bool dominated = false;
             for (const auto& minNeededResourcesElement : minNeededResourcesList) {
                 if (Dominates(resources.ToJobResources(), minNeededResourcesElement.ToJobResources())) {
@@ -382,7 +383,7 @@ public:
     }
 
 private:
-    TJobResourcesWithQuotaList AllocationResourcesList;
+    TJobResourcesWithQuotaList AllocationResourcesList_;
 };
 
 using TOperationControllerStrategyHostMockPtr = TIntrusivePtr<TOperationControllerStrategyHostMock>;
@@ -575,7 +576,7 @@ protected:
     {
         return New<TFairShareTreeAllocationScheduler>(
             /*treeId*/ "default",
-            StrategyLogger,
+            StrategyLogger(),
             std::move(host),
             FairShareTreeHostMock_.Get(),
             strategyHost,
@@ -595,7 +596,7 @@ protected:
             FairShareTreeElementHostMock_.Get(),
             TreeConfig_,
             "default",
-            SchedulerLogger);
+            SchedulerLogger());
     }
 
     TSchedulerPoolElementPtr CreateTestPool(ISchedulerStrategyHost* strategyHost, const TString& name, TPoolConfigPtr config = New<TPoolConfig>())
@@ -609,7 +610,7 @@ protected:
             /*defaultConfigured*/ true,
             TreeConfig_,
             "default",
-            SchedulerLogger);
+            SchedulerLogger());
     }
 
     TPoolConfigPtr CreateSimplePoolConfig(double strongGuaranteeCpu = 0.0, double weight = 1.0)
@@ -670,7 +671,7 @@ protected:
             FairShareTreeElementHostMock_.Get(),
             operation,
             "default",
-            SchedulerLogger);
+            SchedulerLogger());
 
         operationElement->AttachParent(parent, SlotIndex_++);
         parent->EnableChild(operationElement);
@@ -769,8 +770,12 @@ protected:
             /*controllerEpoch*/ TControllerEpoch(0),
             execNode,
             startTime,
-            allocationResources.ToJobResources(),
-            allocationResources.DiskQuota(),
+            TAllocationStartDescriptor{
+                .Id = allocationId,
+                .ResourceLimits = TJobResourcesWithQuota{
+                    allocationResources.ToJobResources(),
+                    allocationResources.DiskQuota()},
+            },
             /*preemptionMode*/ EPreemptionMode::Normal,
             /*treeId*/ "",
             /*schedulingIndex*/ UndefinedSchedulingIndex);
@@ -792,15 +797,24 @@ protected:
     {
         ResetFairShareFunctionsRecursively(rootElement.Get());
 
+        auto totalResourceLimits = strategyHost->GetResourceLimits(TreeConfig_->NodesFilter);
+
+        TFairSharePreUpdateContext preUpdateContext{
+            .Now = now,
+            .TotalResourceLimits = totalResourceLimits,
+        };
+
         NVectorHdrf::TFairShareUpdateContext context(
-            /*totalResourceLimits*/ strategyHost->GetResourceLimits(TreeConfig_->NodesFilter),
+            totalResourceLimits,
             TreeConfig_->MainResource,
             TreeConfig_->IntegralGuarantees->PoolCapacitySaturationPeriod,
             TreeConfig_->IntegralGuarantees->SmoothPeriod,
             now,
             previousUpdateTime);
 
-        rootElement->PreUpdate(&context);
+        rootElement->InitializeFairShareUpdate(now, context);
+
+        rootElement->PreUpdate(&preUpdateContext);
 
         NVectorHdrf::TFairShareUpdateExecutor updateExecutor(rootElement, &context);
         updateExecutor.Run();
@@ -828,7 +842,8 @@ protected:
             /*resourceUsage*/ TJobResources{},
             /*resourceLimits*/ TJobResources{},
             /*nodeCount*/ 0,
-            std::move(treeSchedulingSnapshot));
+            std::move(treeSchedulingSnapshot),
+            TJobResourcesByTagFilter{});
     }
 
     TScheduleAllocationsContextWithDependencies PrepareScheduleAllocationsContext(
@@ -850,7 +865,7 @@ protected:
             /*schedulingInfoLoggingEnabled*/ true,
             strategyHost,
             /*scheduleAllocationsDeadlineReachedCounter*/ NProfiling::TCounter{},
-            SchedulerLogger);
+            SchedulerLogger());
 
         return TScheduleAllocationsContextWithDependencies{
             .SchedulingContext = std::move(schedulingContext),
@@ -1004,7 +1019,7 @@ TEST_F(TFairShareTreeAllocationSchedulerTest, DontSuggestMoreResourcesThanOperat
     std::vector<TFuture<void>> futures;
     auto actionQueue = New<NConcurrency::TActionQueue>();
     for (int i = 0; i < 2; ++i) {
-        auto future = BIND([&, i]() {
+        auto future = BIND([&, i] {
             DoTestSchedule(strategyHost.Get(), treeSnapshot, execNodes[i], operationElement);
         }).AsyncVia(actionQueue->GetInvoker()).Run();
         futures.push_back(std::move(future));
@@ -1120,7 +1135,8 @@ TEST_F(TFairShareTreeAllocationSchedulerTest, TestConditionalPreemption)
 
     auto donorOperation = New<TOperationStrategyHostMock>(TJobResourcesWithQuotaList(5, allocationResources));
     auto donorOperationSpec = New<TStrategyOperationSpec>();
-    donorOperationSpec->MaxUnpreemptibleRunningAllocationCount = 0;
+    donorOperationSpec->NonPreemptibleResourceUsageThreshold = New<TJobResourcesConfig>();
+    donorOperationSpec->NonPreemptibleResourceUsageThreshold->UserSlots = 0;
     auto donorOperationElement = CreateTestOperationElement(
         strategyHost.Get(),
         treeScheduler,
@@ -1464,7 +1480,7 @@ TEST_F(TFairShareTreeAllocationSchedulerTest, TestSchedulableChildSetWithBatchSc
             .Times(2)
             .WillRepeatedly(testing::Invoke([&] (auto /*context*/, auto /*allocationLimits*/, auto /*diskResourceLimits*/, auto /*treeId*/, auto /*poolPath*/, auto /*treeConfig*/) {
                 auto result = New<TControllerScheduleAllocationResult>();
-                result->StartDescriptor.emplace(TAllocationId(TGuid::Create()), operationAllocationResources);
+                result->StartDescriptor.emplace(TAllocationStartDescriptor{TAllocationId(TGuid::Create()), operationAllocationResources, TAllocationAttributes{}});
                 return MakeFuture<TControllerScheduleAllocationResultPtr>(
                     TErrorOr<TControllerScheduleAllocationResultPtr>(result));
             }));
@@ -1672,7 +1688,7 @@ TEST_F(TFairShareTreeAllocationSchedulerTest, TestSchedulableChildSetWithoutBatc
             .Times(2)
             .WillRepeatedly(testing::Invoke([&] (auto /*context*/, auto /*allocationLimits*/, auto /*diskResourceLimits*/, auto /*treeId*/, auto /*poolPath*/, auto /*treeConfig*/) {
                 auto result = New<TControllerScheduleAllocationResult>();
-                result->StartDescriptor.emplace(TAllocationId(TGuid::Create()), operationAllocationResources);
+                result->StartDescriptor.emplace(TAllocationStartDescriptor{TAllocationId(TGuid::Create()), operationAllocationResources, TAllocationAttributes{}});
                 return MakeFuture<TControllerScheduleAllocationResultPtr>(
                     TErrorOr<TControllerScheduleAllocationResultPtr>(result));
             }));

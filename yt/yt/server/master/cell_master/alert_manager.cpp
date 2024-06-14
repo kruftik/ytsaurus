@@ -24,7 +24,7 @@ using NObjectServer::TCellTag;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CellMasterLogger;
+static constexpr auto& Logger = CellMasterLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -43,12 +43,12 @@ public:
 
         RegisterLoader(
             "AlertManager",
-            BIND(&TAlertManager::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TAlertManager::Load, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "AlertManager",
-            BIND(&TAlertManager::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TAlertManager::Save, Unretained(this)));
 
         RegisterMethod(BIND_NO_PROPAGATE(&TAlertManager::HydraSetCellAlerts, Unretained(this)));
     }
@@ -184,7 +184,7 @@ private:
         if (multicellManager->IsPrimaryMaster()) {
             const auto& hydraManager = Bootstrap_->GetHydraFacade()->GetHydraManager();
             YT_UNUSED_FUTURE(CreateMutation(hydraManager, request)
-                ->CommitAndLog(Logger));
+                ->CommitAndLog(Logger()));
         } else {
             multicellManager->PostToPrimaryMaster(request, /*reliable*/ false);
         }

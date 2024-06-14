@@ -29,44 +29,51 @@ TDiskHealthChecker::TDiskHealthChecker(
     , TotalTimer_(profiler.Timer("/disk_health_check/total_time"))
     , ReadTimer_(profiler.Timer("/disk_health_check/read_time"))
     , WriteTimer_(profiler.Timer("/disk_health_check/write_time"))
+    , PeriodicExecutor_(New<TPeriodicExecutor>(
+        CheckInvoker_,
+        BIND(&TDiskHealthChecker::OnCheck, MakeWeak(this)),
+        Config_->CheckPeriod))
 {
     Logger.AddTag("Path: %v", Path_);
 }
 
 void TDiskHealthChecker::Start()
 {
-    CheckerCookie_ = TDelayedExecutor::Submit(
-        BIND(&TDiskHealthChecker::OnCheck, MakeWeak(this)),
-        Config_->CheckPeriod);
+    PeriodicExecutor_->Start();
 }
 
-void TDiskHealthChecker::Stop()
+TFuture<void> TDiskHealthChecker::Stop()
 {
-    TDelayedExecutor::CancelAndClear(CheckerCookie_);
+    return PeriodicExecutor_->Stop();
 }
 
-TFuture<void> TDiskHealthChecker::RunCheck()
+void TDiskHealthChecker::RunCheck()
 {
-    return BIND(&TDiskHealthChecker::DoRunCheck, MakeStrong(this))
+    YT_VERIFY(!PeriodicExecutor_->IsStarted());
+    return RunCheckWithTimeout()
+        .ThrowOnError();
+}
+
+TError TDiskHealthChecker::RunCheckWithTimeout()
+{
+    return WaitFor(BIND_NO_PROPAGATE(&TDiskHealthChecker::DoRunCheck, MakeStrong(this))
         .AsyncVia(CheckInvoker_)
         .Run()
-        .WithTimeout(Config_->Timeout);
+        .WithTimeout(Config_->Timeout));
 }
 
 void TDiskHealthChecker::OnCheck()
 {
-    RunCheck().Subscribe(BIND(&TDiskHealthChecker::OnCheckCompleted, MakeWeak(this)));
+    OnCheckCompleted(RunCheckWithTimeout());
 }
 
 void TDiskHealthChecker::OnCheckCompleted(const TError& error)
 {
     if (error.IsOK()) {
-        TDelayedExecutor::Submit(
-            BIND(&TDiskHealthChecker::OnCheck, MakeWeak(this)),
-            Config_->CheckPeriod);
-
         return;
     }
+
+    YT_UNUSED_FUTURE(PeriodicExecutor_->Stop());
 
     auto actualError = error.GetCode() == NYT::EErrorCode::Timeout
         ? TError("Disk health check timed out at %v", Path_)
@@ -81,17 +88,21 @@ void TDiskHealthChecker::DoRunCheck()
     YT_LOG_DEBUG("Disk health check started");
 
     if (auto lockFilePath = NFS::CombinePaths(Path_, DisabledLockFileName); NFS::Exists(lockFilePath)) {
-        TError lockFileError;
+        TError lockFileError("Empty lock file found");
         try {
-            lockFileError = NYTree::ConvertTo<TError>(NYson::TYsonString(TFileInput(lockFilePath).ReadAll()));
+            if (
+                auto error = NYTree::ConvertTo<TError>(NYson::TYsonString(TFileInput(lockFilePath).ReadAll()));
+                !error.IsOK())
+            {
+                lockFileError = std::move(error);
+            }
         } catch (const std::exception& ex) {
             YT_LOG_INFO(ex, "Failed to extract error from location lock file");
+            lockFileError = TError("Failed to extract error from location lock file")
+                << ex;
         }
-        auto error = TError("Lock file is found");
-        if (!lockFileError.IsOK()) {
-            error.MutableInnerErrors()->push_back(std::move(lockFileError));
-        }
-        THROW_ERROR(error);
+
+        THROW_ERROR_EXCEPTION(NChunkClient::EErrorCode::LockFileIsFound, "Lock file is found") << std::move(lockFileError);
     }
 
     std::vector<ui8> writeData(Config_->TestSize);
@@ -134,9 +145,8 @@ void TDiskHealthChecker::DoRunCheck()
         if (memcmp(readData.data(), writeData.data(), Config_->TestSize) != 0) {
             THROW_ERROR_EXCEPTION("Test file is corrupt");
         }
-
     } catch (const std::exception& ex) {
-        THROW_ERROR_EXCEPTION("Disk health check failed at %v", Path_)
+        THROW_ERROR_EXCEPTION(NChunkClient::EErrorCode::DiskHealthCheckFailed, "Disk health check failed at %v", Path_)
             << ex;
     }
 

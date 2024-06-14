@@ -50,7 +50,7 @@ using NTransactionClient::TReadTimestampRange;
 
 struct TTabletReaderPoolTag { };
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 static constexpr TDuration DefaultMaxOverdraftDuration = TDuration::Minutes(1);
 
@@ -952,16 +952,16 @@ IVersionedReaderPtr CreateCompactionTabletReader(
     auto rowMerger = CreateVersionedRowMerger(
         mountConfig->RowMergerType,
         New<TRowBuffer>(TTabletReaderPoolTag()),
-        tabletSnapshot->QuerySchema->GetColumnCount(),
-        tabletSnapshot->QuerySchema->GetKeyColumnCount(),
+        tabletSnapshot->QuerySchema,
         TColumnFilter(),
         mountConfig,
         currentTimestamp,
         majorTimestamp,
         tabletSnapshot->ColumnEvaluator,
-        false,
-        false,
-        tabletSnapshot->QuerySchema->GetTtlColumnIndex());
+        tabletSnapshot->CustomRuntimeData,
+        /*lookup*/ false,
+        /*mergeRowsOnFlush*/ false,
+        /*useTtlColumn*/ true);
 
     std::vector<TLegacyOwningKey> boundaries;
     boundaries.reserve(stores.size());

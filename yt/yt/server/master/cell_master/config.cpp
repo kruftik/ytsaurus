@@ -151,6 +151,22 @@ void TTestConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("master_cell_directory_override", &TThis::MasterCellDirectoryOverride)
         .Default();
+    registrar.Parameter("frozen_hive_edges", &TThis::FrozenHiveEdges)
+        .Default()
+        .DontSerializeDefault();
+    registrar.Parameter("discovered_masters_cell_tags", &TThis::DiscoveredMastersCellTags)
+        .Default();
+
+    registrar.Postprocessor([] (TThis* config) {
+        for (const auto& edge : config->FrozenHiveEdges) {
+            if (edge.size() != 2) {
+                config->FrozenHiveEdges.clear();
+
+                THROW_ERROR_EXCEPTION("Wrong Hive edge format; expected 2 values, but got %v",
+                    edge.size());
+            }
+        }
+    });
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -246,8 +262,6 @@ void TCellMasterConfig::Register(TRegistrar registrar)
         .DefaultNew();
     registrar.Parameter("object_service", &TThis::ObjectService)
         .DefaultNew();
-    registrar.Parameter("cypress_manager", &TThis::CypressManager)
-        .DefaultNew();
     registrar.Parameter("cell_manager", &TThis::CellManager)
         .DefaultNew();
     registrar.Parameter("replicated_table_tracker", &TThis::ReplicatedTableTracker)
@@ -283,6 +297,8 @@ void TCellMasterConfig::Register(TRegistrar registrar)
     registrar.Parameter("abort_on_unrecognized_options", &TThis::AbortOnUnrecognizedOptions)
         .Default(false);
     registrar.Parameter("expose_testing_facilities", &TThis::ExposeTestingFacilities)
+        .Default(false);
+    registrar.Parameter("disable_node_connections", &TThis::DisableNodeConnections)
         .Default(false);
 
     registrar.Postprocessor([] (TThis* config) {

@@ -21,6 +21,8 @@
 
 #include <yt/yt/ytlib/auth/native_authenticator.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
 
 #include <yt/yt/ytlib/orchid/orchid_service.h>
@@ -54,7 +56,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ReplicatedTableTrackerLogger;
+static constexpr auto& Logger = ReplicatedTableTrackerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -147,6 +149,7 @@ private:
             std::move(connectionOptions));
 
         NativeConnection_->GetClusterDirectorySynchronizer()->Start();
+        NativeConnection_->GetMasterCellDirectorySynchronizer()->Start();
 
         NativeAuthenticator_ = NApi::NNative::CreateNativeAuthenticator(NativeConnection_);
 
@@ -178,14 +181,16 @@ private:
             &MonitoringManager_,
             &orchidRoot);
 
-        SetNodeByYPath(
-            orchidRoot,
-            "/config",
-            CreateVirtualNode(ConfigNode_));
-        SetNodeByYPath(
-            orchidRoot,
-            "/dynamic_config_manager",
-            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        if (Config_->ExposeConfigInOrchid) {
+            SetNodeByYPath(
+                orchidRoot,
+                "/config",
+                CreateVirtualNode(ConfigNode_));
+            SetNodeByYPath(
+                orchidRoot,
+                "/dynamic_config_manager",
+                CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        }
         if (CoreDumper_) {
             SetNodeByYPath(
                 orchidRoot,

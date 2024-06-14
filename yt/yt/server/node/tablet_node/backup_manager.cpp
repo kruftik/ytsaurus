@@ -9,6 +9,7 @@
 #include "transaction_manager.h"
 #include "transaction.h"
 #include "store_manager.h"
+#include "serialize.h"
 
 #include <yt/yt/server/node/cluster_node/dynamic_config_manager.h>
 #include <yt/yt/server/node/cluster_node/config.h>
@@ -186,11 +187,11 @@ public:
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "BackupManager",
-            BIND(&TBackupManager::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TBackupManager::Save, Unretained(this)));
 
         RegisterLoader(
             "BackupManager",
-            BIND(&TBackupManager::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TBackupManager::Load, Unretained(this)));
 
         const auto& configManager = Bootstrap_->GetDynamicConfigManager();
         Config_ = configManager->GetConfig()->TabletNode->BackupManager;

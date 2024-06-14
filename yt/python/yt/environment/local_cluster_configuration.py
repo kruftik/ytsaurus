@@ -166,6 +166,21 @@ NODE_CONFIG_PATCHES = [
     }
 ]
 
+DYNAMIC_MASTER_CONFIG_PATCHES = [
+    {
+        "cypress_manager": {
+            "default_table_replication_factor": 1,
+            "default_file_replication_factor": 1,
+            "default_journal_replication_factor": 1,
+            "default_journal_read_quorum": 1,
+            "default_journal_write_quorum": 1,
+            "default_hunk_storage_replication_factor": 1,
+            "default_hunk_storage_read_quorum": 1,
+            "default_hunk_storage_write_quorum": 1,
+        }
+    }
+]
+
 # COMPAT(arkady-e1ppa): heartbeat_period, heartbeat_splay, failed_heartbeat_backoff_start_time, failed_heartbeat_backoff_max_time, failed_heartbeat_backoff_multiplier
 DYNAMIC_NODE_CONFIG_PATCHES = [
     {
@@ -260,6 +275,12 @@ def get_patched_dynamic_node_config(yt_config):
     return dyn_node_config
 
 
+def get_patched_dynamic_master_config(yt_config):
+    for patch in DYNAMIC_MASTER_CONFIG_PATCHES:
+        update_inplace(yt_config, patch)
+    return yt_config
+
+
 def modify_cluster_configuration(yt_config, cluster_configuration):
     master = cluster_configuration["master"]
 
@@ -296,6 +317,10 @@ def modify_cluster_configuration(yt_config, cluster_configuration):
     for config in cluster_configuration["queue_agent"]:
         if yt_config.delta_queue_agent_config:
             update_inplace(config, yt_config.delta_queue_agent_config)
+
+    for config in cluster_configuration["kafka_proxy"]:
+        if yt_config.delta_kafka_proxy_config:
+            update_inplace(config, yt_config.delta_kafka_proxy_config)
 
     for config in cluster_configuration["node"]:
         if yt_config.optimize_config:

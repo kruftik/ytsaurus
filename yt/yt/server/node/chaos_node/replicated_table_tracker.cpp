@@ -107,27 +107,32 @@ public:
         std::vector<NTabletClient::TTableReplicaId> replicaIds) override
     {
         return BIND([slot = Slot_, replicaIds = std::move(replicaIds)] {
-            auto latestTimestamp = slot->GetTimestampProvider()->GetLatestTimestamp();
             const auto& chaosManager = slot->GetChaosManager();
 
             TReplicaLagTimes results;
             results.reserve(replicaIds.size());
 
+            THashMap<TReplicationCardId, THashMap<TReplicaId, TDuration>> computedLags;
+
             for (auto replicaId : replicaIds) {
                 auto replicationCardId = ReplicationCardIdFromReplicaId(replicaId);
-                auto *replicationCard = chaosManager->FindReplicationCard(replicationCardId);
-                if (!replicationCard) {
+                auto [replicaIterator, inserted] = computedLags.try_emplace(replicationCardId);
+                if (inserted) {
+                    auto* replicationCard = chaosManager->FindReplicationCard(replicationCardId);
+                    if (!replicationCard) {
+                        continue;
+                    }
+
+                    replicaIterator->second = ComputeReplicasLag(replicationCard->Replicas());
+                }
+
+                const auto& computedLags = replicaIterator->second;
+                auto replicaIt = computedLags.find(replicaId);
+                if (replicaIt == computedLags.end()) {
                     continue;
                 }
 
-                auto* replica = replicationCard->FindReplica(replicaId);
-                if (replica) {
-                    auto minTimestamp = GetReplicationProgressMinTimestamp(replica->ReplicationProgress);
-                    auto lagTime = minTimestamp < latestTimestamp
-                        ? TimestampDiffToDuration(minTimestamp, latestTimestamp).second
-                        : TDuration::Zero();
-                    results.emplace_back(replicaId, lagTime);
-                }
+                results.emplace_back(replicaId, replicaIt->second);
             }
 
             return results;

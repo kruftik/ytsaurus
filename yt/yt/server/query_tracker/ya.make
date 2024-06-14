@@ -8,9 +8,12 @@ SRCS(
     config.cpp
     dynamic_config_manager.cpp
     handler_base.cpp
+    proxy_service.cpp
     query_tracker.cpp
+    query_tracker_proxy.cpp
     mock_engine.cpp
     ql_engine.cpp
+    spyt_discovery.cpp
     spyt_engine.cpp
     yql_engine.cpp
 )
@@ -39,6 +42,8 @@ PEERDIR(
 
     yt/yt/ytlib
     yt/yt/ytlib/query_tracker_client
+
+    yt/yt/client
 )
 
 END()

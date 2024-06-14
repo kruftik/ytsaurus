@@ -1,4 +1,4 @@
-PY23_TEST()
+PY3TEST()
 
 INCLUDE(${ARCADIA_ROOT}/yt/opensource.inc)
 
@@ -81,12 +81,11 @@ DEPENDS(
 )
 
 EXPLICIT_DATA()
-    
+
 IF (NOT OPENSOURCE)
     DEPENDS(
         # These python used for various tests
         yt/python/yt/wrapper/tests/yt_python
-        yt/python/yt/wrapper/tests/yt_python3
         yt/python/yt/wrapper/tests/yt_ipython
     )
 
@@ -123,9 +122,16 @@ RESOURCE(
     yt/java/ytsaurus-client-core/src/test/resources/good-rich-ypath.txt /good-rich-ypath.txt
 )
 
+
 IF (NOT OPENSOURCE)
     RESOURCE(
         yt/python/yt/wrapper/client_impl_yandex.py /modules/client_impl_yandex.py
+    )
+ELSE()
+    # Keep it sync with yt/python/yt/wrapper/tests/system_python/test_paths.txt
+    RESOURCE_FILES(
+        yt/python/yt/wrapper/tests/test_operations_pickling.py
+        yt/python/yt/wrapper/tests/test_tmpfs.py
     )
 ENDIF()
 
@@ -141,7 +147,9 @@ TEST_SRCS(
     test_client.py
     test_command_params.py
     test_cypress_commands.py
+    test_docker_respawn.py
     test_driver.py
+    test_dirtable_commands.py
     test_download_core_dump.py
     test_dynamic_table_commands.py
     test_errors.py
@@ -150,6 +158,7 @@ TEST_SRCS(
     test_ipython.py
     test_job_commands.py
     test_job_tool.py
+    test_jupyter.py
     test_misc.py
     test_module.py
     test_operations.py
@@ -170,13 +179,12 @@ END()
 
 RECURSE_FOR_TESTS(
     serverless
-    py3_only
+    typed_api
 )
 
 IF (NOT OPENSOURCE)
     RECURSE(
         yt_python
-        yt_python3
         yt_ipython
     )
 

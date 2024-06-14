@@ -69,18 +69,28 @@ You may encounter the `{{}}` construction in the source, for example:
 A {{product-name}} cluster is a group of instances located in containers ...
 ```
 
-The `{{product-name}}` is a variable that will be automatically substituted when rendering documentation. Variable values are specified in the `presets.yaml` files located in the `ytsaurus/yt/docs/ru` and `ytsaurus/yt/docs/en` directories. Below is the example:
+The `{{product-name}}` is a variable that will be automatically substituted when rendering documentation. Variable values are specified in the `presets.yaml` file:
 
 ```
-# The presets.yaml file.
-default:
+public:
     product-name: YTsaurus
     audience: public
     source-root: https://github.com/ytsaurus/ytsaurus/tree/main
     ...
 ```
 
-You can read about variables in the official [YFM official documentation](https://diplodoc.com/docs/en/project/presets).
+For each version of the documentation, a separate `presets.yaml` file is specified:
+
+```
+|-- ytsaurus/yt/docs/       
+    |-- ru/                 
+        |-- presets.yaml    # Variables from this file will be resolved in the Russian documentation.
+    |-- en/                 
+        |-- presets.yaml    # These variables will be resolved in the English documentation.
+    |-- presets.yaml        # These variables will be resolved in both the Russian and English documentation.
+```
+
+You can read more about variables in the official [YFM documentation](https://diplodoc.com/docs/en/project/presets).
 
 ### Reused Content
 
@@ -347,7 +357,7 @@ Use an ordered list when order matters, and unordered list otherwise. Every item
 When working with tables, keep the following in mind:
 
 - There must be a reference to the table, for example: "Table 1 shows...".
-- It is mandatory to add a table title: `<small>Table N — Title of the table`. It should start with a capital letter, without a period at the end. 
+- It is mandatory to add a table title: `<small>Table N — Title of the table</small>`. It should start with a capital letter, without a period at the end. 
 - Periods are not needed in the table: neither in the header nor in the cells.
 
 Example:
@@ -355,7 +365,7 @@ Example:
 ```
 The attributes of subjects are shown in Table 1.
 
-<small>Table 1 — Attributes of Subjects<small>
+<small>Table 1 — Attributes of Subjects</small>
 
 | **Attribute**       | **Type**        | **Description**                                           |
 | ------------------- | --------------- | --------------------------------------------------------- |

@@ -81,8 +81,12 @@ void ToProto(NProto::TReviveOperationResult* resultProto, const TOperationContro
         ToProto(allocationProto->mutable_allocation_id(), allocation.AllocationId);
         allocationProto->set_start_time(ToProto<ui64>(allocation.StartTime));
         allocationProto->set_preemptible_progress_start_time(ToProto<ui64>(allocation.PreemptibleProgressStartTime));
-        ToProto(allocationProto->mutable_resource_limits(), allocation.ResourceLimits);
-        ToProto(allocationProto->mutable_disk_quota(), allocation.DiskQuota);
+        ToProto(
+            allocationProto->mutable_resource_limits(),
+            TJobResourcesWithQuota(
+                allocation.ResourceLimits,
+                allocation.DiskQuota));
+
         allocationProto->set_tree_id(allocation.TreeId);
         allocationProto->set_node_id(ToProto<ui32>(allocation.NodeId));
         allocationProto->set_node_address(allocation.NodeAddress);
@@ -161,7 +165,7 @@ public:
 
     ~TOperationControllerWrapper() override
     {
-        auto Logger = ControllerLogger.WithTag("OperationId: %v", Id_);
+        auto Logger = ControllerLogger().WithTag("OperationId: %v", Id_);
 
         const auto snapshot = GetMemoryUsageSnapshot();
         YT_VERIFY(snapshot);
@@ -269,9 +273,9 @@ public:
         return Underlying_->Dispose();
     }
 
-    bool IsThrottling() const noexcept override
+    bool ShouldSkipScheduleAllocationRequest() const noexcept override
     {
-        return Underlying_->IsThrottling();
+        return Underlying_->ShouldSkipScheduleAllocationRequest();
     }
 
     bool ShouldSkipRunningJobEvents() const noexcept override
@@ -367,6 +371,11 @@ public:
     void OnAllocationAborted(TAbortedAllocationSummary&& abortedAllocationSummary) override
     {
         return DoExecuteGuarded(&IOperationControllerSchedulerHost::OnAllocationAborted, std::move(abortedAllocationSummary));
+    }
+
+    void OnAllocationFinished(TFinishedAllocationSummary&& finishedAllocationSummary) override
+    {
+        return DoExecuteGuarded(&IOperationControllerSchedulerHost::OnAllocationFinished, std::move(finishedAllocationSummary));
     }
 
     void AbandonJob(TJobId jobId) override

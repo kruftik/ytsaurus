@@ -14,8 +14,6 @@
 
 #include <yt/yt/core/logging/log.h>
 
-#include <numeric>
-
 namespace NYT::NQueryClient {
 
 using namespace NConcurrency;
@@ -24,62 +22,45 @@ using namespace NObjectClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-std::pair<TConstFrontQueryPtr, std::vector<TConstQueryPtr>> CoordinateQuery(
-    const TConstQueryPtr& query,
-    const std::vector<TRefiner>& refiners)
+std::pair<TConstFrontQueryPtr, TConstQueryPtr> GetDistributedQueryPattern(const TConstQueryPtr& query)
 {
-    auto Logger = MakeQueryLogger(query);
+    auto bottomQuery = New<TQuery>();
 
-    auto subqueryPattern = New<TQuery>();
+    bottomQuery->Schema.Original = query->Schema.Original;
+    bottomQuery->Schema.Mapping = query->Schema.Mapping;
 
-    subqueryPattern->Schema.Original = query->Schema.Original;
-    subqueryPattern->Schema.Mapping = query->Schema.Mapping;
-    subqueryPattern->JoinClauses = query->JoinClauses;
-    subqueryPattern->OrderClause = query->OrderClause;
-    subqueryPattern->HavingClause = query->HavingClause;
-    subqueryPattern->GroupClause = query->GroupClause;
-    subqueryPattern->Offset = 0;
-    subqueryPattern->Limit = query->Offset + query->Limit;
-    subqueryPattern->UseDisjointGroupBy = query->UseDisjointGroupBy;
-    subqueryPattern->InferRanges = query->InferRanges;
-    subqueryPattern->IsFinal = false;
+    bottomQuery->JoinClauses = query->JoinClauses;
+    bottomQuery->OrderClause = query->OrderClause;
+    bottomQuery->HavingClause = query->HavingClause;
+    bottomQuery->GroupClause = query->GroupClause;
+    bottomQuery->Offset = 0;
+    bottomQuery->Limit = query->Offset + query->Limit;
+    bottomQuery->UseDisjointGroupBy = query->UseDisjointGroupBy;
+    bottomQuery->InferRanges = query->InferRanges;
+    bottomQuery->IsFinal = false;
+    bottomQuery->WhereClause = query->WhereClause;
 
-    auto topQuery = New<TFrontQuery>();
+    auto frontQuery = New<TFrontQuery>();
 
-    topQuery->GroupClause = query->GroupClause;
-    topQuery->HavingClause = query->HavingClause;
-    topQuery->OrderClause = query->OrderClause;
-    topQuery->Offset = query->Offset;
-    topQuery->Limit = query->Limit;
-    topQuery->IsFinal = query->IsFinal;
-    topQuery->ProjectClause = query->ProjectClause;
-    topQuery->Schema = subqueryPattern->GetTableSchema();
+    frontQuery->GroupClause = query->GroupClause;
+    frontQuery->HavingClause = query->HavingClause;
+    frontQuery->OrderClause = query->OrderClause;
+    frontQuery->Offset = query->Offset;
+    frontQuery->Limit = query->Limit;
+    frontQuery->IsFinal = query->IsFinal;
+    frontQuery->ProjectClause = query->ProjectClause;
+    frontQuery->Schema = bottomQuery->GetTableSchema();
 
-    std::vector<TConstQueryPtr> subqueries;
-
-    for (const auto& refiner : refiners) {
-        // Set initial schema and key columns
-        auto subquery = New<TQuery>(*subqueryPattern);
-        subquery->Id = TGuid::Create();
-
-        if (query->WhereClause) {
-            auto refinedWhere = refiner(query->WhereClause, subquery->GetKeyColumns());
-            subquery->WhereClause = IsTrue(refinedWhere) ? nullptr : refinedWhere;
-        }
-
-        subqueries.push_back(subquery);
-    }
-
-    return std::pair(topQuery, subqueries);
+    return {frontQuery, bottomQuery};
 }
 
-TRowRanges GetPrunedRanges(
+TSharedRange<TRowRange> GetPrunedRanges(
     const TConstExpressionPtr& predicate,
     const TTableSchemaPtr& tableSchema,
     const TKeyColumns& keyColumns,
     TObjectId tableId,
-    const TSharedRange<TRowRange>& ranges,
-    const TRowBufferPtr& rowBuffer,
+    const TSharedRange<TRowRange>& /*ranges*/,
+    const TRowBufferPtr& /*rowBuffer*/,
     const IColumnEvaluatorCachePtr& evaluatorCache,
     const TConstRangeExtractorMapPtr& rangeExtractors,
     const TQueryOptions& options,
@@ -89,10 +70,10 @@ TRowRanges GetPrunedRanges(
 
     YT_LOG_DEBUG("Inferring ranges from predicate");
 
-    TRangeInferrer rangeInferrer;
+    TSharedRange<TRowRange> result;
 
     if (options.NewRangeInference) {
-        rangeInferrer = CreateNewRangeInferrer(
+        result = CreateNewRangeInferrer(
             predicate,
             tableSchema,
             keyColumns,
@@ -100,7 +81,7 @@ TRowRanges GetPrunedRanges(
             GetBuiltinConstraintExtractors(),
             options);
     } else {
-        rangeInferrer = CreateRangeInferrer(
+        result = CreateRangeInferrer(
             predicate,
             tableSchema,
             keyColumns,
@@ -115,25 +96,16 @@ TRowRanges GetPrunedRanges(
             range.second);
     };
 
-    YT_LOG_DEBUG("Splitting %v sources according to ranges", ranges.Size());
-
-    TRowRanges result;
-    for (const auto& originalRange : ranges) {
-        auto inferred = rangeInferrer(originalRange, rowBuffer);
-        result.insert(result.end(), inferred.begin(), inferred.end());
-
-        for (const auto& range : inferred) {
-            YT_LOG_DEBUG_IF(options.VerboseLogging, "Narrowing source %v key range from %v to %v",
-                tableId,
-                keyRangeFormatter(originalRange),
-                keyRangeFormatter(range));
-        }
+    for (const auto& range : result) {
+        YT_LOG_DEBUG_IF(options.VerboseLogging, "Inferred range (TableId: %v, Range: %v)",
+            tableId,
+            keyRangeFormatter(range));
     }
 
     return result;
 }
 
-TRowRanges GetPrunedRanges(
+TSharedRange<TRowRange> GetPrunedRanges(
     const TConstQueryPtr& query,
     TObjectId tableId,
     const TSharedRange<TRowRange>& ranges,
@@ -147,7 +119,7 @@ TRowRanges GetPrunedRanges(
         query->Schema.Original,
         query->GetKeyColumns(),
         tableId,
-        std::move(ranges),
+        ranges,
         rowBuffer,
         evaluatorCache,
         rangeExtractors,
@@ -156,65 +128,41 @@ TRowRanges GetPrunedRanges(
 }
 
 TQueryStatistics CoordinateAndExecute(
-    const TConstQueryPtr& query,
-    const IUnversionedRowsetWriterPtr& writer,
-    const std::vector<TRefiner>& refiners,
-    std::function<TEvaluateResult(const TConstQueryPtr&, int)> evaluateSubquery,
-    std::function<TQueryStatistics(const TConstFrontQueryPtr&, const ISchemafulUnversionedReaderPtr&, const IUnversionedRowsetWriterPtr&)> evaluateTop)
+    bool ordered,
+    bool prefetch,
+    int splitCount,
+    std::function<TEvaluateResult()> evaluateSubQuery,
+    std::function<TQueryStatistics(const ISchemafulUnversionedReaderPtr&)> evaluateTopQuery)
 {
-    auto Logger = MakeQueryLogger(query);
-
-    YT_LOG_DEBUG("Begin coordinating query");
-
-    TConstFrontQueryPtr topQuery;
-    std::vector<TConstQueryPtr> subqueries;
-    std::tie(topQuery, subqueries) = CoordinateQuery(query, refiners);
-
-    YT_LOG_DEBUG("Finished coordinating query");
-
     std::vector<ISchemafulUnversionedReaderPtr> splitReaders;
 
     // Use TFutureHolder to prevent leaking subqueries.
     std::vector<TFutureHolder<TQueryStatistics>> subqueryHolders;
 
-    auto subqueryReaderCreator = [&, index = 0] () mutable -> ISchemafulUnversionedReaderPtr {
-        if (index >= std::ssize(subqueries)) {
-            return nullptr;
-        }
-
-        const auto& subquery = subqueries[index];
-
+    auto subqueryReaderCreator = [&] () mutable -> ISchemafulUnversionedReaderPtr {
         ISchemafulUnversionedReaderPtr reader;
         TFuture<TQueryStatistics> statistics;
-        std::tie(reader, statistics) = evaluateSubquery(subquery, index);
-
-        subqueryHolders.push_back(statistics);
-
-        ++index;
-
+        std::tie(reader, statistics) = evaluateSubQuery();
+        if (reader) {
+            subqueryHolders.push_back(statistics);
+        }
         return reader;
     };
 
     // TODO: Use separate condition for prefetch after protocol update
-    auto topReader = query->IsOrdered()
-        ? (query->Limit == std::numeric_limits<i64>::max() - 1
+    auto topReader = ordered
+        ? (prefetch
             ? CreateFullPrefetchingOrderedSchemafulReader(std::move(subqueryReaderCreator))
             : CreateOrderedSchemafulReader(std::move(subqueryReaderCreator)))
-        : CreateUnorderedSchemafulReader(std::move(subqueryReaderCreator), subqueries.size());
+        : CreateUnorderedSchemafulReader(std::move(subqueryReaderCreator), /*concurrency*/ splitCount);
 
-    auto queryStatistics = evaluateTop(topQuery, std::move(topReader), std::move(writer));
+    auto queryStatistics = evaluateTopQuery(std::move(topReader));
 
     for (int index = 0; index < std::ssize(subqueryHolders); ++index) {
         auto subqueryStatisticsOrError = WaitForFast(subqueryHolders[index].Get());
         if (subqueryStatisticsOrError.IsOK()) {
             auto subqueryStatistics = std::move(subqueryStatisticsOrError).ValueOrThrow();
-            YT_LOG_DEBUG("Subquery finished (SubqueryId: %v, Statistics: %v)",
-                subqueries[index]->Id,
-                subqueryStatistics);
             queryStatistics.AddInnerStatistics(std::move(subqueryStatistics));
-        } else {
-            YT_LOG_DEBUG(subqueryStatisticsOrError, "Subquery failed (SubqueryId: %v)",
-                subqueries[index]->Id);
         }
     }
 

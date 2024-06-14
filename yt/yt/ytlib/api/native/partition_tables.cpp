@@ -184,6 +184,9 @@ void TMultiTablePartitioner::BuildPartitions()
         }
 
         if (Options_.MaxPartitionCount && std::ssize(Partitions_.Partitions) >= *Options_.MaxPartitionCount) {
+            // Note: YQL tests check this error message, but they are not run automatically on commits.
+            // If you change the message, please change the tests after deployment.
+            // See eg. https://a.yandex-team.ru/arcadia/commit/9c13476686afd16f47ad22838809d17ebd6b9594
             THROW_ERROR_EXCEPTION("Maximum partition count exceeded")
                 << TErrorAttribute("limit", *Options_.MaxPartitionCount);
         }
@@ -352,10 +355,10 @@ TComparator TMultiTablePartitioner::GetComparator(int tableIndex)
 }
 
 void TMultiTablePartitioner::FixLimitsInOrderedDynamicStore(
-    size_t tableIndex,
+    int tableIndex,
     const std::vector<NChunkClient::TInputChunkPtr>& inputChunks)
 {
-    YT_VERIFY(tableIndex < DataSourceDirectory_->DataSources().size());
+    YT_VERIFY(tableIndex < std::ssize(DataSourceDirectory_->DataSources()));
 
     const auto& dataSource = DataSourceDirectory_->DataSources()[tableIndex];
     auto dynamic = dataSource.GetType() == EDataSourceType::VersionedTable;
@@ -385,7 +388,7 @@ void TMultiTablePartitioner::FixLimitsInOrderedDynamicStore(
         auto& inputChunk = inputChunks[chunkIndex];
 
         // Rows in ordered dynamic stores go after rows in static stores of the ordered dynamic table.
-        i64 lowerRowIndex = maxStaticStoreUpperRowIndexForTablet[inputChunk->GetTabletIndex()];
+        auto& lowerRowIndex = maxStaticStoreUpperRowIndexForTablet[inputChunk->GetTabletIndex()];
 
         if (!inputChunk->LowerLimit()) {
             inputChunk->LowerLimit() = std::make_unique<TLegacyReadLimit>();
@@ -398,7 +401,8 @@ void TMultiTablePartitioner::FixLimitsInOrderedDynamicStore(
         }
         if (!inputChunk->UpperLimit()->HasRowIndex()) {
             YT_VERIFY(inputChunk->GetTotalRowCount() >= 0);
-            inputChunk->UpperLimit()->SetRowIndex(lowerRowIndex + inputChunk->GetTotalRowCount());
+            lowerRowIndex += inputChunk->GetTotalRowCount();
+            inputChunk->UpperLimit()->SetRowIndex(lowerRowIndex);
         }
     }
 }

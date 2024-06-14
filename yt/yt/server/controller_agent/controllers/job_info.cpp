@@ -40,6 +40,18 @@ void TJobNodeDescriptor::Persist(const TPersistenceContext& context)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void TAllocation::Persist(const TPersistenceContext& context)
+{
+    using NYT::Persist;
+
+    Persist(context, Id);
+
+    Persist(context, Joblet);
+    Persist(context, LastJobId);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 TJoblet::TJoblet(
     TTask* task,
     int jobIndex,
@@ -55,7 +67,7 @@ TJoblet::TJoblet(
 
 TJobMetrics TJoblet::UpdateJobMetrics(const TJobSummary& jobSummary, bool isJobFinished)
 {
-    const auto Logger = ControllerLogger.WithTag("JobId: %v", JobId);
+    const auto Logger = ControllerLogger().WithTag("JobId: %v", JobId);
 
     if (!jobSummary.Statistics) {
         // Return empty delta if job has no statistics.
@@ -147,6 +159,10 @@ void TJoblet::Persist(const TPersistenceContext& context)
     // COMPAT(arkady-e1ppa)
     if (context.GetVersion() >= ESnapshotVersion::NodeJobStartTimeInJoblet) {
         Persist(context, NodeJobStartTime);
+    }
+    // COMPAT(pogorelov)
+    if (context.GetVersion() >= ESnapshotVersion::WaitingForResourcesDuration) {
+        Persist(context, WaitingForResourcesDuration);
     }
     // COMPAT(pogorelov)
     if (context.GetVersion() < ESnapshotVersion::JobStateInJoblet) {

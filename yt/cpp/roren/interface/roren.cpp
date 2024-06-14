@@ -6,6 +6,7 @@
 
 namespace NRoren {
 
+TTypeTag<TString> TransformNameTag("TransformName");
 ////////////////////////////////////////////////////////////////////////////////
 
 TPipeline::TPipeline(IExecutorPtr executor) : Executor_(std::move(executor))
@@ -28,6 +29,16 @@ void TPipeline::Run()
     }
 
     Executor_->Run(*this);
+}
+
+TString TPipeline::DumpDot() const
+{
+    return RawPipeline_->DumpDot();
+}
+
+void TPipeline::Dump(NYT::NYson::IYsonConsumer* consumer) const
+{
+    RawPipeline_->Dump(consumer);
 }
 
 void TPipeline::Optimize()

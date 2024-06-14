@@ -8,6 +8,8 @@
 #include "serialize.h"
 #include "config.h"
 
+#include <yt/yt/server/lib/hydra/local_hydra_janitor.h>
+
 #include <yt/yt/core/misc/serialize.h>
 
 #include <yt/yt/core/ytree/ypath_proxy.h>
@@ -34,11 +36,11 @@ public:
 
         RegisterLoader(
             "ConfigManager",
-            BIND(&TConfigManager::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TConfigManager::Load, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "ConfigManager",
-            BIND(&TConfigManager::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TConfigManager::Save, Unretained(this)));
     }
 
     void Initialize() override
@@ -84,6 +86,9 @@ public:
         ReplicateConfigToSecondaryMasters();
 
         YT_UNUSED_FUTURE(HydraManager_->Reconfigure(Config_->HydraManager));
+
+        const auto& janitor = Bootstrap_->GetHydraFacade()->GetLocalJanitor();
+        janitor->Reconfigure(Config_->HydraManager);
 
         NTracing::TNullTraceContextGuard nullTraceContext;
         ConfigChanged_.Fire(oldConfig);

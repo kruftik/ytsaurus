@@ -20,6 +20,8 @@ void TStandaloneTabletBalancerConfig::Register(TRegistrar registrar)
         .Default(TDuration::Minutes(2));
     registrar.Parameter("worker_thread_pool_size", &TThis::WorkerThreadPoolSize)
         .Default(3);
+    registrar.Parameter("pivot_picker_thread_pool_size", &TThis::PivotPickerThreadPoolSize)
+        .Default(3);
 
     registrar.Parameter("parameterized_timeout_on_start", &TThis::ParameterizedTimeoutOnStart)
         .Default(TDuration::Minutes(5));
@@ -38,6 +40,9 @@ void TTabletBalancerDynamicConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("max_parameterized_move_action_count", &TThis::MaxParameterizedMoveActionCount)
         .Default(5)
+        .GreaterThanOrEqual(0);
+    registrar.Parameter("max_parameterized_move_action_hard_limit", &TThis::MaxParameterizedMoveActionHardLimit)
+        .Default(2000)
         .GreaterThanOrEqual(0);
     registrar.Parameter("parameterized_node_deviation_threshold", &TThis::ParameterizedNodeDeviationThreshold)
         .Default(0.1)
@@ -101,7 +106,7 @@ void TTabletBalancerDynamicConfig::Register(TRegistrar registrar)
 void TActionManagerConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("create_action_batch_size_limit", &TThis::CreateActionBatchSizeLimit)
-        .Default(100);
+        .Default(500);
     registrar.Parameter("tablet_action_polling_period", &TThis::TabletActionPollingPeriod)
         .Default(TDuration::Seconds(10));
     registrar.Parameter("tablet_action_creation_timeout", &TThis::TabletActionCreationTimeout)

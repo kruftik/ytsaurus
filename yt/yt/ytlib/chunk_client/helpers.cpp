@@ -236,14 +236,12 @@ TSessionId CreateChunk(
     auto channel = client->GetMasterChannelOrThrow(EMasterChannelKind::Leader, cellTag);
     TChunkServiceProxy proxy(channel);
 
-    auto batchReq = proxy.ExecuteBatch();
-    GenerateMutationId(batchReq);
-    SetSuppressUpstreamSync(&batchReq->Header(), true);
-    // COMPAT(shakurov): prefer proto ext (above).
-    batchReq->set_suppress_upstream_sync(true);
-    batchReq->Header().set_logical_request_weight(1);
+    auto req = proxy.CreateChunk();
+    GenerateMutationId(req);
+    auto* multicellSyncExt = req->Header().MutableExtension(NObjectClient::NProto::TMulticellSyncExt::multicell_sync_ext);
+    multicellSyncExt->set_suppress_upstream_sync(true);
+    req->Header().set_logical_request_weight(1);
 
-    auto* req = batchReq->add_create_chunk_subrequests();
     ToProto(req->mutable_transaction_id(), transactionId);
     req->set_type(static_cast<int>(chunkType));
     req->set_account(options->Account);
@@ -258,15 +256,14 @@ TSessionId CreateChunk(
     }
     req->set_consistent_replica_placement_hash(options->ConsistentChunkReplicaPlacementHash);
 
-    auto batchRspOrError = WaitFor(batchReq->Invoke());
+    auto rspOrError = WaitFor(req->Invoke());
     THROW_ERROR_EXCEPTION_IF_FAILED(
-        GetCumulativeError(batchRspOrError),
+        rspOrError,
         NChunkClient::EErrorCode::MasterCommunicationFailed,
         "Error creating chunk");
 
-    const auto& batchRsp = batchRspOrError.Value();
-    const auto& rsp = batchRsp->create_chunk_subresponses(0);
-    auto sessionId = FromProto<TSessionId>(rsp.session_id());
+    const auto& rsp = rspOrError.Value();
+    auto sessionId = FromProto<TSessionId>(rsp->session_id());
 
     YT_LOG_DEBUG("Chunk created (MediumIndex: %v)",
         sessionId.MediumIndex);
@@ -685,7 +682,12 @@ IChunkReaderPtr CreateRemoteReader(
     auto chunkId = FromProto<TChunkId>(chunkSpec.chunk_id());
     auto replicas = GetReplicasFromChunkSpec(chunkSpec);
 
-    auto Logger = ChunkClientLogger.WithTag("ChunkId: %v", chunkId);
+    auto Logger = ChunkClientLogger().WithTag("ChunkId: %v", chunkId);
+
+    auto optionsPerChunk = New<TRemoteReaderOptions>();
+    optionsPerChunk->AllowFetchingSeedsFromMaster = options->AllowFetchingSeedsFromMaster;
+    optionsPerChunk->EnableP2P = options->EnableP2P;
+    optionsPerChunk->UseProxyingDataNodeService = chunkSpec.use_proxying_data_node_service();
 
     if (IsErasureChunkId(chunkId)) {
         auto erasureCodecId = ECodec(chunkSpec.erasure_codec());
@@ -719,7 +721,7 @@ IChunkReaderPtr CreateRemoteReader(
             auto partChunkId = ErasurePartIdFromChunkId(chunkId, index);
             auto reader = CreateReplicationReader(
                 partConfig,
-                options,
+                optionsPerChunk,
                 chunkReaderHost,
                 partChunkId,
                 partReplicas);
@@ -738,7 +740,7 @@ IChunkReaderPtr CreateRemoteReader(
 
         return CreateReplicationReader(
             std::move(config),
-            std::move(options),
+            std::move(optionsPerChunk),
             std::move(chunkReaderHost),
             chunkId,
             replicas);
@@ -974,12 +976,15 @@ EChunkFeatures GetSupportedChunkFeatures()
     return features;
 }
 
-void ValidateChunkFeatures(TChunkId chunkId, ui64 chunkFeatures, ui64 supportedChunkFeatures)
+void ValidateChunkFeatures(
+    TChunkId chunkId,
+    EChunkFeatures chunkFeatures,
+    EChunkFeatures supportedChunkFeatures)
 {
     if ((chunkFeatures & supportedChunkFeatures) != chunkFeatures) {
         for (auto chunkFeature : TEnumTraits<EChunkFeatures>::GetDomainValues()) {
-            ui64 chunkFeatureMask = ToUnderlying(chunkFeature);
-            if ((chunkFeatures & chunkFeatureMask) && !(supportedChunkFeatures & chunkFeatureMask)) {
+            EChunkFeatures chunkFeatureMask = chunkFeature;
+            if ((chunkFeatures & chunkFeatureMask) != EChunkFeatures::None && (supportedChunkFeatures & chunkFeatureMask) == EChunkFeatures::None) {
                 THROW_ERROR_EXCEPTION(EErrorCode::UnsupportedChunkFeature,
                     "Processing chunk %v requires feature %Qv that is not supported by cluster yet",
                     chunkId,
@@ -1081,9 +1086,16 @@ void FormatValue(
         allyReplicas.Revision);
 }
 
-TString ToString(const TAllyReplicasInfo& allyReplicas)
+////////////////////////////////////////////////////////////////////////////////
+
+bool IsLargeEnoughChunkSize(i64 chunkSize, i64 chunkSizeThreshold)
 {
-    return ToStringViaBuilder(allyReplicas);
+    return chunkSize >= chunkSizeThreshold;
+}
+
+bool IsLargeEnoughChunkWeight(i64 chunkWeight, i64 chunkWeightThreshold)
+{
+    return chunkWeight >= chunkWeightThreshold;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

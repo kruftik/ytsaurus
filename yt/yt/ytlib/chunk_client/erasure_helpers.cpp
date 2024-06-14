@@ -13,7 +13,7 @@
 
 #include <yt/yt/core/misc/checksum.h>
 #include <yt/yt/core/misc/numeric_helpers.h>
-#include <yt/yt/core/misc/memory_reference_tracker.h>
+#include <yt/yt/core/misc/memory_usage_tracker.h>
 
 #include <library/cpp/yt/assert/assert.h>
 
@@ -160,8 +160,7 @@ std::vector<TPartRange> TParityPartSplitInfo::SplitRangesByStripesAndAlignToPari
         ranges.end(),
         [] (TPartRange left, TPartRange right) {
             return left.End <= right.Begin;
-        }
-    ));
+        }));
 
     std::vector<TPartRange> result;
 
@@ -411,7 +410,7 @@ public:
 
         if (!indicesToRequest.empty()) {
             auto blocksFuture = BIND(
-                [=, this, this_ = MakeStrong(this)] () {
+                [=, this, this_ = MakeStrong(this)] {
                     return Reader_->ReadBlocks(indicesToRequest);
                 })
                 // Or simple Via?
@@ -454,7 +453,7 @@ private:
         TSharedMutableRef result;
 
         // We use lazy initialization.
-        auto initialize = [&] () {
+        auto initialize = [&] {
             if (!result) {
                 struct TErasureWriterSliceTag { };
                 result = TSharedMutableRef::Allocate<TErasureWriterSliceTag>(range.Size());
@@ -488,7 +487,7 @@ private:
 
         initialize();
 
-        LastResult_ = TrackMemory(ReadBlockOptions_.ClientOptions.MemoryReferenceTracker, result);
+        LastResult_ = TrackMemory(ReadBlockOptions_.ClientOptions.MemoryUsageTracker, result);
         return LastResult_;
     }
 };
@@ -641,8 +640,7 @@ TDataBlocksPlacementInParts BuildDataBlocksPlacementInParts(
             auto it = std::upper_bound(
                 partInfos[0].first_block_index_per_stripe().begin(),
                 partInfos[0].first_block_index_per_stripe().end(),
-                blockIndex
-            );
+                blockIndex);
 
             stripeIndex = (it - partInfos[0].first_block_index_per_stripe().begin()) - 1;
             YT_VERIFY(stripeIndex >= 0);
@@ -655,8 +653,7 @@ TDataBlocksPlacementInParts BuildDataBlocksPlacementInParts(
                 partInfos.end(),
                 [&] (const TPartInfo& partInfo) {
                     return partInfo.first_block_index_per_stripe(stripeIndex) <= blockIndex;
-                }
-            );
+                });
 
             partIndex = (it - partInfos.begin() - 1);
             while (partIndex > 0 && GetStripeBlockCount(placementExt, partIndex, stripeIndex) == 0) {

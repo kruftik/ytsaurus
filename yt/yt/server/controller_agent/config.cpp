@@ -584,6 +584,8 @@ void TJobTrackerConfig::Register(TRegistrar registrar)
     // TODO(arkady-e1ppa): remove this when all nodes are 24.1.
     registrar.Parameter("enable_graceful_abort", &TThis::EnableGracefulAbort)
         .Default(false);
+    registrar.Parameter("check_node_heartbeat_sequence_number", &TThis::CheckNodeHeartbeatSequenceNumber)
+        .Default(false);
 }
 
 void TDockerRegistryConfig::Register(TRegistrar registrar)
@@ -659,7 +661,13 @@ void TControllerAgentConfig::Register(TRegistrar registrar)
         .DefaultNew();
 
     registrar.Parameter("event_log", &TThis::EventLog)
-        .DefaultNew();
+        .DefaultCtor([] {
+            auto config = New<NEventLog::TEventLogManagerConfig>();
+            config->Enable = false;
+            config->MaxRowWeight = 128_MB;
+            config->Path = "//sys/scheduler/event_log";
+            return config;
+        });
 
     registrar.Parameter("scheduler_handshake_rpc_timeout", &TThis::SchedulerHandshakeRpcTimeout)
         .Default(TDuration::Seconds(10));
@@ -694,6 +702,10 @@ void TControllerAgentConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("controller_thread_count", &TThis::ControllerThreadCount)
         .Default(16)
+        .GreaterThan(0);
+
+    registrar.Parameter("chunk_scraper_thread_count", &TThis::ChunkScraperThreadCount)
+        .Default(4)
         .GreaterThan(0);
 
     registrar.Parameter("job_spec_build_thread_count", &TThis::JobSpecBuildThreadCount)
@@ -887,9 +899,6 @@ void TControllerAgentConfig::Register(TRegistrar registrar)
         .Default(1'000)
         .GreaterThan(0);
 
-    registrar.Parameter("job_settlement_timeout", &TThis::JobSettlementTimeout)
-        .Default(TDuration::Seconds(120));
-
     //! By default we disable job size adjustment for partition maps,
     //! since it may lead to partition data skew between nodes.
     registrar.Parameter("enable_partition_map_job_size_adjustment", &TThis::EnablePartitionMapJobSizeAdjustment)
@@ -978,7 +987,7 @@ void TControllerAgentConfig::Register(TRegistrar registrar)
         .Default(TDuration::Seconds(1));
 
     registrar.Parameter("job_spec_slice_throttler", &TThis::JobSpecSliceThrottler)
-        .DefaultCtor([] () { return NConcurrency::TThroughputThrottlerConfig::Create(500'000); });
+        .DefaultCtor([] { return NConcurrency::TThroughputThrottlerConfig::Create(500'000); });
 
     registrar.Parameter("static_orchid_cache_update_period", &TThis::StaticOrchidCacheUpdatePeriod)
         .Default(TDuration::Seconds(1));
@@ -1132,14 +1141,12 @@ void TControllerAgentConfig::Register(TRegistrar registrar)
         .DefaultNew();
 
     registrar.Parameter("max_job_aborts_until_operation_failure", &TThis::MaxJobAbortsUntilOperationFailure)
-        .Default(THashMap<EAbortReason, int>({{EAbortReason::RootVolumePreparationFailed, 10}}));
+        .Default(THashMap<EAbortReason, int>({{EAbortReason::RootVolumePreparationFailed, 1000}}));
+
+    registrar.Parameter("job_id_unequal_to_allocation_id", &TThis::JobIdUnequalToAllocationId)
+        .Default(false);
 
     registrar.Preprocessor([&] (TControllerAgentConfig* config) {
-        config->EventLog->MaxRowWeight = 128_MB;
-        if (!config->EventLog->Path) {
-            config->EventLog->Path = "//sys/scheduler/event_log";
-        }
-
         config->ChunkLocationThrottler->Limit = 10'000;
 
         // Value in options is an upper bound hint on uncompressed data size for merge jobs.

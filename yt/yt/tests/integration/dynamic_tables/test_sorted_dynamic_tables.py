@@ -20,7 +20,7 @@ import yt_error_codes
 
 from yt_helpers import profiler_factory
 
-from yt_type_helpers import make_schema, optional_type
+from yt_type_helpers import make_schema, optional_type, list_type, tuple_type
 
 from yt.environment.helpers import assert_items_equal
 from yt.common import YtError, YtResponseError
@@ -223,6 +223,13 @@ class TestSortedDynamicTablesBase(DynamicTablesBase):
         else:
             set("{}/@chunk_reader".format(path), {"prefer_local_replicas": False})
 
+    def _sync_set_watermark(self, watermark, column_name="watermark"):
+        runtime_data = {"column_name": column_name, "watermark": watermark}
+        set("//tmp/t/@custom_runtime_data", runtime_data)
+
+        tablet_id = get("//tmp/t/@tablets/0/tablet_id")
+        wait(lambda: get(f"//sys/tablets/{tablet_id}/orchid/custom_runtime_data", default=None) == runtime_data)
+
 
 ##################################################################
 
@@ -329,13 +336,9 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
     @authors("ponasenko-rs")
     @pytest.mark.parametrize("lock_type", ["exclusive", "shared_write", "shared_strong"])
     def test_tablet_locks_persist_in_snapshots(self, lock_type):
-        if self.DRIVER_BACKEND == "rpc":
-            if lock_type == "exclusive":
-                # TODO(ponasenko-rs): Remove after YT-20282.
-                pytest.skip("Rpc proxy client drops exclusive locks without data")
-            elif lock_type == "shared_write":
-                # Shared write locks aren't supported on rpc proxy.
-                pytest.skip()
+        if self.DRIVER_BACKEND == "rpc" and lock_type == "exclusive":
+            # TODO(ponasenko-rs): Remove after YT-20282.
+            pytest.skip("Rpc proxy client drops exclusive locks without data")
 
         sync_create_cells(1)
         cell_id = ls("//sys/tablet_cells")[0]
@@ -346,6 +349,8 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
         ]
 
         create_dynamic_table("//tmp/t", schema=schema)
+        # TODO(ponasenko-rs): Remove after YT-21404.
+        set("//tmp/t/@dynamic_store_auto_flush_period", None)
         sync_mount_table("//tmp/t")
 
         tx = start_transaction(type="tablet")
@@ -367,10 +372,6 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
 
     @authors("ponasenko-rs")
     def test_transaction_shared_write_locks(self):
-        if self.DRIVER_BACKEND == "rpc":
-            # Shared write locks aren't supported on rpc proxy.
-            pytest.skip()
-
         sync_create_cells(1)
 
         schema = [
@@ -435,10 +436,6 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
     @authors("ponasenko-rs")
     @pytest.mark.parametrize("has_explicit_lock_group", [True, False])
     def test_aggregate_shared_write_locks(self, has_explicit_lock_group):
-        if self.DRIVER_BACKEND == "rpc":
-            # Shared write locks aren't supported on rpc proxy.
-            pytest.skip()
-
         sync_create_cells(1)
 
         schema = [
@@ -491,6 +488,63 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
         assert_items_equal(actual, rows)
         actual = lookup_rows("//tmp/t1", [{"key": row["key"]} for row in rows])
         assert_items_equal(actual, rows)
+
+    @authors("whatsername")
+    @pytest.mark.parametrize("optimize_for", ["scan", "lookup"])
+    def test_any_keys(self, optimize_for):
+        sync_create_cells(1)
+        create_dynamic_table("//tmp/t", optimize_for=optimize_for, schema=[
+            {"name": "key", "type": "any", "sort_order": "ascending"},
+            {"name": "value", "type": "string"}]
+        )
+        sync_mount_table("//tmp/t")
+
+        value1 = {"key": [1, 1], "value": "write"}
+        insert_rows("//tmp/t", [value1])
+        value2 = {"key": [1, []], "value": "insert"}
+        insert_rows("//tmp/t", [value2])
+
+        with raises_yt_error(yt_error_codes.SchemaViolation):
+            wrong_value = {"key": [3, {}], "value": "wrong"}
+            insert_rows("//tmp/t", [wrong_value])
+
+        assert_items_equal(read_table("//tmp/t"), [value2, value1])
+
+    @authors("whatsername")
+    @pytest.mark.parametrize("optimize_for", ["scan", "lookup"])
+    def test_composite_keys(self, optimize_for):
+        sync_create_cells(1)
+        create_dynamic_table("//tmp/t1", optimize_for=optimize_for, schema=[
+            {"name": "key", "type_v3": list_type("int64"), "sort_order": "ascending"},
+            {"name": "value", "type": "string"}]
+        )
+        sync_mount_table("//tmp/t1")
+        create_dynamic_table("//tmp/t2", optimize_for=optimize_for, schema=[
+            {"name": "key", "type_v3": tuple_type(["string", "string"]), "sort_order": "descending"},
+            {"name": "value", "type": "string"}]
+        )
+        sync_mount_table("//tmp/t2")
+
+        value1 = {"key": [123, 456], "value": "write"}
+        insert_rows("//tmp/t1", [value1])
+        value2 = {"key": [123, 0], "value": "insert"}
+        insert_rows("//tmp/t1", [value2])
+
+        value3 = {"key": ["a", "456"], "value": "write"}
+        insert_rows("//tmp/t2", [value3])
+        value4 = {"key": ["a", "123"], "value": "insert"}
+        insert_rows("//tmp/t2", [value4])
+
+        with raises_yt_error(yt_error_codes.SchemaViolation):
+            wrong_value = {"key": [3, []], "value": "wrong"}
+            insert_rows("//tmp/t1", [wrong_value])
+
+        with raises_yt_error(yt_error_codes.SchemaViolation):
+            wrong_value = {"key": [3, "a"], "value": "wrong"}
+            insert_rows("//tmp/t2", [wrong_value])
+
+        assert_items_equal(read_table("//tmp/t1"), [value2, value1])
+        assert_items_equal(read_table("//tmp/t2"), [value4, value3])
 
     @authors("babenko", "savrus")
     def test_yt_13441_empty_store_set(self):
@@ -1633,6 +1687,92 @@ class TestSortedDynamicTables(TestSortedDynamicTablesBase):
         with pytest.raises(YtError, match="Cell {} has no assigned peers".format(cell_id)):
             lookup_rows("//tmp/t", [{"key": 1}])
 
+    @authors("gryzlov-ad")
+    def test_watermark_basic(self):
+        sync_create_cells(1)
+        schema = [
+            {"name": "key", "type": "int64", "sort_order": "ascending"},
+            {"name": "watermark", "type": "uint64"},
+        ]
+        self._create_sorted_table(
+            "//tmp/t",
+            schema=schema,
+            mount_config={
+                "min_data_ttl": 0,
+                "max_data_ttl": 1000,
+                "min_data_versions": 0,
+                "max_data_versions": 1,
+                "row_merger_type": "watermark",
+                "auto_compaction_period": 1,
+            },
+        )
+
+        sync_mount_table("//tmp/t")
+
+        rows = [
+            {"key": 0, "watermark": 10},
+            {"key": 1, "watermark": 11},
+            {"key": 2, "watermark": 12},
+        ]
+        insert_rows("//tmp/t", rows)
+        sync_flush_table("//tmp/t")
+
+        query = "* from [//tmp/t] order by key limit 100"
+        for i, watermark in enumerate([9, 10, 11, 12]):
+            self._sync_set_watermark(watermark)
+            wait(lambda: select_rows(query) == rows[i:])
+
+            time.sleep(1)
+            assert select_rows(query) == rows[i:]
+
+        # Row with an empty watermark should not interfere with compaction.
+        empty_watermark_row = {"key": 3, "watermark": yson.YsonEntity()}
+        rows.append(empty_watermark_row)
+
+        insert_rows("//tmp/t", rows)
+        sync_flush_table("//tmp/t")
+
+        wait(lambda: select_rows(query) == [empty_watermark_row])
+
+    @authors("gryzlov-ad")
+    def test_watermark_wrong_schema(self):
+        sync_create_cells(1)
+        schema = [
+            {"name": "key", "type": "int64", "sort_order": "ascending"},
+            # Watermark column type must be uint64 or optional<uint64>, otherwise it is ignored.
+            {"name": "watermark", "type": "int64"},
+        ]
+        self._create_sorted_table(
+            "//tmp/t",
+            schema=schema,
+            mount_config={
+                "min_data_ttl": 0,
+                "max_data_ttl": 5000,
+                "min_data_versions": 0,
+                "max_data_versions": 1,
+                "row_merger_type": "watermark",
+                "auto_compaction_period": 1,
+                "merge_rows_on_flush": True,
+            },
+        )
+
+        sync_mount_table("//tmp/t")
+        self._sync_set_watermark(11)
+
+        rows = [
+            {"key": 0, "watermark": 10},
+            {"key": 1, "watermark": 11},
+            {"key": 2, "watermark": 12},
+        ]
+        insert_rows("//tmp/t", rows)
+
+        sync_flush_table("//tmp/t")
+
+        query = "* from [//tmp/t]"
+        assert_items_equal(select_rows(query), rows)
+        # All rows are deleted due to "max_data_ttl" and it is not prevented by low watermark value.
+        wait(lambda: select_rows(query) == [])
+
 
 class TestSortedDynamicTablesMulticell(TestSortedDynamicTables):
     NUM_SECONDARY_MASTER_CELLS = 2
@@ -2609,6 +2749,39 @@ class TestReshardWithSlicing(TestSortedDynamicTablesBase):
         with pytest.raises(YtError):
             sync_reshard_table("//tmp/t", 4, enable_slicing=True)
 
+    @authors("alexelexa")
+    def test_too_many_chunks_reshard(self):
+        sync_create_cells(1)
+        self._create_simple_table("//tmp/t")
+        set("//tmp/t/@chunk_writer", {"block_size": 5})
+        set("//tmp/t/@enable_compaction_and_partitioning", False)
+        set("//sys/@config/chunk_manager/max_chunks_per_fetch", 2)
+
+        sync_mount_table("//tmp/t")
+        rows = [{"key": i, "value": "value"} for i in range(420)]
+        insert_rows("//tmp/t", rows)
+        sync_unmount_table("//tmp/t")
+
+        sync_reshard_table("//tmp/t", 2, enable_slicing=True)
+        assert get("//tmp/t/@tablet_count") == 2
+
+        sync_mount_table("//tmp/t")
+        rows = [{"key": i, "value": "value"} for i in range(500, 920, 2)]
+        insert_rows("//tmp/t", rows)
+
+        sync_flush_table("//tmp/t")
+
+        rows = [{"key": i, "value": "value"} for i in range(501, 920, 2)]
+        insert_rows("//tmp/t", rows)
+        sync_unmount_table("//tmp/t")
+
+        sync_reshard_table("//tmp/t", 4, enable_slicing=True)
+        assert get("//tmp/t/@tablet_count") < 4
+
+        set("//sys/@config/chunk_manager/max_chunks_per_fetch", 100)
+        sync_reshard_table("//tmp/t", 4, enable_slicing=True)
+        assert get("//tmp/t/@tablet_count") == 4
+
 
 ##################################################################
 
@@ -2846,7 +3019,7 @@ class TestDynamicTablesTtl(DynamicTablesBase):
         self._sync_wait_chunk_ids_to_change("//tmp/t")
         assert lookup_rows("//tmp/t", keys) == rows
 
-        time.sleep(6)
+        time.sleep(8)
         self._sync_wait_chunk_ids_to_change("//tmp/t")
         assert lookup_rows("//tmp/t", keys) == []
 
@@ -2883,7 +3056,7 @@ class TestDynamicTablesTtl(DynamicTablesBase):
         self._sync_wait_chunk_ids_to_change("//tmp/t")
         assert lookup_rows("//tmp/t", keys) == []
 
-    @authors("alxelexa")
+    @authors("alexelexa")
     def test_per_row_ttl_min_data_ttl(self):
         self._create_table_with_ttl_column(min_data_ttl=20000)
         keys = [{"key": 0}]

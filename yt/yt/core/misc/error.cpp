@@ -64,34 +64,29 @@ void FormatValue(TStringBuilderBase* builder, TErrorCode code, TStringBuf spec)
     FormatValue(builder, static_cast<int>(code), spec);
 }
 
-TString ToString(TErrorCode code)
-{
-    return ToStringViaBuilder(code);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
-YT_THREAD_LOCAL(bool) ErrorSanitizerEnabled = false;
-YT_THREAD_LOCAL(TInstant) ErrorSanitizerDatetimeOverride = {};
-YT_THREAD_LOCAL(TSharedRef) ErrorSanitizerLocalHostNameOverride = {};
+YT_DEFINE_THREAD_LOCAL(bool, ErrorSanitizerEnabled, false);
+YT_DEFINE_THREAD_LOCAL(TInstant, ErrorSanitizerDatetimeOverride);
+YT_DEFINE_THREAD_LOCAL(TSharedRef, ErrorSanitizerLocalHostNameOverride);
 
 TErrorSanitizerGuard::TErrorSanitizerGuard(TInstant datetimeOverride, TSharedRef localHostNameOverride)
-    : SavedEnabled_(ErrorSanitizerEnabled)
-    , SavedDatetimeOverride_(GetTlsRef(ErrorSanitizerDatetimeOverride))
-    , SavedLocalHostNameOverride_(GetTlsRef(ErrorSanitizerLocalHostNameOverride))
+    : SavedEnabled_(ErrorSanitizerEnabled())
+    , SavedDatetimeOverride_(ErrorSanitizerDatetimeOverride())
+    , SavedLocalHostNameOverride_(ErrorSanitizerLocalHostNameOverride())
 {
-    ErrorSanitizerEnabled = true;
-    GetTlsRef(ErrorSanitizerDatetimeOverride) = datetimeOverride;
-    GetTlsRef(ErrorSanitizerLocalHostNameOverride) = std::move(localHostNameOverride);
+    ErrorSanitizerEnabled() = true;
+    ErrorSanitizerDatetimeOverride() = datetimeOverride;
+    ErrorSanitizerLocalHostNameOverride() = std::move(localHostNameOverride);
 }
 
 TErrorSanitizerGuard::~TErrorSanitizerGuard()
 {
-    YT_ASSERT(ErrorSanitizerEnabled);
+    YT_ASSERT(ErrorSanitizerEnabled());
 
-    ErrorSanitizerEnabled = SavedEnabled_;
-    GetTlsRef(ErrorSanitizerDatetimeOverride) = SavedDatetimeOverride_;
-    GetTlsRef(ErrorSanitizerLocalHostNameOverride) = std::move(SavedLocalHostNameOverride_);
+    ErrorSanitizerEnabled() = SavedEnabled_;
+    ErrorSanitizerDatetimeOverride() = SavedDatetimeOverride_;
+    ErrorSanitizerLocalHostNameOverride() = std::move(SavedLocalHostNameOverride_);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -301,9 +296,9 @@ private:
 
     void CaptureOriginAttributes()
     {
-        if (ErrorSanitizerEnabled) {
-            Datetime_ = GetTlsRef(ErrorSanitizerDatetimeOverride);
-            HostHolder_ = GetTlsRef(ErrorSanitizerLocalHostNameOverride);
+        if (ErrorSanitizerEnabled()) {
+            Datetime_ = ErrorSanitizerDatetimeOverride();
+            HostHolder_ = ErrorSanitizerLocalHostNameOverride();
             Host_ = HostHolder_.empty() ? TStringBuf() : TStringBuf(HostHolder_.Begin(), HostHolder_.End());
             return;
         }
@@ -352,6 +347,55 @@ private:
         SpanId_ = Attributes_->GetAndRemove<NTracing::TSpanId>(SpanIdKey, NTracing::InvalidSpanId);
     }
 };
+
+////////////////////////////////////////////////////////////////////////////////
+
+namespace  {
+
+bool IsWhitelisted(const TError& error, const THashSet<TStringBuf>& attributeWhitelist)
+{
+    for (const auto& key : error.Attributes().ListKeys()) {
+        if (attributeWhitelist.contains(key)) {
+            return true;
+        }
+    }
+
+    for (const auto& innerError : error.InnerErrors()) {
+        if (IsWhitelisted(innerError, attributeWhitelist)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+//! Returns vector which consists of objects from errors such that:
+//! if N is the number of objects in errors s.t. IsWhitelisted is true
+//! then first N objects of returned vector are the ones for which IsWhitelisted is true
+//! followed by std::max(0, maxInnerErrorCount - N - 1) remaining objects
+//! finally followed by errors.back().
+std::vector<TError>& ApplyWhitelist(std::vector<TError>& errors, const THashSet<TStringBuf>& attributeWhitelist, int maxInnerErrorCount)
+{
+    if (std::ssize(errors) < std::max(2, maxInnerErrorCount)) {
+        return errors;
+    }
+
+    auto firstNotWhitelisted = std::partition(
+        errors.begin(),
+        std::prev(errors.end()),
+        [&attributeWhitelist] (const TError& error) {
+            return IsWhitelisted(error, attributeWhitelist);
+        });
+
+    int lastErrorOffset = std::max<int>(firstNotWhitelisted - errors.begin(), maxInnerErrorCount - 1);
+
+    *(errors.begin() + lastErrorOffset) = std::move(errors.back());
+    errors.resize(lastErrorOffset + 1);
+
+    return errors;
+}
+
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -629,7 +673,10 @@ std::vector<TError>* TError::MutableInnerErrors()
 
 const TString InnerErrorsTruncatedKey("inner_errors_truncated");
 
-TError TError::Truncate(int maxInnerErrorCount, i64 stringLimit, const THashSet<TStringBuf>& attributeWhitelist) const &
+TError TError::Truncate(
+    int maxInnerErrorCount,
+    i64 stringLimit,
+    const THashSet<TStringBuf>& attributeWhitelist) const &
 {
     if (!Impl_) {
         return TError();
@@ -666,22 +713,37 @@ TError TError::Truncate(int maxInnerErrorCount, i64 stringLimit, const THashSet<
     }
     result->CopyBuiltinAttributesFrom(*Impl_);
 
-    if (std::ssize(InnerErrors()) <= maxInnerErrorCount) {
-        for (const auto& innerError : InnerErrors()) {
-            result->MutableInnerErrors()->push_back(truncateInnerError(innerError));
+    const auto& innerErrors = InnerErrors();
+    auto& copiedInnerErrors = *result->MutableInnerErrors();
+
+    if (std::ssize(innerErrors) <= maxInnerErrorCount) {
+        for (const auto& innerError : innerErrors) {
+            copiedInnerErrors.push_back(truncateInnerError(innerError));
         }
     } else {
         result->MutableAttributes()->Set(InnerErrorsTruncatedKey, true);
-        for (int i = 0; i + 1 < maxInnerErrorCount; ++i) {
-            result->MutableInnerErrors()->push_back(truncateInnerError(InnerErrors()[i]));
+
+        // NB(arkady-e1ppa): We want to always keep the last inner error,
+        // so we make room for it and do not check if it is whitelisted.
+        for (int idx = 0; idx < std::ssize(innerErrors) - 1; ++idx) {
+            const auto& innerError = innerErrors[idx];
+            if (
+                IsWhitelisted(innerError, attributeWhitelist) ||
+                std::ssize(copiedInnerErrors) < maxInnerErrorCount - 1)
+            {
+                copiedInnerErrors.push_back(truncateInnerError(innerError));
+            }
         }
-        result->MutableInnerErrors()->push_back(truncateInnerError(InnerErrors().back()));
+        copiedInnerErrors.push_back(truncateInnerError(innerErrors.back()));
     }
 
     return TError(std::move(result));
 }
 
-TError TError::Truncate(int maxInnerErrorCount, i64 stringLimit, const THashSet<TStringBuf>& attributeWhitelist) &&
+TError TError::Truncate(
+    int maxInnerErrorCount,
+    i64 stringLimit,
+    const THashSet<TStringBuf>& attributeWhitelist) &&
 {
     if (!Impl_) {
         return TError();
@@ -711,14 +773,12 @@ TError TError::Truncate(int maxInnerErrorCount, i64 stringLimit, const THashSet<
             truncateInnerError(innerError);
         }
     } else {
-        auto& innerErrors = *MutableInnerErrors();
+        auto& innerErrors = ApplyWhitelist(*MutableInnerErrors(), attributeWhitelist, maxInnerErrorCount);
         MutableAttributes()->Set(InnerErrorsTruncatedKey, true);
-        for (int i = 0; i + 1 < maxInnerErrorCount; ++i) {
-            truncateInnerError(innerErrors[i]);
+
+        for (auto& innerError : innerErrors) {
+            truncateInnerError(innerError);
         }
-        truncateInnerError(innerErrors.back());
-        innerErrors[maxInnerErrorCount - 1] = std::move(innerErrors.back());
-        innerErrors.resize(maxInnerErrorCount);
     }
 
     return std::move(*this);
@@ -730,13 +790,6 @@ bool TError::IsOK() const
         return true;
     }
     return Impl_->IsOK();
-}
-
-void TError::ThrowOnError() const
-{
-    if (!IsOK()) {
-        THROW_ERROR *this;
-    }
 }
 
 TError TError::Wrap() const &
@@ -877,22 +930,16 @@ void TError::Load(TStreamLoadContext& context)
 
 std::optional<TError> TError::FindMatching(TErrorCode code) const
 {
-    if (!Impl_) {
-        return {};
-    }
+    return FindMatching([&] (TErrorCode errorCode) {
+        return code == errorCode;
+    });
+}
 
-    if (GetCode() == code) {
-        return *this;
-    }
-
-    for (const auto& innerError : InnerErrors()) {
-        auto innerResult = innerError.FindMatching(code);
-        if (innerResult) {
-            return innerResult;
-        }
-    }
-
-    return {};
+std::optional<TError> TError::FindMatching(const THashSet<TErrorCode>& codes) const
+{
+    return FindMatching([&] (TErrorCode code) {
+        return codes.contains(code);
+    });
 }
 
 TError::TErrorOr(std::unique_ptr<TImpl> impl)
@@ -956,7 +1003,7 @@ void AppendError(TStringBuilderBase* builder, const TError& error, int indent)
                 (!error.GetThreadName().empty() ? error.GetThreadName() : ToString(error.GetTid())),
                 error.GetFid()),
             indent);
-    } else if (ErrorSanitizerEnabled && error.HasHost()) {
+    } else if (ErrorSanitizerEnabled() && error.HasHost()) {
         AppendAttribute(
             builder,
             "host",
@@ -1029,13 +1076,6 @@ void FormatValue(TStringBuilderBase* builder, const TError& error, TStringBuf /*
     AppendError(builder, error, 0);
 }
 
-TString ToString(const TError& error)
-{
-    TStringBuilder builder;
-    AppendError(&builder, error, 0);
-    return builder.Flush();
-}
-
 void ToProto(NYT::NProto::TError* protoError, const TError& error)
 {
     if (!error.Impl_) {
@@ -1073,7 +1113,7 @@ void ToProto(NYT::NProto::TError* protoError, const TError& error)
 
         static const TString FidKey("fid");
         addAttribute(FidKey, error.GetFid());
-    } else if (ErrorSanitizerEnabled && error.HasHost()) {
+    } else if (ErrorSanitizerEnabled() && error.HasHost()) {
         static const TString HostKey("host");
         addAttribute(HostKey, error.GetHost());
     }
@@ -1165,6 +1205,7 @@ void Serialize(
     const std::function<void(IYsonConsumer*)>* valueProducer,
     int depth)
 {
+    auto& errorSanitizerEnabled = ErrorSanitizerEnabled();
     BuildYsonFluently(consumer)
         .BeginMap()
             .Item("code").Value(error.GetCode())
@@ -1177,7 +1218,7 @@ void Serialize(
                         .Item("tid").Value(error.GetTid())
                         .Item("thread").Value(error.GetThreadName())
                         .Item("fid").Value(error.GetFid());
-                } else if (ErrorSanitizerEnabled && error.HasHost()) {
+                } else if (errorSanitizerEnabled && error.HasHost()) {
                     fluent
                         .Item("host").Value(error.GetHost());
                 }

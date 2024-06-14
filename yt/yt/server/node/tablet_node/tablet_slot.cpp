@@ -285,7 +285,6 @@ DEFINE_REFCOUNTED_TYPE(TMediumThrottlerManager);
 
 ////////////////////////////////////////////////////////////////////////////////
 
-
 class TTabletSlot
     : public TAutomatonInvokerHood<EAutomatonThreadQueue>
     , public ITabletSlot
@@ -304,7 +303,7 @@ public:
         , Bootstrap_(bootstrap)
         , SnapshotQueue_(New<TActionQueue>(
             Format("TabletSnap/%v", slotIndex)))
-        , Logger(TabletNodeLogger)
+        , Logger(TabletNodeLogger())
         , SlotIndex_(slotIndex)
     {
         VERIFY_INVOKER_THREAD_AFFINITY(GetAutomatonInvoker(), AutomatonThread);
@@ -355,6 +354,13 @@ public:
         VERIFY_THREAD_AFFINITY_ANY();
 
         return THood::GetGuardedAutomatonInvoker(queue);
+    }
+
+    const IInvokerPtr& GetAsyncSnapshotInvoker() override
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return SnapshotQueue_->GetInvoker();
     }
 
     const IMutationForwarderPtr& GetMutationForwarder() override
@@ -523,7 +529,7 @@ public:
         return Occupant_->GetLeaseManager();
     }
 
-    ITabletManagerPtr GetTabletManager() override
+    const ITabletManagerPtr& GetTabletManager() override
     {
         return TabletManager_;
     }
@@ -557,10 +563,7 @@ public:
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
-        auto automation = New<TTabletAutomaton>(
-            GetCellId(),
-            SnapshotQueue_->GetInvoker(),
-            GetLeaseManager());
+        auto automation = New<TTabletAutomaton>(this);
 
         if (auto controller = Bootstrap_->GetOverloadController()) {
             automation->RegisterWaitTimeObserver(controller->CreateGenericTracker(
@@ -742,6 +745,8 @@ public:
 
     ECellarType GetCellarType() override
     {
+        VERIFY_THREAD_AFFINITY_ANY();
+
         return CellarType;
     }
 
@@ -792,9 +797,21 @@ public:
         return TabletNodeProfiler;
     }
 
+    IReconfigurableThroughputThrottlerPtr GetChunkFragmentReaderMediumThrottler(TTablet* tablet) const
+    {
+        const auto throttlersConfig = Bootstrap_->GetDynamicConfigManager()->GetConfig()
+            ->TabletNode->MediumThrottlers;
+
+        if (!throttlersConfig->EnableBlobThrottling) {
+            return GetUnlimitedThrottler();
+        }
+
+        return tablet->DistributedThrottlers()[ETabletDistributedThrottlerKind::BlobMediumRead];
+    }
+
     IChunkFragmentReaderPtr CreateChunkFragmentReader(TTablet* tablet) override
     {
-        auto mediumThrottler = tablet->DistributedThrottlers()[ETabletDistributedThrottlerKind::BlobMediumRead];
+        auto mediumThrottler = GetChunkFragmentReaderMediumThrottler(tablet);
 
         return NChunkClient::CreateChunkFragmentReader(
             tablet->GetSettings().HunkReaderConfig,
@@ -808,8 +825,8 @@ public:
                 const auto& tabletNodeConfig = dynamicConfigManager->GetConfig()->TabletNode;
 
                 if (!tabletNodeConfig->EnableChunkFragmentReaderThrottling) {
-                    static const IThroughputThrottlerPtr EmptyThrottler;
-                    return EmptyThrottler;
+                    static const IThroughputThrottlerPtr NullThrottler;
+                    return NullThrottler;
                 }
 
                 return bootstrap->GetInThrottler(category);
@@ -823,7 +840,7 @@ public:
         return Bootstrap_->GetCompressionDictionaryManager();
     }
 
-    int EstimateChangelogMediumBytes(int payload) const override
+    i64 EstimateChangelogMediumBytes(i64 payload) const override
     {
         VERIFY_THREAD_AFFINITY_ANY();
 
@@ -899,7 +916,7 @@ private:
 
     NLogging::TLogger GetLogger() const
     {
-        return TabletNodeLogger.WithTag("CellId: %v, PeerId: %v",
+        return TabletNodeLogger().WithTag("CellId: %v, PeerId: %v",
             Occupant_->GetCellId(),
             Occupant_->GetPeerId());
     }

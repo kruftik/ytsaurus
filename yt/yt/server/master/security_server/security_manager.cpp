@@ -17,7 +17,6 @@
 #include "request_tracker.h"
 #include "user.h"
 #include "user_proxy.h"
-#include "security_tags.h"
 #include "ace_iterator.h"
 #include "user_activity_tracker.h"
 
@@ -40,6 +39,9 @@
 #include <yt/yt/server/master/cypress_server/node.h>
 #include <yt/yt/server/master/cypress_server/cypress_manager.h>
 #include <yt/yt/server/master/cypress_server/shard.h>
+
+#include <yt/yt/server/master/incumbent_server/incumbent_detail.h>
+#include <yt/yt/server/master/incumbent_server/incumbent_manager.h>
 
 #include <yt/yt/server/master/tablet_server/tablet.h>
 
@@ -82,33 +84,34 @@
 
 namespace NYT::NSecurityServer {
 
-using namespace NChunkServer;
-using namespace NChunkClient;
-using namespace NConcurrency;
-using namespace NHydra;
 using namespace NCellMaster;
+using namespace NChunkClient;
+using namespace NChunkServer;
+using namespace NConcurrency;
+using namespace NCypressServer;
+using namespace NHiveServer;
+using namespace NHydra;
+using namespace NIncumbentServer;
+using namespace NLogging;
 using namespace NObjectClient;
 using namespace NObjectServer;
-using namespace NTransactionServer;
-using namespace NYson;
-using namespace NYTree;
-using namespace NYPath;
-using namespace NCypressServer;
-using namespace NSequoiaServer;
-using namespace NSecurityClient;
-using namespace NTableServer;
 using namespace NObjectServer;
-using namespace NHiveServer;
 using namespace NProfiling;
-using namespace NLogging;
+using namespace NSecurityClient;
+using namespace NSequoiaServer;
+using namespace NTableServer;
+using namespace NTransactionServer;
+using namespace NYPath;
+using namespace NYson;
 using namespace NYTProf;
+using namespace NYTree;
 
 using NYT::FromProto;
 using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SecurityServerLogger;
+static constexpr auto& Logger = SecurityServerLogger;
 static TFlsSlot<TUser*> AuthenticatedUserSlot;
 
 namespace {
@@ -449,28 +452,32 @@ private:
 class TSecurityManager
     : public ISecurityManager
     , public TMasterAutomatonPart
+    , public TShardedIncumbentBase
 {
 public:
     explicit TSecurityManager(TBootstrap* bootstrap)
         : TMasterAutomatonPart(bootstrap, EAutomatonThreadQueue::SecurityManager)
+        , TShardedIncumbentBase(
+            bootstrap->GetIncumbentManager(),
+            EIncumbentType::SecurityManager)
         , UserActivityTracker_(CreateUserActivityTracker(bootstrap))
         , RequestTracker_(New<TRequestTracker>(Bootstrap_->GetConfig()->SecurityManager->UserThrottler, bootstrap))
     {
         RegisterLoader(
             "SecurityManager.Keys",
-            BIND(&TSecurityManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TSecurityManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "SecurityManager.Values",
-            BIND(&TSecurityManager::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TSecurityManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "SecurityManager.Keys",
-            BIND(&TSecurityManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TSecurityManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "SecurityManager.Values",
-            BIND(&TSecurityManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TSecurityManager::SaveValues, Unretained(this)));
 
         auto cellTag = Bootstrap_->GetMulticellManager()->GetPrimaryCellTag();
 
@@ -501,6 +508,9 @@ public:
         UsersGroupId_ = MakeWellKnownId(EObjectType::Group, cellTag, 0xfffffffffffffffe);
         SuperusersGroupId_ = MakeWellKnownId(EObjectType::Group, cellTag, 0xfffffffffffffffd);
         AdminsGroupId_ = MakeWellKnownId(EObjectType::Group, cellTag, 0xfffffffffffffffc);
+
+        const auto& incumbentManager = Bootstrap_->GetIncumbentManager();
+        incumbentManager->RegisterIncumbent(this);
 
         RegisterMethod(BIND_NO_PROPAGATE(&TSecurityManager::HydraSetAccountStatistics, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TSecurityManager::HydraRecomputeMembershipClosure, Unretained(this)));
@@ -535,9 +545,10 @@ public:
                 BIND_NO_PROPAGATE(&TSecurityManager::OnReplicateKeysToSecondaryMaster, MakeWeak(this)));
             multicellManager->SubscribeReplicateValuesToSecondaryMaster(
                 BIND_NO_PROPAGATE(&TSecurityManager::OnReplicateValuesToSecondaryMaster, MakeWeak(this)));
+            multicellManager->SubscribeSecondaryMasterRegisteredAtPrimary(
+                BIND_NO_PROPAGATE(&TSecurityManager::OnSecondaryMasterRegisteredAtPrimary, MakeWeak(this)));
         }
 
-        static constexpr int AccountProfilingProducerCount = 10;
         AccountProfilingProducers_.reserve(AccountProfilingProducerCount);
         for (auto i = 0; i < AccountProfilingProducerCount; ++i) {
             auto& producer = AccountProfilingProducers_.emplace_back(New<TBufferedProducer>());
@@ -547,6 +558,14 @@ public:
                 .WithDefaultDisabled()
                 .AddProducer("", producer);
         }
+
+        auto perCellPermissionValidationProfiler = PermissionValidationProfiler
+            .WithSparse()
+            .WithDefaultDisabled();
+        CheckPermissionTimer_ = perCellPermissionValidationProfiler
+            .Timer("/check_permission_wall_time");
+        AclIterationTimer_ = perCellPermissionValidationProfiler
+            .Timer("/acl_iteration_wall_time");
     }
 
     void OnAccountsProfiling()
@@ -554,11 +573,8 @@ public:
         if (!Bootstrap_->IsPrimaryMaster()) {
             return;
         }
-        if (!IsLeader()) {
-            return;
-        }
+
         std::vector<TSensorBuffer> buffers(std::ssize(AccountProfilingProducers_));
-        auto bufferIndex = -1;
         const auto& chunkManager = Bootstrap_->GetChunkManager();
 
         for (auto [accountId, account] : Accounts()) {
@@ -566,7 +582,16 @@ public:
                 continue;
             }
 
-            bufferIndex = ++bufferIndex % std::ssize(buffers);
+            // TODO(h0pless): Optimize by saving accounts that belong to this shard into a separate vector,
+            // simmilar to chunk manager incumbency maps.
+            if (!IsShardActive(account->GetShardIndex())) {
+                continue;
+            }
+
+            // NB: account should always stay in the same bucket. If the bucket changes, then the previous bucket will continue
+            // to report outdated values. The worst part is that outdated and current values will get added up.
+            // On the other note, the distribution is not quite uniform, but it does not matter here.
+            auto bufferIndex = account->GetProfilingBucketIndex() % std::ssize(buffers);
             auto& buffer = buffers[bufferIndex];
 
             TWithTagGuard accountTag(&buffer, "account", account->GetName());
@@ -576,14 +601,14 @@ public:
             buffer.AddGauge("/total_node_count", statistics.ResourceUsage.GetNodeCount());
             buffer.AddGauge("/chunk_count", statistics.ResourceUsage.GetChunkCount());
 
-            auto profileDetailed = [&] (double usage, double commitedUsage, TString name)  {
+            auto profileDetailed = [&] (i64 usage, i64 committedUsage, TString name)  {
                 {
-                    TWithTagGuard guard(&buffer, "status", "commited");
-                    buffer.AddGauge(name, commitedUsage);
+                    TWithTagGuard guard(&buffer, "status", "committed");
+                    buffer.AddGauge(name, committedUsage);
                 }
                 {
-                    TWithTagGuard guard(&buffer, "status", "uncommited");
-                    buffer.AddGauge(name, std::max(0., double(usage - commitedUsage)));
+                    TWithTagGuard guard(&buffer, "status", "uncommitted");
+                    buffer.AddGauge(name, std::max(static_cast<i64>(0), usage - committedUsage));
                 }
             };
 
@@ -603,7 +628,7 @@ public:
             auto diskSpace = statistics.ResourceUsage.GetPatchedDiskSpace(
                 chunkManager,
                 additionalMediumIndexes);
-            auto commitedDiskSpace = statistics.CommittedResourceUsage.GetPatchedDiskSpace(
+            auto committedDiskSpace = statistics.CommittedResourceUsage.GetPatchedDiskSpace(
                 chunkManager,
                 additionalMediumIndexes);
 
@@ -614,10 +639,10 @@ public:
                 TWithTagGuard guard(&buffer, "medium", medium->GetName());
                 buffer.AddGauge("/disk_space_in_gb", double(space) / 1_GB);
                 auto committedIt = std::find_if(
-                    commitedDiskSpace.begin(),
-                    commitedDiskSpace.end(),
+                    committedDiskSpace.begin(),
+                    committedDiskSpace.end(),
                     [index = medium->GetIndex()] (const auto& pair) {return pair.first->GetIndex() == index;});
-                if (committedIt != commitedDiskSpace.end()) {
+                if (committedIt != committedDiskSpace.end()) {
                     profileDetailed(space / double(1_GB), committedIt->second / double(1_GB), "/detailed_disk_space_in_gb");
                 }
             }
@@ -1566,10 +1591,12 @@ public:
         auto id = objectManager->GenerateId(EObjectType::User, hintId);
         auto* user = DoCreateUser(id, name);
         if (user) {
-            user->SetLastSeenTime(GetCurrentMutationContext()->GetTimestamp());
+            if (!GetDynamicConfig()->DisableUpdateUserLastSeen) {
+                user->SetLastSeenTime(GetCurrentMutationContext()->GetTimestamp());
+            }
 
             YT_LOG_DEBUG("User created (User: %v)", name);
-            LogStructuredEventFluently(Logger, ELogLevel::Info)
+            LogStructuredEventFluently(Logger(), ELogLevel::Info)
                 .Item("event").Value(EAccessControlEvent::UserCreated)
                 .Item("name").Value(user->GetName());
         }
@@ -1581,7 +1608,7 @@ public:
         YT_VERIFY(UserNameMap_.erase(user->GetName()) == 1);
         DestroySubject(user);
 
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::UserDestroyed)
             .Item("name").Value(user->GetName());
     }
@@ -1675,7 +1702,7 @@ public:
         auto* group = DoCreateGroup(id, name);
         if (group) {
             YT_LOG_DEBUG("Group created (Group: %v)", name);
-            LogStructuredEventFluently(Logger, ELogLevel::Info)
+            LogStructuredEventFluently(Logger(), ELogLevel::Info)
                 .Item("event").Value(EAccessControlEvent::GroupCreated)
                 .Item("name").Value(name);
         }
@@ -1701,7 +1728,7 @@ public:
 
         DestroySubject(group);
 
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::GroupDestroyed)
             .Item("name").Value(group->GetName());
     }
@@ -1794,7 +1821,7 @@ public:
         auto id = objectManager->GenerateId(EObjectType::NetworkProject, hintId);
         auto* networkProject = DoCreateNetworkProject(id, name);
         YT_LOG_DEBUG("Network project created (NetworkProject: %v)", name);
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::NetworkProjectCreated)
             .Item("name").Value(networkProject->GetName());
         return networkProject;
@@ -1806,7 +1833,7 @@ public:
 
         YT_LOG_DEBUG("Network project destroyed (NetworkProject: %v)",
             networkProject->GetName());
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::NetworkProjectDestroyed)
             .Item("name").Value(networkProject->GetName());
     }
@@ -1933,7 +1960,7 @@ public:
         YT_LOG_DEBUG("Proxy role created (Name: %v, ProxyKind: %v)",
             name,
             proxyKind);
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::ProxyRoleCreated)
             .Item("name").Value(name)
             .Item("proxy_kind").Value(proxyKind);
@@ -1951,7 +1978,7 @@ public:
         YT_LOG_DEBUG("Proxy role destroyed (Name: %v, ProxyKind: %v)",
             name,
             proxyKind);
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::ProxyRoleDestroyed)
             .Item("name").Value(name)
             .Item("proxy_kind").Value(proxyKind);
@@ -1993,7 +2020,7 @@ public:
             group->GetName(),
             member->GetName());
 
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::MemberAdded)
             .Item("group_name").Value(group->GetName())
             .Item("member_type").Value(member->GetType())
@@ -2020,7 +2047,7 @@ public:
             group->GetName(),
             member->GetName());
 
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::MemberRemoved)
             .Item("group_name").Value(group->GetName())
             .Item("member_type").Value(member->GetType())
@@ -2046,7 +2073,7 @@ public:
                 YT_ABORT();
         }
 
-        LogStructuredEventFluently(Logger, ELogLevel::Info)
+        LogStructuredEventFluently(Logger(), ELogLevel::Info)
             .Item("event").Value(EAccessControlEvent::SubjectRenamed)
             .Item("subject_type").Value(subject->GetType())
             .Item("old_name").Value(subject->GetName())
@@ -2138,6 +2165,13 @@ public:
         EPermission permission,
         TPermissionCheckOptions options = {}) override
     {
+        TWallTimer checkPermissionTimer;
+
+        user->AlertIfPendingRemoval(
+            Format("User pending for removal was mentioned in permission check for object (User: %v, ObjectId: %v)",
+            user->GetName(),
+            object->GetId()));
+
         if (IsVersionedType(object->GetType()) && object->IsForeign()) {
             YT_LOG_DEBUG("Checking permission for a versioned foreign object (ObjectId: %v)",
                 object->GetId());
@@ -2162,10 +2196,15 @@ public:
 
         auto* owner = GetObjectOwner(object, options.FirstObjectAcdOverride.Owner());
 
+        auto dynamicConfig = GetDynamicConfig();
+        auto* userTags = dynamicConfig->EnableSubjectTagFilters ? &user->Tags() : nullptr;
+
+        TWallTimer aclIterationTimer;
         TTagFilteringAceIterator aceIter(
             Bootstrap_->GetObjectManager().Get(),
             object,
-            &user->Tags(),
+            /*alwaysEvaluateFirstElement*/ !dynamicConfig->FixSubjectTagFilterIteratorNeverSkippingFirstAce,
+            userTags,
             std::move(options.FirstObjectAcdOverride));
         auto aceEndIter = TTagFilteringAceIterator();
 
@@ -2184,6 +2223,7 @@ public:
                 break;
             }
         }
+        AclIterationTimer_.Record(aclIterationTimer.GetElapsedTime());
 
         const auto& cypressManager = Bootstrap_->GetCypressManager();
 
@@ -2202,6 +2242,7 @@ public:
                 currentDepth);
         }
 
+        CheckPermissionTimer_.Record(checkPermissionTimer.GetElapsedTime());
         return checker.GetResponse();
     }
 
@@ -2269,6 +2310,11 @@ public:
         EPermission permission,
         TPermissionCheckOptions options = {}) override
     {
+        user->AlertIfPendingRemoval(
+            Format("User pending for removal was mentioned in validating permission for object (User: %v, ObjectId: %v)",
+            user->GetName(),
+            object->GetId()));
+
         // TODO(cherepashka): remove after acl & inherited attributes are implemented in Sequoia.
         if (GetSequoiaContext()) {
             return;
@@ -2327,7 +2373,7 @@ public:
                 "check for announces at https://infra.yandex-team.ru before reporting any issues",
                 user->GetName());
         } else {
-            auto event = LogStructuredEventFluently(Logger, ELogLevel::Info)
+            auto event = LogStructuredEventFluently(Logger(), ELogLevel::Info)
                 .Item("event").Value(EAccessControlEvent::AccessDenied)
                 .Item("user").Value(user->GetName())
                 .Item("permission").Value(permission)
@@ -2598,6 +2644,10 @@ public:
 
     TError CheckUserAccess(TUser* user) override
     {
+        user->AlertIfPendingRemoval(
+            Format("User pending for removal was mentioned in check user access (User: %v)",
+            user->GetName()));
+
         if (user->GetBanned()) {
             return TError(
                 NSecurityClient::EErrorCode::UserBanned,
@@ -2854,15 +2904,15 @@ private:
 
     bool IsChunkHostCell_ = false;
 
-    // COMPAT(h0pless): Reign UpdatePerUserThrottlerLimits
-    bool NeedUpdatePerUserThrottlerLimits_ = false;
-
     // COMPAT(h0pless): Remove this after chunk schemas are introduced.
     bool NeedRecomputeReferencingAccounts_ = false;
 
     bool MustRecomputeMembershipClosure_ = false;
 
     bool GroupNameMapInitialized_ = false;
+
+    TEventTimer CheckPermissionTimer_;
+    TEventTimer AclIterationTimer_;
 
     DECLARE_THREAD_AFFINITY_SLOT(AutomatonThread);
 
@@ -3110,7 +3160,7 @@ private:
     {
         NProto::TReqRecomputeMembershipClosure request;
         YT_UNUSED_FUTURE(CreateMutation(Bootstrap_->GetHydraFacade()->GetHydraManager(), request)
-            ->CommitAndLog(Logger));
+            ->CommitAndLog(Logger()));
     }
 
 
@@ -3169,7 +3219,6 @@ private:
         ProxyRoleMap_.LoadKeys(context);
         AccountResourceUsageLeaseMap_.LoadKeys(context);
 
-        NeedUpdatePerUserThrottlerLimits_ = context.GetVersion() < EMasterReign::UpdatePerUserThrottlerLimits;
         NeedRecomputeReferencingAccounts_ = context.GetVersion() < EMasterReign::AddChunkSchemas;
     }
 
@@ -3266,33 +3315,8 @@ private:
 
         InitBuiltins();
 
-        ValidateAccountResourceUsages();
-
         RecomputeAccountMasterMemoryUsage();
         RecomputeSubtreeSize(RootAccount_, /*validateMatch*/ true);
-
-        // Strictly speaking, only root user is necessary here, but it doesn't hurt to make more built-in users independent from the default config.
-        if (NeedUpdatePerUserThrottlerLimits_) {
-            const auto unlimitedThrottlerConfig = New<TThroughputThrottlerConfig>();
-            RootUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            RootUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            SchedulerUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            SchedulerUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            ReplicatorUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            ReplicatorUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            FileCacheUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            FileCacheUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            OperationsCleanerUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            OperationsCleanerUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            OperationsClientUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            OperationsClientUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            TabletCellChangeloggerUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            TabletCellChangeloggerUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            TabletCellSnapshotterUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            TabletCellSnapshotterUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-            TableMountInformerUser_->SetChunkServiceUserRequestWeightThrottlerConfig(unlimitedThrottlerConfig);
-            TableMountInformerUser_->SetChunkServiceUserRequestBytesThrottlerConfig(unlimitedThrottlerConfig);
-        }
 
         InitializeRootAccount();
     }
@@ -3432,7 +3456,8 @@ private:
             return false;
         };
 
-        bool resourceUsageMatches = true;
+        bool mismatchFound = false;
+        auto mismatchLogLevel = recompute ? ELogLevel::Alert : ELogLevel::Fatal;
 
         auto& actualUsage = account->LocalStatistics().ResourceUsage;
         const auto& expectedUsage = expectedResourceUsage.Usage;
@@ -3441,11 +3466,14 @@ private:
             actualUsage,
             expectedUsage))
         {
-            YT_LOG_ALERT("%v account usage mismatch, snapshot usage: %v, recomputed usage: %v",
+            YT_LOG_EVENT(
+                Logger(),
+                mismatchLogLevel,
+                "Account usage mismatch (Account: %v, SnapshotUsage: %v, RecomputedUsage: %v)",
                 account->GetName(),
                 actualUsage,
                 expectedUsage);
-            resourceUsageMatches = false;
+            mismatchFound = true;
         }
 
         auto& actualCommittedUsage = account->LocalStatistics().CommittedResourceUsage;
@@ -3455,15 +3483,18 @@ private:
             actualCommittedUsage,
             expectedCommittedUsage))
         {
-            YT_LOG_ALERT("%v account committed usage mismatch, snapshot usage: %v, recomputed usage: %v",
+            YT_LOG_EVENT(
+                Logger(),
+                mismatchLogLevel,
+                "Account committed usage mismatch (Account: %v, SnapshotUsage: %v, RecomputedUsage: %v)",
                 account->GetName(),
                 actualUsage,
                 expectedUsage);
-            resourceUsageMatches = false;
+            mismatchFound = true;
         }
 
-        if (!resourceUsageMatches && recompute) {
-            YT_LOG_ALERT("Setting recomputed resource usage for account (AccountName: %v)",
+        if (mismatchFound && recompute) {
+            YT_LOG_ALERT("Setting recomputed resource usage for account (Account: %v)",
                 account->GetName());
 
             actualUsage = expectedUsage;
@@ -3478,12 +3509,17 @@ private:
 
     void ValidateAccountResourceUsages()
     {
+        YT_LOG_INFO("Started validating account resource usage");
+
         auto resourceUsages = ComputeAccountResourceUsages();
         for (auto [accountId, account] : Accounts()) {
             ValidateAndMaybeRecomputeAccountResourceUsage(
                 account,
-                resourceUsages[account]);
+                resourceUsages[account],
+                /*recompute*/ false);
         }
+
+        YT_LOG_INFO("Finished validating account resource usage");
     }
 
     void RecomputeAccountMasterMemoryUsage()
@@ -3693,7 +3729,6 @@ private:
         SequoiaAccount_ = nullptr;
 
         MustRecomputeMembershipClosure_ = false;
-        NeedUpdatePerUserThrottlerLimits_ = false;
         NeedRecomputeReferencingAccounts_ = false;
         GroupNameMapInitialized_ = false;
 
@@ -4047,8 +4082,18 @@ private:
             Bootstrap_->GetHydraFacade()->GetAutomatonInvoker(NCellMaster::EAutomatonThreadQueue::SecurityManager),
             BIND(&TSecurityManager::CommitAccountMasterMemoryUsage, MakeWeak(this)));
         AccountMasterMemoryUsageUpdateExecutor_->Start();
+    }
 
+    void OnIncumbencyStarted(int shardIndex) override
+    {
+        TShardedIncumbentBase::OnIncumbencyStarted(shardIndex);
         StartAccountsProfiling();
+    }
+
+    void OnIncumbencyFinished(int shardIndex) override
+    {
+        TShardedIncumbentBase::OnIncumbencyFinished(shardIndex);
+        StopAccountsProfiling();
     }
 
     void StartAccountsProfiling()
@@ -4057,12 +4102,7 @@ private:
             return;
         }
 
-        if (!IsLeader()) {
-            return;
-        }
-
         const auto& dynamicConfig = GetDynamicConfig();
-
         if (!dynamicConfig->EnableAccountsProfiling) {
             return;
         }
@@ -4120,8 +4160,6 @@ private:
             YT_UNUSED_FUTURE(AccountMasterMemoryUsageUpdateExecutor_->Stop());
             AccountMasterMemoryUsageUpdateExecutor_.Reset();
         }
-
-        StopAccountsProfiling();
     }
 
     void OnStopFollowing() override
@@ -4154,7 +4192,7 @@ private:
 
         if (request.entries_size() > 0) {
             YT_UNUSED_FUTURE(CreateMutation(Bootstrap_->GetHydraFacade()->GetHydraManager(), request)
-                ->CommitAndLog(Logger));
+                ->CommitAndLog(Logger()));
         }
     }
 
@@ -4170,7 +4208,7 @@ private:
         }
 
         if (multicellManager->IsPrimaryMaster()) {
-            const auto& secondaryCellTags = multicellManager->GetSecondaryCellTags();
+            const auto& secondaryCellTags = multicellManager->GetRegisteredMasterCellTags();
             for (auto secondaryCellTag : secondaryCellTags) {
                 multicellStatistics[secondaryCellTag];
             }
@@ -4303,7 +4341,7 @@ private:
 
             // Update last seen time.
             auto lastSeenTime = FromProto<TInstant>(update.last_seen_time());
-            if (lastSeenTime > user->GetLastSeenTime()) {
+            if (lastSeenTime > user->GetLastSeenTime() && !GetDynamicConfig()->DisableUpdateUserLastSeen) {
                 user->SetLastSeenTime(lastSeenTime);
             }
         }
@@ -4467,6 +4505,16 @@ private:
 
         for (auto* group : groups) {
             replicateMembership(group);
+        }
+    }
+
+    void OnSecondaryMasterRegisteredAtPrimary(TCellTag cellTag)
+    {
+        YT_VERIFY(Bootstrap_->IsPrimaryMaster());
+
+        auto accounts = GetValuesSortedByKey(AccountMap_);
+        for (auto* account : accounts) {
+            account->MulticellStatistics().emplace(cellTag, TAccountStatistics{});
         }
     }
 

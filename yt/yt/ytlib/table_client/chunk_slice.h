@@ -25,7 +25,7 @@ struct TChunkSlice
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TString ToString(const TChunkSlice& slice);
+void FormatValue(TStringBuilderBase* builder, const TChunkSlice& slice, TStringBuf spec);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -43,7 +43,8 @@ void ToProto(
 
 i64 GetChunkSliceDataWeight(
     const NChunkClient::NProto::TReqGetChunkSliceDataWeights::TChunkSlice& weightedChunkRequest,
-    const NChunkClient::NProto::TChunkMeta& meta);
+    const NChunkClient::NProto::TChunkMeta& meta,
+    const std::optional<std::vector<TColumnStableName>>& columnStableNames);
 
 ////////////////////////////////////////////////////////////////////////////////
 

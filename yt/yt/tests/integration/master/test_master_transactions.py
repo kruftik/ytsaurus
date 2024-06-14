@@ -4,7 +4,8 @@ from yt_commands import (
     authors, wait, create, ls, get, set, copy, remove, exists, create_user,
     create_group, add_member, remove_member, start_transaction, abort_transaction,
     commit_transaction, ping_transaction, lock, write_file, write_table,
-    get_transactions, get_topmost_transactions, gc_collect, get_driver)
+    get_transactions, get_topmost_transactions, gc_collect, get_driver,
+    raises_yt_error)
 
 from yt.environment.helpers import assert_items_equal
 from yt.common import datetime_to_string, YtError
@@ -12,11 +13,57 @@ from yt.common import datetime_to_string, YtError
 import pytest
 from flaky import flaky
 
-from time import sleep
-from datetime import datetime, timedelta
 import builtins
+from datetime import datetime, timedelta
+import decorator
+from time import sleep
+
 
 ##################################################################
+
+
+def with_portals_dir(func):
+    def wrapper(func, self, *args, **kwargs):
+        if not self.ENABLE_TMP_PORTAL:
+            create("map_node", "//portals")
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            if not self.ENABLE_TMP_PORTAL:
+                remove("//portals", recursive=True)
+
+    return decorator.decorate(func, wrapper)
+
+
+##################################################################
+
+
+# NB: CheckInvariants() complexity is at least O(|Cypress nodes|) which is too
+# slow in this case.
+class TestMasterTransactionsWithoutInvariantChecking(YTEnvSetup):
+    NUM_MASTERS = 3
+    NUM_NODES = 0
+
+    DELTA_MASTER_CONFIG = {
+        "hydra_manager": {
+            "invariants_check_probability": None,
+        }
+    }
+
+    @authors("kvk1920")
+    def test_abort_square(self):
+        set("//sys/accounts/tmp/@resource_limits/node_count", 10000000)
+        create("map_node", "//tmp/tree1")
+        subtree = {str(i): {} for i in range(10000)}
+        for i in range(20):
+            set(f"//tmp/tree1/{i}", subtree, force=True)
+        tx1 = start_transaction()
+        tx2 = start_transaction(tx=tx1)
+        with raises_yt_error("its descendants already have"):
+            copy("//tmp/tree1", "//tmp/tree2", tx=tx2)
+        abort_transaction(tx1)
+        gc_collect()
+        assert not exists(f"#{tx1}")
 
 
 class TestMasterTransactions(YTEnvSetup):
@@ -78,6 +125,7 @@ class TestMasterTransactions(YTEnvSetup):
 
     @authors("h0pless")
     def test_transaction_method_whitelist(self):
+        set("//sys/@config/transaction_manager/alert_transaction_is_not_compatible_with_method", False)
         set("//sys/@config/transaction_manager/transaction_type_to_method_whitelist/transaction", [])
         tx = start_transaction()
         with pytest.raises(YtError, match="Method .* is not supported for type"):
@@ -158,34 +206,36 @@ class TestMasterTransactions(YTEnvSetup):
         assert get("//tmp/t1") == 0
         assert get("//tmp/t2") == 0
 
-    @authors("panin", "ignat")
-    @flaky(max_runs=5)
+    @authors("kvk1920")
     def test_timeout(self):
-        tx = start_transaction(timeout=2000)
+        tx1 = start_transaction(timeout=2000)
+        tx2 = start_transaction(timeout=2000)
 
-        # check that transaction is still alive after 1 seconds
+        # Check that transactions are still alive after 1 seconds.
         sleep(1.0)
-        assert exists("//sys/transactions/" + tx)
+        assert exists(f"//sys/transactions/{tx1}")
+        assert exists(f"//sys/transactions/{tx2}")
 
-        # check that transaction is expired after 3 seconds
+        # Check that transactions are expired after 3 seconds
         sleep(3.0)
-        assert not exists("//sys/transactions/" + tx)
+        assert not exists(f"//sys/transactions/{tx1}")
+        assert not exists(f"//sys/transactions/{tx2}")
 
-    @authors("ignat")
-    @flaky(max_runs=5)
+    @authors("kvk1920")
     def test_deadline(self):
-        tx = start_transaction(
-            timeout=10000,
-            deadline=datetime_to_string(datetime.utcnow() + timedelta(seconds=2)),
-        )
+        deadline = datetime_to_string(datetime.utcnow() + timedelta(seconds=2))
+        tx1 = start_transaction(timeout=10000, deadline=deadline)
+        tx2 = start_transaction(tx=tx1, timeout=10000, deadline=deadline)
 
-        # check that transaction is still alive after 1 seconds
+        # Check that transactions are still alive after 1 seconds.
         sleep(1.0)
-        assert exists("//sys/transactions/" + tx)
+        assert exists(f"//sys/transactions/{tx1}")
+        assert exists(f"//sys/transactions/{tx2}")
 
-        # check that transaction is expired after 3 seconds
+        # Check that transactions are expired after 3 seconds.
         sleep(3.0)
-        assert not exists("//sys/transactions/" + tx)
+        assert not exists(f"//sys/transactions/{tx1}")
+        assert not exists(f"//sys/transactions/{tx2}")
 
     @authors("levysotsky")
     @flaky(max_runs=5)
@@ -227,7 +277,7 @@ class TestMasterTransactions(YTEnvSetup):
         assert exists("//sys/transactions/" + tx_outer)
         ping_transaction(tx_inner)
 
-        sleep(2.5)
+        sleep(3.5)
         # check that outer tx expired (and therefore inner was aborted)
         assert not exists("//sys/transactions/" + tx_inner)
         assert not exists("//sys/transactions/" + tx_outer)
@@ -249,10 +299,8 @@ class TestMasterTransactions(YTEnvSetup):
         assert exists("//sys/transactions/" + tx_outer)
 
     @authors("babenko")
+    @with_portals_dir
     def test_tx_multicell_attrs(self):
-        if not self.ENABLE_TMP_PORTAL:
-            create("map_node", "//portals")
-
         tx = start_transaction(timeout=60000)
         tx_cell_tag = str(get("#" + tx + "/@native_cell_tag"))
         cell_tags = [tx_cell_tag]
@@ -298,9 +346,6 @@ class TestMasterTransactions(YTEnvSetup):
             assert staged_node_ids[tx_cell_tag] == []
 
             assert len(get("#" + tx + "/@lock_ids/13")) == 2
-
-        if not self.ENABLE_TMP_PORTAL:
-            remove("//portals", recursive=True)
 
     @authors("babenko")
     def test_transaction_maps(self):
@@ -376,7 +421,6 @@ class TestMasterTransactions(YTEnvSetup):
     def test_revision4(self):
         if self.is_multicell():
             pytest.skip("@current_commit_revision not supported with sharded transactions")
-            return
 
         r1 = get("//sys/@current_commit_revision")
         set("//tmp/t", 1)
@@ -487,7 +531,7 @@ class TestMasterTransactions(YTEnvSetup):
         tx_a = start_transaction()
         tx_b = start_transaction()
 
-        with pytest.raises(YtError):
+        with raises_yt_error("Unknown transaction cell tag"):
             commit_transaction(tx_b, prerequisite_transaction_ids=["a-b-c-d"])
 
         # Failing to commit a transaction with prerequisites provokes its abort.
@@ -591,18 +635,18 @@ class TestMasterTransactionsMulticell(TestMasterTransactions):
 
         self._assert_native_content_revision_matches("//tmp/t")
 
-        tx1 = start_transaction()
+        tx1 = start_transaction(timeout=120000)
         write_table("<append=%true>//tmp/t", {"a": "b"}, tx=tx1)
         self._assert_native_content_revision_matches("//tmp/t")
         self._assert_native_content_revision_matches("//tmp/t", tx1)
 
-        tx2 = start_transaction()
+        tx2 = start_transaction(timeout=120000)
         write_table("<append=%true>//tmp/t", {"a": "b"}, tx=tx2)
         self._assert_native_content_revision_matches("//tmp/t")
         self._assert_native_content_revision_matches("//tmp/t", tx1)
         self._assert_native_content_revision_matches("//tmp/t", tx2)
 
-        tx3 = start_transaction(tx=tx2)
+        tx3 = start_transaction(tx=tx2, timeout=120000)
         write_table("<append=%true>//tmp/t", {"a": "b"}, tx=tx3)
         self._assert_native_content_revision_matches("//tmp/t")
         self._assert_native_content_revision_matches("//tmp/t", tx1)
@@ -625,10 +669,8 @@ class TestMasterTransactionsMulticell(TestMasterTransactions):
             assert_on_commit()
 
     @authors("shakurov")
+    @with_portals_dir
     def test_native_content_revision_copy(self):
-        if not self.ENABLE_TMP_PORTAL:
-            create("map_node", "//portals")
-
         create("portal_entrance", "//portals/p", attributes={"exit_cell_tag": 13})
 
         create("table", "//tmp/t", attributes={"external_cell_tag": 12})
@@ -652,9 +694,6 @@ class TestMasterTransactionsMulticell(TestMasterTransactions):
         self._assert_native_content_revision_matches("//tmp/t_copy_tx")
         self._assert_native_content_revision_matches("//portals/p/t_copy_tx")
 
-        if not self.ENABLE_TMP_PORTAL:
-            remove("//portals", recursive=True)
-
 
 class TestMasterTransactionsShardedTx(TestMasterTransactionsMulticell):
     NUM_SECONDARY_MASTER_CELLS = 5
@@ -675,9 +714,10 @@ class TestMasterTransactionsShardedTx(TestMasterTransactionsMulticell):
         # coordinator cell (which is by design, BTW). So this test
         # will sometimes succeed trivially. But it definitely must
         # NOT be flaky!
-        tx_a = start_transaction()
-        tx_b = start_transaction()
-        commit_transaction(tx_a, prerequisite_transaction_ids=[tx_b])
+        for _ in range(4):
+            tx_a = start_transaction()
+            tx_b = start_transaction()
+            commit_transaction(tx_a, prerequisite_transaction_ids=[tx_b])
 
     def _create_portal_to_cell(self, cell_tag):
         portal_path = "//portals/p{}".format(cell_tag)
@@ -718,7 +758,8 @@ class TestMasterTransactionsShardedTx(TestMasterTransactionsMulticell):
 
         self._replicate_tx_to_cell(tx2, 13, "r")
 
-        assert get("#" + tx1 + "/@replicated_to_cell_tags") == [13]
+        # TODO(kvk1920): fix mirrored Cypress tx replication.
+        wait(lambda: get("#" + tx1 + "/@replicated_to_cell_tags") == [13])
 
     @authors("shakurov")
     @pytest.mark.parametrize("replication_mode", ["r", "w"])
@@ -816,6 +857,22 @@ class TestMasterTransactionsShardedTx(TestMasterTransactionsMulticell):
 
         assert exists("//tmp/qqq")
 
+    @authors("h0pless")
+    def test_foreign_transaction_map(self):
+        with pytest.raises(YtError, match="Error parsing GUID"):
+            get("//sys/foreign_transactions/1---4")
+
+        tx = start_transaction()
+        tx_cell_tag = get(f"#{tx}/@native_cell_tag")
+        assert tx not in ls("//sys/foreign_transactions", driver=get_driver(3))
+        assert tx not in ls("//sys/foreign_transactions", driver=get_driver(tx_cell_tag - 10))
+
+        self._replicate_tx_to_cell(tx, 13, "r")
+        wait(lambda: tx in ls("//sys/foreign_transactions", driver=get_driver(3)))
+
+        commit_transaction(tx)
+        wait(lambda: tx not in ls("//sys/foreign_transactions", driver=get_driver(3)))
+
 
 class TestMasterTransactionsCTxS(TestMasterTransactionsShardedTx):
     DRIVER_BACKEND = "rpc"
@@ -826,6 +883,24 @@ class TestMasterTransactionsCTxS(TestMasterTransactionsShardedTx):
             "transaction_manager": {
                 "use_cypress_transaction_service": True,
             }
+        }
+    }
+
+
+class TestMasterTransactionsMirroredTx(TestMasterTransactionsCTxS):
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+    NUM_CYPRESS_PROXIES = 1
+    NUM_TEST_PARTITIONS = 6
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    DELTA_DYNAMIC_MASTER_CONFIG = {
+        "transaction_manager": {
+            "forbid_transaction_actions_for_cypress_transactions": True,
         }
     }
 

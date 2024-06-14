@@ -192,6 +192,9 @@ public:
 
     bool MakeRootFSWritable;
 
+    //! Enable mount of fuse device to user job container.
+    bool EnableFuse;
+
     //! Path to write job proxy stderr (for testing purposes).
     std::optional<TString> StderrPath;
     //! Path to write executor stderr (for testing purposes).
@@ -261,6 +264,9 @@ public:
     //! If set, lightweight chunk specs for stderr and core tables
     //! will be sent in heartbeats to the controller agent.
     bool EnableStderrAndCoreLivePreview;
+
+    //! Forward variables from job proxy environment to user job.
+    bool ForwardAllEnvironmentVariables;
 
     std::optional<double> ContainerCpuLimit;
 

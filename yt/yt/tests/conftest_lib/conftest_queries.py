@@ -1,7 +1,7 @@
 from yt_commands import (
     create, create_access_control_object_namespace, create_access_control_object, create_user,
     remove_user, remove, add_member, sync_create_cells, sync_remove_tablet_cells, ls,
-    set, wait, get)
+    make_ace, set, wait, get)
 
 from yt_queries import get_query_tracker_info
 
@@ -45,8 +45,22 @@ class QueryTracker(ExternalComponent):
                          verbose=False, verbose_error=False),
              ignore_exceptions=True)
 
+    def on_start(self):
+        query_tracker_config = {
+            "stages": {
+                "production": {
+                    "channel": {
+                        "addresses": self.addresses,
+                    }
+                },
+            },
+        }
+        set("//sys/clusters/primary/query_tracker", query_tracker_config)
+        wait(query_tracker_has_loaded)
+
     def on_finish(self):
         remove("//sys/query_tracker/instances", recursive=True, force=True)
+        remove("//sys/clusters/primary/query_tracker")
 
 
 def query_tracker_has_loaded():
@@ -61,21 +75,22 @@ def query_tracker_environment():
     create_user("query_tracker")
     add_member("query_tracker", "superusers")
     sync_create_cells(1)
-    query_tracker_config = {
-        "stages": {
-            "production": {},
-        },
-    }
-    set("//sys/clusters/primary/query_tracker", query_tracker_config)
+
     create("document", "//sys/query_tracker/config", recursive=True, force=True, attributes={"value": {}})
     create_access_control_object_namespace("queries")
     create_access_control_object("nobody", "queries")
-
-    wait(query_tracker_has_loaded)
+    create_access_control_object(
+        "everyone-share",
+        "queries",
+        attributes={
+            "principal_acl": [
+                make_ace("allow", "everyone", "read"),
+                make_ace("allow", "everyone", "use"),
+            ]
+        })
     yield
     remove("//sys/access_control_object_namespaces/queries/nobody")
     remove("//sys/access_control_object_namespaces/queries")
-    remove("//sys/clusters/primary/query_tracker")
     sync_remove_tablet_cells(ls("//sys/tablet_cells"))
     remove_user("query_tracker")
     remove("//sys/query_tracker", recursive=True, force=True)

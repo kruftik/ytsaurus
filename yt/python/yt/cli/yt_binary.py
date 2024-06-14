@@ -995,8 +995,12 @@ def alter_table_replica(**kwargs):
     if kwargs["disable"]:
         kwargs["enabled"] = False
 
+    if kwargs["disable_replicated_table_tracker"]:
+        kwargs["enable_replicated_table_tracker"] = False
+
     kwargs.pop("enable")
     kwargs.pop("disable")
+    kwargs.pop("disable_replicated_table_tracker")
 
     yt.alter_table_replica(**kwargs)
 
@@ -1007,6 +1011,13 @@ def add_alter_table_replica_parser(add_parser):
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--enable", action="store_true", help="enable table replica")
     group.add_argument("--disable", action="store_true", help="disable table replica")
+
+    replicated_table_tracker_group = parser.add_mutually_exclusive_group()
+    replicated_table_tracker_group.add_argument("--enable-replicated-table-tracker", action="store_true",
+                                                help="enable replicated table tracker for table replica")
+    replicated_table_tracker_group.add_argument("--disable-replicated-table-tracker", action="store_true",
+                                                help="disable replicated table tracker for table replica")
+
     parser.add_argument("--mode", help='alternation mode, can be "sync" or "async"')
 
 
@@ -1232,7 +1243,8 @@ def add_start_query_parser(add_parser):
     add_structured_argument(parser, "--settings", help="additional settings of a query in structured form")
     add_structured_argument(parser, "--files", help='query files, a YSON list of files, each of which is represented by a map with keys "name", "content", "type".'
                                                     'Field "type" is one of "raw_inline_data", "url"')
-    parser.add_argument("--access-control-object", type=str, help='optional access control object name')
+    parser.add_argument("--access-control-object", type=str, help='optional access control object name (deprecated)')
+    add_structured_argument(parser, "--access-control-objects", help='access control objects, a YSON list of ACO names')
     parser.add_argument("--stage", type=str, help='query tracker stage, defaults to "production"')
 
 
@@ -1313,6 +1325,13 @@ def add_list_queries_parser(add_parser):
     parser.add_argument("--attribute", action="append", dest="attributes", help="desired attributes in the response")
     parser.add_argument("--stage", type=str, help='query tracker stage, defaults to "production"')
     add_structured_format_argument(parser)
+
+
+def add_alter_query_parser(add_parser):
+    parser = add_parser("alter-query", yt.alter_query)
+    add_structured_argument(parser, "--annotations", help='a YSON map of annotations')
+    add_structured_argument(parser, "--access-control-objects", help='access control objects, a YSON list of ACO names')
+    parser.add_argument("--stage", type=str, help='query tracker stage, defaults to "production"')
 
 
 SPEC_BUILDERS = {
@@ -1693,8 +1712,8 @@ def add_ping_tx_parser(add_parser):
     transaction_args(parser)
 
 
-@copy_docstring_from(yt.lock)
 def lock(**kwargs):
+    """Tries to lock the path. Do not forget about global `--tx` option"""
     lock_id = yt.lock(**kwargs)
     if lock_id is not None:
         print(lock_id)
@@ -2212,13 +2231,13 @@ def remove_maintenance(**kwargs):
 
 
 def add_maintenance_request_parsers(add_parser):
-    parser = add_parser("add_maintenance", add_maintenance)
+    parser = add_parser("add-maintenance", add_maintenance)
     parser.add_argument("--component", type=str)
     parser.add_argument("--address", type=str)
     parser.add_argument("--type", type=str)
     parser.add_argument("--comment", type=str)
 
-    parser = add_parser("remove_maintenance", remove_maintenance)
+    parser = add_parser("remove-maintenance", remove_maintenance)
     parser.add_argument("-c", "--component", type=str)
     parser.add_argument("-a", "--address", type=str)
     parser.add_argument("--id", default=None)
@@ -2244,17 +2263,24 @@ def add_dirtable_parser(root_subparsers):
     add_dirtable_parsers(dirtable_subparsers)
 
 
+def add_livy_parser(add_parser):
+    parser = add_parser("livy", pythonic_help="SPYT Livy commands")
+    livy_subparsers = parser.add_subparsers(metavar="livy_command", **SUBPARSER_KWARGS)
+    add_spyt_liyv_subparser = add_subparser(livy_subparsers, params_argument=False)
+    add_strawberry_ctl_parser(add_spyt_liyv_subparser, "livy")
+
+
 def add_spark_parser(root_subparsers):
     # NB: py2 version of argparse library does not support aliases in add_parser.
     # Rewrite it when py2 support is dropped or deprecate a legacy "spark" alias.
     for name in ("spyt", "spark"):
         parser = populate_argument_help(root_subparsers.add_parser(
-            name, description="Spark over YT commands"))
+            name, description="SPYT commands"))
 
         spark_subparsers = parser.add_subparsers(metavar="spark_command", **SUBPARSER_KWARGS)
         add_spark_subparser = add_subparser(spark_subparsers, params_argument=False)
-        add_start_spark_cluster_parser(add_spark_subparser)
         add_find_spark_cluster_parser(add_spark_subparser)
+        add_livy_parser(add_spark_subparser)
 
 
 @copy_docstring_from(chyt.start_clique)
@@ -2346,40 +2372,6 @@ def add_jupyt_parser(root_subparsers):
 
     add_jupyter_subparser = add_subparser(jupyter_subparsers, params_argument=False)
     add_strawberry_ctl_parser(add_jupyter_subparser, "jupyt")
-
-
-@copy_docstring_from(yt.start_spark_cluster)
-def start_spark_cluster_handler(*args, **kwargs):
-    yt.start_spark_cluster(*args, **kwargs)
-
-
-def add_start_spark_cluster_parser(add_parser):
-    from yt.wrapper.spark import SparkDefaultArguments
-    parser = add_parser("start-cluster", start_spark_cluster_handler,
-                        help="Start Spark Standalone cluster in YT Vanilla Operation")
-    parser.add_argument("--spark-worker-core-count", required=True, type=int,
-                        help="Number of cores that will be available on Spark worker")
-    parser.add_argument("--spark-worker-memory-limit", required=True,
-                        help="Amount of memory that will be available on Spark worker")
-    parser.add_argument("--spark-worker-count", required=True, type=int, help="Number of Spark workers")
-    parser.add_argument("--spark-worker-timeout", default=SparkDefaultArguments.SPARK_WORKER_TIMEOUT,
-                        help="Worker timeout to wait master start")
-    parser.add_argument("--operation-alias", help="Alias for the underlying YT operation")
-    parser.add_argument("--discovery-path", help="Cypress path for discovery files and logs, "
-                                                 "the same path must be used in find-spark-cluster. "
-                                                 "SPARK_YT_DISCOVERY_PATH env variable is used by default")
-    parser.add_argument("--pool", help="Pool for the underlying YT operation")
-    parser.add_argument("--spark-worker-tmpfs-limit", default=SparkDefaultArguments.SPARK_WORKER_TMPFS_LIMIT,
-                        help="Limit of tmpfs usage per Spark worker")
-    parser.add_argument("--spark-master-memory-limit", default=SparkDefaultArguments.SPARK_MASTER_MEMORY_LIMIT,
-                        help="Memory limit on Spark master")
-    parser.add_argument("--spark-history-server-memory-limit",
-                        default=SparkDefaultArguments.SPARK_HISTORY_SERVER_MEMORY_LIMIT,
-                        help="Memory limit on Spark History Server")
-    parser.add_argument("--dynamic-config-path", default=SparkDefaultArguments.DYNAMIC_CONFIG_PATH,
-                        help="YT path of dynamic config")
-    add_structured_argument(parser, "--operation-spec", "YT Vanilla Operation spec",
-                            default=SparkDefaultArguments.get_operation_spec())
 
 
 @copy_docstring_from(yt.find_spark_cluster)
@@ -2486,7 +2478,7 @@ def add_flow_set_pipeline_dynamic_spec_parser(add_parser):
     parser.add_argument("--expected-version", type=int,
                         help="Pipeline spec expected version")
     parser.add_argument("--spec-path", help="Path to part of the spec")
-    add_hybrid_argument(parser, "spec", group_required=False,
+    add_hybrid_argument(parser, "value", group_required=False,
                         help="new spec attribute value")
 
 
@@ -2554,7 +2546,7 @@ def add_run_command_with_lock_parser(add_parser):
     parser.set_defaults(func=run_command_with_lock_handler)
 
 
-def main_func():
+def _prepare_config_parser():
     config_parser = ArgumentParser(add_help=False)
     config_parser.add_argument("--proxy", help="specify cluster to run command, "
                                                "by default YT_PROXY from environment")
@@ -2570,6 +2562,11 @@ def main_func():
                                help="turn on pinging ancestor transactions")
     config_parser.add_argument("--trace", action="store_true",
                                help="trace execution of request using jaeger")
+    return config_parser
+
+
+def _prepare_parser():
+    config_parser = _prepare_config_parser()
 
     parser = ArgumentParser(parents=[config_parser],
                             formatter_class=RawDescriptionHelpFormatter,
@@ -2644,6 +2641,7 @@ def main_func():
     add_get_query_parser(add_parser)
     add_get_query_result_parser(add_parser)
     add_list_queries_parser(add_parser)
+    add_alter_query_parser(add_parser)
 
     add_erase_parser(add_parser)
     add_merge_parser(add_parser)
@@ -2730,9 +2728,18 @@ def main_func():
     if HAS_IDM_CLI_HELPERS:
         add_idm_parser(subparsers)
 
+    add_maintenance_request_parsers(add_parser)
+
     add_admin_parser(subparsers)
 
     add_dirtable_parser(subparsers)
+
+    return parser
+
+
+def main_func():
+    config_parser = _prepare_config_parser()
+    parser = _prepare_parser()
 
     if "_ARGCOMPLETE" in os.environ:
         completers.autocomplete(parser, append_space=False)

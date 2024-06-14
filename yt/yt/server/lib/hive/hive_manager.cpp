@@ -68,6 +68,13 @@ static constexpr auto ReadOnlyCheckPeriod = TDuration::Seconds(1);
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void FormatValue(TStringBuilderBase* builder, const THiveEdge& edge, TStringBuf /*spec*/)
+{
+    builder->AppendFormat("%v->%v", edge.SourceCellId, edge.DestinationCellId);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 static NConcurrency::TFlsSlot<TCellId> HiveMutationSenderId;
 
 bool IsHiveMutation()
@@ -118,7 +125,7 @@ public:
             hydraManager,
             hydraManager->CreateGuardedAutomatonInvoker(automatonInvoker),
             THiveServiceProxy::GetDescriptor(),
-            HiveServerLogger,
+            HiveServerLogger(),
             selfCellId,
             std::move(upstreamSynchronizer),
             std::move(authenticator))
@@ -142,6 +149,7 @@ public:
             AutomatonInvoker_,
             HydraManager_,
             Profiler_))
+        , LamportClock_(LogicalTimeRegistry_->GetClock())
     {
         SyncPostingTimeCounter_ = Profiler_.TimeCounter("/sync_posting_time");
         AsyncPostingTimeCounter_ = Profiler_.TimeCounter("/async_posting_time");
@@ -166,22 +174,21 @@ public:
 
         RegisterLoader(
             "HiveManager.Keys",
-            BIND(&THiveManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&THiveManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "HiveManager.Values",
-            BIND(&THiveManager::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&THiveManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "HiveManager.Keys",
-            BIND(&THiveManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&THiveManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "HiveManager.Values",
-            BIND(&THiveManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&THiveManager::SaveValues, Unretained(this)));
 
         OrchidService_ = CreateOrchidService();
-        LamportClock_ = LogicalTimeRegistry_->GetClock();
 
         if (AvenueDirectory_) {
             AvenueDirectory_->SubscribeEndpointUpdated(
@@ -293,6 +300,23 @@ public:
                 endpointId);
         }
         return mailbox;
+    }
+
+    void FreezeEdges(std::vector<THiveEdge> edgesToFreeze) override
+    {
+        if (!FrozenEdges_.empty()) {
+            YT_LOG_INFO("Unfreezing Hive edges (Edges: %v)",
+                FrozenEdges_);
+            FrozenEdges_.clear();
+        }
+
+        if (edgesToFreeze.empty()) {
+            return;
+        }
+
+        FrozenEdges_ = std::move(edgesToFreeze);
+        YT_LOG_INFO("Freezing Hive edges (Edges: %v)",
+            edgesToFreeze);
     }
 
     void RemoveCellMailbox(TCellMailbox* mailbox) override
@@ -477,10 +501,10 @@ private:
     const IHydraManagerPtr HydraManager_;
     const TProfiler Profiler_;
 
-    IYPathServicePtr OrchidService_;
+    const TLogicalTimeRegistryPtr LogicalTimeRegistry_;
+    TLogicalTimeRegistry::TLamportClock* const LamportClock_;
 
-    TLogicalTimeRegistryPtr LogicalTimeRegistry_;
-    TLogicalTimeRegistry::TLamportClock* LamportClock_;
+    IYPathServicePtr OrchidService_;
 
     TEntityMap<TCellMailbox> CellMailboxMap_;
     TEntityMap<TAvenueMailbox> AvenueMailboxMap_;
@@ -499,6 +523,8 @@ private:
     TTimeCounter SyncPostingTimeCounter_;
     TTimeCounter AsyncPostingTimeCounter_;
     THashMap<TCellId, TTimeCounter> PerCellSyncTimeCounter_;
+
+    std::vector<THiveEdge> FrozenEdges_;
 
     DECLARE_THREAD_AFFINITY_SLOT(AutomatonThread);
 
@@ -634,6 +660,19 @@ private:
                 srcCellId);
         }
 
+        if (mailbox->IsCell()) {
+            for (const auto& edge : FrozenEdges_) {
+                if (edge.DestinationCellId == SelfCellId_ && edge.SourceCellId == srcCellId) {
+                    YT_LOG_DEBUG(
+                        "Edge is frozen; "
+                        "not posting messages along it (SelfCellId: %v, SrcCellId: %v)",
+                        SelfCellId_,
+                        srcCellId);
+                    return;
+                }
+            }
+        }
+
         bool shouldCommit = DoPostMessages(request, response);
         if (!shouldCommit) {
             request->clear_messages();
@@ -715,13 +754,15 @@ private:
         context->SetRequestInfo("LogicalTime: %v",
             requestTime);
 
-        auto [logicalTime, sequenceNumber] = LogicalTimeRegistry_->GetConsistentState(requestTime);
+        auto [logicalTime, state] = LogicalTimeRegistry_->GetConsistentState(requestTime);
         response->set_logical_time(logicalTime.Underlying());
-        response->set_sequence_number(sequenceNumber);
+        response->set_sequence_number(state.SequenceNumber);
+        response->set_segment_id(state.SegmentId);
 
-        context->SetResponseInfo("StateLogicalTime: %v, StateSequenceNumber: %v",
+        context->SetResponseInfo("StateLogicalTime: %v, StateSequenceNumber: %v, StateSegmentId: %v",
             logicalTime,
-            sequenceNumber);
+            state.SequenceNumber,
+            state.SegmentId);
         context->Reply();
     }
 
@@ -1602,8 +1643,7 @@ private:
                     avenueEnvelopes,
                     [] (auto* builder, const auto& envelope) {
                         builder->AppendFormat("%v", GetSiblingAvenueEndpointId(envelope.SrcEndpointId));
-                    }
-                ));
+                    }));
         } else {
             YT_LOG_DEBUG("Posting reliable outcoming messages "
                 "(SrcCellId: %v, DstCellId: %v, MessageIds: %v-%v, Avenues: %v)",
@@ -1623,8 +1663,7 @@ private:
                                 envelope.FirstMessageId,
                                 envelope.FirstMessageId + ssize(envelope.MessagesToPost) - 1);
                         }
-                    }
-                ));
+                    }));
         }
 
         NRpc::TDispatcher::Get()->GetHeavyInvoker()->Invoke(BIND(

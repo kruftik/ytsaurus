@@ -30,11 +30,11 @@ struct ISequoiaTransaction
 
     virtual TFuture<NApi::TSelectRowsResult> SelectRows(
         ESequoiaTable table,
-        const TSelectRowsRequest& request) = 0;
+        const TSelectRowsQuery& query) = 0;
 
     template <class TRecordKey>
     TFuture<std::vector<typename TRecordKey::TRecordDescriptor::TRecord>> SelectRows(
-        const TSelectRowsRequest& request);
+        const TSelectRowsQuery& query);
 
     virtual void DatalessLockRow(
         NObjectClient::TCellTag masterCellTag,
@@ -89,6 +89,9 @@ struct ISequoiaTransaction
 
     virtual const NTableClient::TRowBufferPtr& GetRowBuffer() const = 0;
     virtual const ISequoiaClientPtr& GetClient() const = 0;
+
+    virtual NObjectClient::TTransactionId GetId() const = 0;
+    virtual NTransactionClient::TTimestamp GetStartTimestamp() const = 0;
 };
 
 DEFINE_REFCOUNTED_TYPE(ISequoiaTransaction)
@@ -101,7 +104,8 @@ TFuture<ISequoiaTransactionPtr> StartSequoiaTransaction(
     ISequoiaClientPtr client,
     NApi::NNative::IClientPtr nativeRootClient,
     NApi::NNative::IClientPtr groundRootClient,
-    const NApi::TTransactionStartOptions& options = {});
+    const NApi::TTransactionStartOptions& options,
+    const TSequoiaTransactionSequencingOptions& sequencingOptions);
 
 } // namespace NDetail
 

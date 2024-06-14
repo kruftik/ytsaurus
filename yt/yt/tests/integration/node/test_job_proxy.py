@@ -277,9 +277,12 @@ class TestRpcProxyInJobProxy(YTEnvSetup):
             update_inplace(default_config, config)
         return YtClient(proxy=None, config=default_config)
 
-    def run_job_proxy(self, enable_rpc_proxy, rpc_proxy_thread_pool_size=None,  time_limit=2000):
+    def run_job_proxy(self, enable_rpc_proxy, rpc_proxy_thread_pool_size=None, monitoring=False, time_limit=2000):
         task_patch = {
             "enable_rpc_proxy_in_job_proxy": enable_rpc_proxy,
+            "monitoring": {
+                "enable": monitoring
+            }
         }
         if rpc_proxy_thread_pool_size is not None:
             task_patch["rpc_proxy_worker_thread_pool_size"] = rpc_proxy_thread_pool_size
@@ -317,6 +320,20 @@ class TestRpcProxyInJobProxy(YTEnvSetup):
     def test_incorrect_thread_count(self):
         with pytest.raises(YtError):
             self.run_job_proxy(enable_rpc_proxy=True, rpc_proxy_thread_pool_size=0)
+
+    @authors("alex-shishkin")
+    def test_metrics(self):
+        def check_sensor_values(projections):
+            return any('job_descriptor' in projection['tags'] and
+                       'slot_index' in projection['tags'] and
+                       projection['value'] > 0 for projection in projections)
+
+        socket_file = self.run_job_proxy(enable_rpc_proxy=True, monitoring=True)
+        client = self.create_client_from_uds(socket_file, config={"token": "tester_token"})
+        client.list("/")
+        node = ls("//sys/cluster_nodes")[0]
+        profiler = profiler_factory().at_job_proxy(node, fixed_tags={'yt_service': 'ApiService', 'method': 'ListNode'})
+        wait(lambda: check_sensor_values(profiler.get_all("rpc/server/request_count")))
 
 
 class TestUnavailableJobProxy(JobProxyTestBase):
@@ -367,15 +384,66 @@ class TestJobProxyProfiling(YTEnvSetup):
 
     @authors("prime")
     def test_sensors(self):
-        op = run_test_vanilla("sleep 100", job_count=10, track=False)
+        op = run_test_vanilla("sleep 100", job_count=10, track=False, task_patch={"monitoring": {"enable": True}})
 
         node = ls("//sys/cluster_nodes")[0]
         profiler = profiler_factory().at_job_proxy(node)
 
-        thread_count = profiler.gauge("resource_tracker/thread_count")
-
-        wait(lambda: thread_count.get() and thread_count.get() > 0)
+        wait(lambda: sum(projection['value'] for projection in profiler.get_all("resource_tracker/thread_count")) > 0)
 
         op.abort()
 
-        wait(lambda: thread_count.get() is None)
+        wait(lambda: profiler.get_all("resource_tracker/thread_count") == [])
+
+
+class TestJobProxyLogging(YTEnvSetup):
+    NUM_MASTERS = 1
+    NUM_NODES = 1
+    NUM_SCHEDULERS = 1
+
+    DELTA_NODE_CONFIG = {
+        "exec_node": {
+            "job_controller": {
+                "resource_limits": {
+                    "user_slots": 5,
+                    "cpu": 5,
+                    "memory": 5 * 1024 ** 3,
+                }
+            },
+            "job_proxy": {
+                "job_proxy_logging": {
+                    "mode": "per_job_directory",
+                },
+            },
+        },
+        "job_resource_manager": {
+            "resource_limits": {
+                "user_slots": 5,
+                "cpu": 5,
+                "memory": 5 * 1024 ** 3,
+            }
+        },
+    }
+
+    @authors("tagirhamitov")
+    def test_separate_directory(self):
+        job_count = 3
+
+        run_test_vanilla(with_breakpoint("BREAKPOINT"), job_count=job_count)
+        job_ids = wait_breakpoint(job_count=job_count)
+        assert len(job_ids) == job_count
+
+        for job_id in job_ids:
+            sharding_key = job_id.split("-")[0]
+            if len(sharding_key) < 8:
+                sharding_key = "0"
+            else:
+                sharding_key = sharding_key[0]
+            log_path = os.path.join(
+                self.path_to_run,
+                "logs/job_proxy-0",
+                sharding_key,
+                job_id,
+                "job_proxy.log"
+            )
+            assert os.path.exists(log_path)

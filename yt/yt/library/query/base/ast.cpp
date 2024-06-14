@@ -238,33 +238,6 @@ bool operator == (const TJoin& lhs, const TJoin& rhs)
         std::tie(rhs.IsLeft, rhs.Table, rhs.Fields, rhs.Lhs, rhs.Rhs, rhs.Predicate);
 }
 
-bool operator == (const TQuery& lhs, const TQuery& rhs)
-{
-    return
-        std::tie(
-            lhs.Table,
-            lhs.WithIndex,
-            lhs.Joins,
-            lhs.SelectExprs,
-            lhs.WherePredicate,
-            lhs.GroupExprs,
-            lhs.HavingPredicate,
-            lhs.OrderExpressions,
-            lhs.Offset,
-            lhs.Limit) ==
-        std::tie(
-            rhs.Table,
-            rhs.WithIndex,
-            rhs.Joins,
-            rhs.SelectExprs,
-            rhs.WherePredicate,
-            rhs.GroupExprs,
-            rhs.HavingPredicate,
-            rhs.OrderExpressions,
-            rhs.Offset,
-            rhs.Limit);
-}
-
 void FormatLiteralValue(TStringBuilderBase* builder, const TLiteralValue& value)
 {
     Visit(value,
@@ -335,6 +308,7 @@ std::vector<TStringBuf> GetKeywords()
     XX(escape)
     XX(false)
     XX(true)
+    XX(inf)
 
 #undef XX
 
@@ -422,9 +396,9 @@ void FormatId(TStringBuilderBase* builder, TStringBuf id, bool isFinal = false)
     }
 }
 
-void FormatExpressions(TStringBuilderBase* builder, const TExpressionList& exprs, bool expandAliases);
-void FormatExpression(TStringBuilderBase* builder, const TExpression& expr, bool expandAliases, bool isFinal = false);
-void FormatExpression(TStringBuilderBase* builder, const TExpressionList& expr, bool expandAliases);
+void FormatExpressions(TStringBuilderBase* builder, const TExpressionList& exprs, bool expandAliases = true);
+void FormatExpression(TStringBuilderBase* builder, const TExpression& expr, bool expandAliases = true, bool isFinal = false);
+void FormatExpression(TStringBuilderBase* builder, const TExpressionList& expr, bool expandAliases = true);
 
 void FormatReference(TStringBuilderBase* builder, const TReference& ref, bool isFinal = false)
 {
@@ -640,9 +614,9 @@ void FormatJoin(TStringBuilderBase* builder, const TJoin& join)
     FormatTableDescriptor(builder, join.Table);
     if (join.Fields.empty()) {
         builder->AppendString(" ON (");
-        FormatExpressions(builder, join.Lhs, true);
+        FormatExpressions(builder, join.Lhs);
         builder->AppendString(") = (");
-        FormatExpressions(builder, join.Rhs, true);
+        FormatExpressions(builder, join.Rhs);
         builder->AppendChar(')');
     } else {
         builder->AppendString(" USING ");
@@ -656,7 +630,7 @@ void FormatJoin(TStringBuilderBase* builder, const TJoin& join)
     }
     if (join.Predicate) {
         builder->AppendString(" AND ");
-        FormatExpression(builder, *join.Predicate, true);
+        FormatExpression(builder, *join.Predicate);
     }
 }
 
@@ -679,7 +653,7 @@ void FormatArrayJoin(TStringBuilderBase* builder, const TArrayJoin& join)
         });
     if (join.Predicate) {
         builder->AppendString(" AND ");
-        FormatExpression(builder, *join.Predicate, true);
+        FormatExpression(builder, *join.Predicate);
     }
 }
 
@@ -691,7 +665,7 @@ void FormatQuery(TStringBuilderBase* builder, const TQuery& query)
             query.SelectExprs->begin(),
             query.SelectExprs->end(),
             [] (TStringBuilderBase* builder, const TExpressionPtr& expr) {
-                FormatExpression(builder, *expr, true);
+                FormatExpression(builder, *expr);
             });
     } else {
         builder->AppendString("*");
@@ -717,23 +691,23 @@ void FormatQuery(TStringBuilderBase* builder, const TQuery& query)
 
     if (query.WherePredicate) {
         builder->AppendString(" WHERE ");
-        FormatExpression(builder, *query.WherePredicate, true);
+        FormatExpression(builder, *query.WherePredicate, /*expandAliases*/ true);
     }
 
     if (query.GroupExprs) {
         builder->AppendString(" GROUP BY ");
-        FormatExpressions(builder, query.GroupExprs->first, true);
-        if (query.GroupExprs->second == ETotalsMode::BeforeHaving) {
+        FormatExpressions(builder, *query.GroupExprs);
+        if (query.TotalsMode == ETotalsMode::BeforeHaving) {
             builder->AppendString(" WITH TOTALS");
         }
     }
 
     if (query.HavingPredicate) {
         builder->AppendString(" HAVING ");
-        FormatExpression(builder, *query.HavingPredicate, true);
+        FormatExpression(builder, *query.HavingPredicate);
     }
 
-    if (query.GroupExprs && query.GroupExprs->second == ETotalsMode::AfterHaving) {
+    if (query.GroupExprs && query.TotalsMode == ETotalsMode::AfterHaving) {
         builder->AppendString(" WITH TOTALS");
     }
 
@@ -744,7 +718,7 @@ void FormatQuery(TStringBuilderBase* builder, const TQuery& query)
             query.OrderExpressions.begin(),
             query.OrderExpressions.end(),
             [] (TStringBuilderBase* builder, const std::pair<TExpressionList, bool>& pair) {
-                FormatExpression(builder, pair.first, true);
+                FormatExpression(builder, pair.first);
                 if (pair.second) {
                     builder->AppendString(" DESC");
                 }
@@ -784,14 +758,14 @@ TString FormatReference(const TReference& ref)
 TString FormatExpression(const TExpression& expr)
 {
     TStringBuilder builder;
-    FormatExpression(&builder, expr, true);
+    FormatExpression(&builder, expr);
     return builder.Flush();
 }
 
 TString FormatExpression(const TExpressionList& exprs)
 {
     TStringBuilder builder;
-    FormatExpression(&builder, exprs, true);
+    FormatExpression(&builder, exprs);
     return builder.Flush();
 }
 
@@ -812,14 +786,14 @@ TString FormatQuery(const TQuery& query)
 TString InferColumnName(const TExpression& expr)
 {
     TStringBuilder builder;
-    FormatExpression(&builder, expr, false, true);
+    FormatExpression(&builder, expr, /*expandAliases*/ false, /*isFinal*/ true);
     return builder.Flush();
 }
 
 TString InferColumnName(const TReference& ref)
 {
     TStringBuilder builder;
-    FormatReference(&builder, ref, true);
+    FormatReference(&builder, ref, /*isFinal*/ true);
     return builder.Flush();
 }
 

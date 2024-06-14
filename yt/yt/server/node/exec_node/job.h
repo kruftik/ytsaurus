@@ -5,18 +5,12 @@
 #include "gpu_manager.h"
 #include "job_info.h"
 #include "public.h"
-#include "volume_manager.h"
-
-#include <yt/yt/server/node/exec_node/chunk_cache.h>
 
 #include <yt/yt/server/node/job_agent/job_resource_manager.h>
 
-#include <yt/yt/library/containers/public.h>
-
-#include <yt/yt/library/containers/cri/public.h>
-
 #include <yt/yt/server/lib/exec_node/public.h>
 #include <yt/yt/server/lib/exec_node/job_report.h>
+#include <yt/yt/server/lib/exec_node/proxying_data_node_service_helpers.h>
 
 #include <yt/yt/server/lib/misc/job_report.h>
 
@@ -34,6 +28,9 @@
 #include <yt/yt/ytlib/job_proxy/public.h>
 
 #include <yt/yt/ytlib/scheduler/public.h>
+
+#include <yt/yt/library/containers/public.h>
+#include <yt/yt/library/containers/cri/public.h>
 
 #include <yt/yt/core/logging/log.h>
 
@@ -65,7 +62,7 @@ struct TArtifact
 ////////////////////////////////////////////////////////////////////////////////
 
 class TJob
-    : public NJobAgent::TResourceHolder
+    : public TRefCounted
 {
     struct TNameWithAddress
     {
@@ -114,7 +111,6 @@ public:
     void OnResultReceived(NControllerAgent::NProto::TJobResult jobResult);
 
     TJobId GetId() const noexcept;
-    TGuid GetIdAsGuid() const noexcept override;
     NScheduler::TAllocationId GetAllocationId() const;
 
     TOperationId GetOperationId() const;
@@ -223,6 +219,7 @@ public:
     bool IsGrowingStale(TDuration maxDelay) const;
 
     void OnEvictedFromAllocation();
+    void PrepareResourcesRelease();
 
     bool IsJobProxyCompleted() const noexcept;
 
@@ -257,7 +254,10 @@ private:
     const TOperationId OperationId_;
     IBootstrap* const Bootstrap_;
 
+    const NLogging::TLogger Logger;
+
     TAllocationPtr Allocation_;
+    NJobAgent::TResourceHolderPtr ResourceHolder_;
 
     TControllerAgentDescriptor ControllerAgentDescriptor_;
     TWeakPtr<TControllerAgentConnectorPool::TControllerAgentConnector> ControllerAgentConnector_;
@@ -293,6 +293,8 @@ private:
     NConcurrency::TDelayedExecutorCookie InterruptionTimeoutCookie_;
     TInstant InterruptionDeadline_;
 
+    bool GracefulAbortRequested_ = false;
+
     NYson::TYsonString StatisticsYson_ = NYson::TYsonString(TStringBuf("{}"));
 
     using TGpuStatisticsWithUpdateTime = std::pair<TGpuStatistics, std::optional<TInstant>>;
@@ -308,11 +310,14 @@ private:
     std::optional<TError> Error_;
     std::optional<NControllerAgent::NProto::TJobResultExt> JobResultExtension_;
 
-    std::optional<TInstant> PrepareStartTime_;
+    std::optional<TInstant> ResourcesAcquiredTime_;
+
+    std::optional<TInstant> PreparationStartTime_;
     std::optional<TInstant> CopyFinishTime_;
     std::optional<TInstant> StartTime_;
     std::optional<TInstant> ExecStartTime_;
     std::optional<TInstant> FinishTime_;
+    std::optional<TInstant> ResultReceivedTime_;
 
     std::optional<TInstant> StartPrepareVolumeTime_;
     std::optional<TInstant> FinishPrepareVolumeTime_;
@@ -329,6 +334,10 @@ private:
 
     std::optional<ui32> NetworkProjectId_;
     std::vector<TString> TmpfsPaths_;
+
+    std::atomic<bool> UseJobInputCache_ = false;
+
+    TAtomicObject<THashMap<NChunkClient::TChunkId, TRefCountedChunkSpecPtr>> ProxiableChunks_;
 
     std::vector<TArtifact> Artifacts_;
     std::vector<NDataNode::TArtifactKey> LayerArtifactKeys_;
@@ -379,7 +388,9 @@ private:
     NTracing::TTraceContextPtr TraceContext_;
     NTracing::TTraceContextFinishGuard FinishGuard_;
 
-    void OnResourcesAcquired() noexcept override;
+    const IJobInputCachePtr JobInputCache_;
+
+    void OnResourcesAcquired() noexcept;
 
     // Helpers.
 
@@ -518,6 +529,8 @@ private:
     void ResetJobProbe();
 
     NJobProxy::IJobProbePtr GetJobProbeOrThrow();
+
+    void ReportJobProxyProcessFinish(const TError& error);
 
     static bool ShouldCleanSandboxes();
 

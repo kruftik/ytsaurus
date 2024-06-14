@@ -4,7 +4,7 @@ namespace NYT::NQueryClient::NAst {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TListContainsTrasformer::TListContainsTrasformer(
+TListContainsTransformer::TListContainsTransformer(
     TAstHead* head,
     const TReference& repeatedIndexedColumn,
     const TReference& unfoldedIndexerColumn)
@@ -13,7 +13,7 @@ TListContainsTrasformer::TListContainsTrasformer(
     , UnfoldedIndexerColumn(unfoldedIndexerColumn)
 { }
 
-TExpressionPtr TListContainsTrasformer::OnFunction(TFunctionExpressionPtr function)
+TExpressionPtr TListContainsTransformer::OnFunction(TFunctionExpressionPtr function)
 {
     if (function->FunctionName != "list_contains" ||
         function->Arguments.size() != 2)
@@ -39,6 +39,38 @@ TExpressionPtr TListContainsTrasformer::OnFunction(TFunctionExpressionPtr functi
 
 ////////////////////////////////////////////////////////////////////////////////
 
+TInTransformer::TInTransformer(
+    TAstHead* head,
+    const TReference& repeatedIndexedColumn,
+    const TReference& unfoldedIndexerColumn)
+    : TBase(head)
+    , RepeatedIndexedColumn(repeatedIndexedColumn)
+    , UnfoldedIndexerColumn(unfoldedIndexerColumn)
+{ }
+
+TExpressionPtr TInTransformer::OnIn(TInExpressionPtr inExpr)
+{
+    if (inExpr->Expr.size() != 1) {
+        return TBase::OnIn(inExpr);
+    }
+
+    auto* reference = inExpr->Expr[0]->As<TReferenceExpression>();
+    if (reference->Reference != RepeatedIndexedColumn) {
+        return TBase::OnIn(inExpr);
+    }
+
+    auto* newReference = Head->New<TReferenceExpression>(
+        NullSourceLocation,
+        UnfoldedIndexerColumn);
+
+    return Head->New<TInExpression>(
+        NullSourceLocation,
+        TExpressionList{newReference},
+        inExpr->Values);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 TTableReferenceReplacer::TTableReferenceReplacer(
     TAstHead* head,
     THashSet<TString> replacedColumns,
@@ -60,6 +92,18 @@ TExpressionPtr TTableReferenceReplacer::OnReference(TReferenceExpressionPtr refe
     }
 
     return Head->New<TReferenceExpression>(NullSourceLocation, columnName, NewAlias);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+
+TReferenceHarvester::TReferenceHarvester(TColumnSet* storage)
+    : Storage_(storage)
+{ }
+
+void TReferenceHarvester::OnReference(const TReferenceExpression* referenceExpr)
+{
+    Storage_->insert(referenceExpr->Reference.ColumnName);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -23,6 +23,7 @@ class LocalYtConfig(object):
     local_cypress_dir = attr.ib(None)
     meta_files_suffix = attr.ib(".meta")
     cluster_name = attr.ib(None)
+    wait_for_dynamic_config = attr.ib(True)
 
     """High level master configuration"""
     primary_cell_tag = attr.ib(1)
@@ -42,6 +43,14 @@ class LocalYtConfig(object):
     store_location_count = attr.ib(1)
     use_slot_user_id = attr.ib(True)
     cri_endpoint = attr.ib(None)
+    job_proxy_logging = attr.ib(factory=lambda: {
+        "mode": "simple",
+    })
+    job_proxy_log_manager = attr.ib(factory=lambda: {
+        "sharding_key_length": 1,
+        "logs_storage_period": "7d",
+        "directory_traversal_concurrency": None,
+    })
     default_docker_image = "docker.io/library/python:2.7-slim"
 
     """Feature flags"""
@@ -73,6 +82,7 @@ class LocalYtConfig(object):
     http_proxy_ports = attr.ib(factory=list)
     https_proxy_ports = attr.ib(factory=list)
     rpc_proxy_ports = attr.ib(factory=list)
+    discovery_server_ports = attr.ib(factory=list)
 
     port_locks_path = attr.ib(None)
     local_port_range = attr.ib(None)
@@ -86,6 +96,7 @@ class LocalYtConfig(object):
     clock_count = attr.ib(0)
     discovery_server_count = attr.ib(0)
     queue_agent_count = attr.ib(0)
+    kafka_proxy_count = attr.ib(0)
     timestamp_provider_count = attr.ib(0)
     secondary_cell_count = attr.ib(0)
     scheduler_count = attr.ib(1)
@@ -114,6 +125,7 @@ class LocalYtConfig(object):
     delta_clock_config = attr.ib(None)
     delta_scheduler_config = attr.ib(None)
     delta_queue_agent_config = attr.ib(None)
+    delta_kafka_proxy_config = attr.ib(None)
     delta_controller_agent_config = attr.ib(None)
     delta_node_config = attr.ib(None)
     delta_http_proxy_config = attr.ib(None)

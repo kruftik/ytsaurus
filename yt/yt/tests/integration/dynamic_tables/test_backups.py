@@ -813,6 +813,34 @@ class TestBackups(DynamicTablesBase):
 
         assert get("//tmp/res/@account") == backup_account
 
+    def test_tablet_static_accounting(self):
+        sync_create_cells(1)
+        self._create_sorted_table("//tmp/t")
+
+        sync_mount_table("//tmp/t")
+        insert_rows("//tmp/t", [{"key": 1, "value": "foo"}])
+
+        sync_unmount_table("//tmp/t")
+        set("//tmp/t/@in_memory_mode", "uncompressed")
+
+        uncompressed_size = get("//tmp/t/@tablet_statistics/uncompressed_data_size")
+        set("//sys/tablet_cell_bundles/default/@resource_limits/tablet_static_memory", uncompressed_size)
+
+        set("//sys/@config/tablet_manager/multicell_gossip/bundle_resource_usage_gossip_period", 5000)
+
+        sync_mount_table("//tmp/t", freeze=True)
+        create_table_backup(["//tmp/t", "//tmp/bak"], checkpoint_timestamp_delay=2000)
+        wait(lambda: get("//sys/tablet_cell_bundles/default/@resource_usage/tablet_static_memory") > 0)
+
+        restore_table_backup(["//tmp/bak", "//tmp/t"], force=True)
+
+        sleep(3)
+
+        assert get("//tmp/t/@in_memory_mode") == "uncompressed"
+
+        # Should not raise.
+        sync_mount_table("//tmp/t")
+
 ##################################################################
 
 
@@ -1348,6 +1376,35 @@ class TestBackupsShardedTx(TestBackups):
         assert_items_equal(select_rows("* from [//tmp/res2]"), [{"key": 2, "value": "b"}])
 
 
+@authors("kvk1920")
+class TestBackupsMirroredTx(TestBackupsShardedTx):
+    DRIVER_BACKEND = "rpc"
+    ENABLE_RPC_PROXY = True
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+    NUM_CYPRESS_PROXIES = 1
+    NUM_TEST_PARTITIONS = 6
+
+    DELTA_RPC_PROXY_CONFIG = {
+        "cluster_connection": {
+            "transaction_manager": {
+                "use_cypress_transaction_service": True,
+            }
+        }
+    }
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    DELTA_DYNAMIC_MASTER_CONFIG = {
+        "transaction_manager": {
+            "forbid_transaction_actions_for_cypress_transactions": True,
+        }
+    }
+
+
 @authors("ifsmirnov")
 class TestReplicatedTableBackupsMulticell(TestReplicatedTableBackups):
     NUM_SECONDARY_MASTER_CELLS = 2
@@ -1359,6 +1416,34 @@ class TestReplicatedTableBackupsShardedTx(TestReplicatedTableBackups):
     MASTER_CELL_DESCRIPTORS = {
         "10": {"roles": ["cypress_node_host"]},
         "12": {"roles": ["transaction_coordinator"]},
+    }
+
+
+@authors("kvk1920")
+class TestReplicatedTableBackupsMirroredTx(TestReplicatedTableBackupsShardedTx):
+    DRIVER_BACKEND = "rpc"
+    ENABLE_RPC_PROXY = True
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+    NUM_CYPRESS_PROXIES = 1
+
+    DELTA_RPC_PROXY_CONFIG = {
+        "cluster_connection": {
+            "transaction_manager": {
+                "use_cypress_transaction_service": True,
+            }
+        }
+    }
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    DELTA_DYNAMIC_MASTER_CONFIG = {
+        "transaction_manager": {
+            "forbid_transaction_actions_for_cypress_transactions": True,
+        }
     }
 
 

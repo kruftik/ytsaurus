@@ -15,6 +15,8 @@ namespace NYT::NSecurityServer {
 
 using namespace NChunkServer;
 using namespace NLogging;
+using namespace NObjectClient;
+using namespace NSecurityClient;
 using namespace NYPath;
 using namespace NYson;
 using namespace NYTree;
@@ -112,7 +114,7 @@ TLimit64 GetOptionalLimit64ChildOrThrow(
 
 void LogAcdUpdate(const TString& attribute, const TYPath& path, const TYsonString& value)
 {
-    LogStructuredEventFluently(SecurityServerLogger, ELogLevel::Info)
+    LogStructuredEventFluently(SecurityServerLogger(), ELogLevel::Info)
         .Item("event").Value(EAccessControlEvent::ObjectAcdUpdated)
         .Item("attribute").Value(attribute)
         .Item("path").Value(path)
@@ -132,6 +134,18 @@ void ValidateSuperuserOnAttributeModification(
             "Access denied: only superusers can change %Qv",
             attribute);
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+int GetAccountShardIndex(TAccountId accountId)
+{
+    return GetShardIndex<AccountShardCount>(accountId);
+}
+
+int GetAccountProfilingBucketIndex(TAccountId accountId)
+{
+    return (EntropyFromId(accountId) / AccountShardCount) % AccountProfilingProducerCount;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

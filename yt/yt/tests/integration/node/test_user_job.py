@@ -7,8 +7,8 @@ from yt_commands import (
     events_on_fs, create, create_pool, create_table,
     ls, get, set, remove, link, exists, create_network_project, create_tmpdir,
     create_user, make_ace, start_transaction, lock,
-    write_file, read_table,
-    write_table, map, abort_op, run_sleeping_vanilla,
+    write_file, read_table, remote_copy, get_driver,
+    write_table, map, abort_op, sort,
     vanilla, run_test_vanilla, abort_job, get_job_spec,
     list_jobs, get_job, get_job_stderr, get_operation,
     sync_create_cells, get_singular_chunk_id,
@@ -61,7 +61,7 @@ class TestSandboxTmpfs(YTEnvSetup):
     NUM_SCHEDULERS = 1
     USE_PORTO = True
 
-    DELTA_MASTER_CONFIG = {
+    DELTA_DYNAMIC_MASTER_CONFIG = {
         "cypress_manager": {
             "default_table_replication_factor": 1,
             "default_file_replication_factor": 1,
@@ -780,7 +780,7 @@ class TestTmpfsWithDiskLimit(YTEnvSetup):
         },
     }
 
-    DELTA_MASTER_CONFIG = {
+    DELTA_DYNAMIC_MASTER_CONFIG = {
         "cypress_manager": {
             "default_table_replication_factor": 1,
             "default_file_replication_factor": 1,
@@ -2468,6 +2468,26 @@ class TestHealExecNode(YTEnvSetup):
         },
     }
 
+    DELTA_DYNAMIC_NODE_CONFIG = {
+        "%true": {
+            "exec_node": {
+                "slot_manager": {
+                    "enable_job_environment_resurrection": True
+                },
+                "scheduler_connector": {
+                    "heartbeat_executor": {
+                        "period": 200,  # 200 msec
+                    },
+                },
+                "controller_agent_connector": {
+                    "heartbeat_executor": {
+                        "period": 200,  # 200 msec
+                    }
+                }
+            }
+        }
+    }
+
     @authors("alexkolodezny")
     def test_heal_locations(self):
         update_nodes_dynamic_config({"data_node": {"abort_on_location_disabled": False}})
@@ -2506,8 +2526,22 @@ class TestHealExecNode(YTEnvSetup):
 
         wait(lambda: op.get_state() == "completed")
 
+        for location in locations:
+            if os.path.exists("{}/disabled".format(location["path"])):
+                os.remove("{}/disabled".format(location["path"]))
+
     @authors("ignat")
     def test_reset_alerts(self):
+        update_nodes_dynamic_config({"data_node": {"abort_on_location_disabled": False}})
+
+        node_address = ls("//sys/cluster_nodes")[0]
+
+        locations = get("//sys/cluster_nodes/{0}/orchid/config/exec_node/slot_manager/locations".format(node_address))
+
+        for location in locations:
+            if os.path.exists("{}/disabled".format(location["path"])):
+                os.remove("{}/disabled".format(location["path"]))
+
         job_proxy_path = os.path.join(self.bin_path, "ytserver-job-proxy")
         assert os.path.exists(job_proxy_path)
 
@@ -2536,15 +2570,35 @@ class TestHealExecNode(YTEnvSetup):
 
         wait(lambda: has_job_proxy_build_info_missing_alert())
 
-        with raises_yt_error("is not resettable"):
-            heal_exec_node(node_address, alert_types_to_reset=["job_proxy_unavailable"])
+        # TODO(arkady-e1ppa): Make this part of the raises_yt_error
+        # functionality?
+        try:
+            with raises_yt_error("can only be fixed by a force reset"):
+                heal_exec_node(node_address, alert_types_to_reset=["job_proxy_unavailable"])
+        except YtError as wrong_error:
+            print_debug("Attempt to reset alert \"job_proxy_unavailable\" raised a wrong exception")
+            print_debug("Expected to contain: \"can only be fixed by a force reset\"")
+            print_debug(f"Actual: {wrong_error}")
 
         heal_exec_node(node_address, alert_types_to_reset=["job_proxy_unavailable"], force_reset=True)
         wait(lambda: not get("//sys/cluster_nodes/{}/@alerts".format(node_address)))
 
+        for location in locations:
+            if os.path.exists("{}/disabled".format(location["path"])):
+                os.remove("{}/disabled".format(location["path"]))
+
     @authors("ignat")
-    def test_reset_fatal_alert(self):
+    def test_force_reset_persistent_alert(self):
+        update_nodes_dynamic_config({"data_node": {"abort_on_location_disabled": False}})
+
         node_address = ls("//sys/cluster_nodes")[0]
+
+        locations = get("//sys/cluster_nodes/{0}/orchid/config/exec_node/slot_manager/locations".format(node_address))
+
+        for location in locations:
+            if os.path.exists("{}/disabled".format(location["path"])):
+                os.remove("{}/disabled".format(location["path"]))
+
         assert not get("//sys/cluster_nodes/{}/@alerts".format(node_address))
 
         update_nodes_dynamic_config({
@@ -2571,15 +2625,42 @@ class TestHealExecNode(YTEnvSetup):
 
         abort_job(job_id)
 
+        persistent_alerts = [
+            "porto_failure",
+            "job_environment_failure",
+        ]
+
+        def check_persistent_alerts():
+            alerts = get("//sys/cluster_nodes/{}/orchid/exec_node/slot_manager/alerts".format(node_address))
+
+            for persistent_alert in persistent_alerts:
+                if persistent_alert in alerts:
+                    print_debug(f"Found alert: {persistent_alert}")
+                    return True
+
+            return False
+
         wait(lambda: get("//sys/cluster_nodes/{}/@alerts".format(node_address)))
-        wait(lambda: "generic_persistent_error" in get("//sys/cluster_nodes/{}/orchid/exec_node/slot_manager/alerts".format(node_address)))
+        wait(check_persistent_alerts)
 
         wait(lambda: len(op.get_running_jobs()) == 0)
 
-        heal_exec_node(node_address, alert_types_to_reset=["generic_persistent_error"], force_reset=True)
+        heal_exec_node(node_address, alert_types_to_reset=persistent_alerts, force_reset=True)
         wait(lambda: not get("//sys/cluster_nodes/{}/@alerts".format(node_address)))
 
+        def check_resurrect():
+            node = ls("//sys/cluster_nodes")[0]
+            alerts = get("//sys/cluster_nodes/{}/@alerts".format(node))
+
+            return len(alerts) == 0
+
+        wait(lambda: check_resurrect())
+
         op.track()
+
+        for location in locations:
+            if os.path.exists("{}/disabled".format(location["path"])):
+                os.remove("{}/disabled".format(location["path"]))
 
 
 ##################################################################
@@ -2763,6 +2844,55 @@ class TestUnusedMemoryAlertWithMemoryReserveFactorSet(YTEnvSetup):
 
 
 class TestConsecutiveJobAborts(YTEnvSetup):
+    NUM_MASTERS = 1
+    NUM_NODES = 3
+    NUM_SCHEDULERS = 1
+
+    DELTA_DYNAMIC_NODE_CONFIG = {
+        "%true": {
+            "exec_node": {
+                "slot_manager": {
+                    "max_consecutive_job_aborts": 2,
+                },
+            },
+        },
+    }
+
+    @authors("achulkov2")
+    def test_nonexistent_intermediate_medium(self):
+        v1 = {"key": "aaa"}
+        v2 = {"key": "bb"}
+        v3 = {"key": "bbxx"}
+        v4 = {"key": "zfoo"}
+        v5 = {"key": "zzz"}
+
+        create("table", "//tmp/t_in")
+        for i in range(0, 10):
+            write_table("<append=true>//tmp/t_in", [v3, v5, v1, v2, v4])  # some random order
+
+        create("table", "//tmp/t_out")
+
+        with raises_yt_error("Job failed with fatal error"):
+            sort(
+                in_="//tmp/t_in",
+                out="//tmp/t_out",
+                sort_by="key",
+                spec={
+                    "partition_count": 5,
+                    "partition_job_count": 2,
+                    "data_weight_per_sort_job": 1,
+                    "intermediate_data_medium": "non_existent",
+                },
+            )
+
+        for node, attributes in get("//sys/exec_nodes", attributes=["alerts"]).items():
+            assert not attributes.attributes.get("alerts", [])
+
+
+##################################################################
+
+
+class TestConsecutiveJobAbortsPorto(YTEnvSetup):
     NUM_MASTERS = 1
     NUM_NODES = 1
     NUM_SCHEDULERS = 1
@@ -3253,7 +3383,7 @@ class TestSlotManagerResurrect(YTEnvSetup):
     NUM_SCHEDULERS = 1
     USE_PORTO = True
 
-    DELTA_MASTER_CONFIG = {
+    DELTA_DYNAMIC_MASTER_CONFIG = {
         "cypress_manager": {
             "default_table_replication_factor": 1,
             "default_file_replication_factor": 1,
@@ -3323,6 +3453,7 @@ class TestSlotManagerResurrect(YTEnvSetup):
         def check_enable():
             node = ls("//sys/cluster_nodes")[0]
             alerts = get("//sys/cluster_nodes/{}/@alerts".format(node))
+            print_debug(alerts)
 
             return len(alerts) == 0
 
@@ -3394,151 +3525,6 @@ class TestSlotManagerResurrect(YTEnvSetup):
         op = run_op(0)
 
         wait(lambda: get(op.get_path() + "/@state") == "completed")
-
-        for location in locations:
-            path = "{}/disabled".format(location["path"])
-            if os.path.exists(path):
-                os.remove(path)
-
-    @authors("don-dron")
-    def test_porto_fail_then_proxy_has_been_spawning(self):
-        nodes = ls("//sys/cluster_nodes")
-        locations = get("//sys/cluster_nodes/{0}/orchid/config/exec_node/slot_manager/locations".format(nodes[0]))
-
-        update_nodes_dynamic_config({
-            "exec_node": {
-                "job_controller": {
-                    "job_common": {
-                        "job_proxy_preparation_timeout": 2000
-                    },
-                },
-                "slot_manager": {
-                    "enable_numa_node_scheduling": True,
-                    "job_environment": {
-                        "type": "porto",
-                        "porto_executor": {
-                            "api_timeout": 2500,
-                        }
-                    }
-                },
-            },
-        })
-
-        def check_enable():
-            node = ls("//sys/cluster_nodes")[0]
-            alerts = get("//sys/cluster_nodes/{}/@alerts".format(node))
-
-            return len(alerts) == 0
-
-        wait(lambda: check_enable())
-
-        op = run_sleeping_vanilla(
-            spec={
-                "job_testing_options": {
-                    "delay_before_run_job_proxy": 10000,
-                    "delay_after_run_job_proxy": 50000,
-                    "delay_before_spawning_job_proxy": 10000,
-                }
-            },
-            track=False
-        )
-
-        wait(lambda: exists(op.get_path() + "/controller_orchid/progress/jobs"))
-
-        def check_before_spawn_jp():
-            job_ids = op.list_jobs()
-
-            if len(job_ids) == 0:
-                return False
-
-            for job_id in job_ids:
-                phase = op.get_job_phase(job_id)
-
-                print_debug(f"Job phase: {phase}")
-                if phase != "running_setup_commands" and phase != "running_gpu_check_command":
-                    return False
-
-            return True
-
-        wait(lambda: check_before_spawn_jp())
-
-        update_nodes_dynamic_config({
-            "porto_executor": {
-                "enable_test_porto_not_responding": True,
-                "api_timeout": 5000
-            }
-        }, path="exec_node/slot_manager/job_environment")
-
-        def check_after_spawn_jp():
-            job_ids = op.list_jobs()
-
-            if len(job_ids) == 0:
-                return False
-
-            for job_id in job_ids:
-                phase = op.get_job_phase(job_id)
-
-                print_debug(f"Job phase: {phase}")
-                if phase != "spawning_job_proxy":
-                    return False
-
-            return True
-
-        wait(lambda: check_after_spawn_jp())
-
-        for job in list_jobs(op.id)["jobs"]:
-            abort_job(job["id"])
-
-        for job in list_jobs(op.id)["jobs"]:
-            wait(lambda: get_job(op.id, job["id"])["state"] == "aborted")
-
-        abort_op(op.id)
-        wait(lambda: op.get_state() == "aborted")
-
-        job_ids = op.list_jobs()
-        for job_id in job_ids:
-            wait(lambda: get_job(op.id, job_id)["state"] == "aborted")
-
-        def check_cleanup_jp():
-            try:
-                job_ids = op.list_jobs()
-
-                if len(job_ids) == 0:
-                    return False
-
-                for job_id in job_ids:
-                    phase = op.get_job_phase(job_id)
-
-                    print_debug(f"Job phase: {phase}")
-                    if phase != "cleanup":
-                        return False
-
-                return True
-            except Exception:
-                pass
-                return True
-
-        wait(lambda: check_cleanup_jp())
-
-        time.sleep(5)
-
-        wait(lambda: are_almost_equal(get("//sys/scheduler/orchid/scheduler/cluster/resource_usage/cpu"), 0))
-        wait(lambda: get("//sys/cluster_nodes/{}/orchid/exec_node/job_resource_manager/resource_usage/user_slots".format(nodes[0])) == 0)
-
-        update_nodes_dynamic_config({
-            "exec_node": {
-                "slot_manager": {
-                    "enable_numa_node_scheduling": False,
-                    "job_environment": {
-                        "type": "porto",
-                        "porto_executor": {
-                            "enable_test_porto_not_responding": False,
-                            "api_timeout": 5000
-                        },
-                    },
-                },
-            },
-        })
 
         for location in locations:
             path = "{}/disabled".format(location["path"])
@@ -3709,3 +3695,262 @@ class TestCriJobStatistics(YTEnvSetup):
         )
 
         assert op.get_statistics()["job"]["memory"]["rss"][0]["summary"]["max"] > 200 * 1000 * 1000
+
+
+##################################################################
+
+
+class TestPortoFuseDevice(YTEnvSetup):
+    NUM_MASTERS = 1
+    NUM_NODES = 1
+    NUM_SCHEDULERS = 1
+
+    USE_PORTO = True
+
+    @authors("ignat")
+    def test_fuse_device(self):
+        op = run_test_vanilla(
+            command=with_breakpoint("stat /dev/fuse >&2; BREAKPOINT"),
+            task_patch={
+                "enable_fuse": True,
+            },
+        )
+
+        job_id = wait_breakpoint()[0]
+
+        assert b"File: '/dev/fuse'" in get_job_stderr(op.id, job_id)
+
+
+##################################################################
+
+
+class TestJobInputCache(YTEnvSetup):
+    NUM_TEST_PARTITIONS = 5
+    NUM_MASTERS = 1
+    NUM_SCHEDULERS = 1
+    NUM_NODES = 15
+
+    JOB_COUNT = 5
+
+    SORTED_SCHEMA = [
+        {"name": "key", "type": "int64", "sort_order": "ascending"},
+        {"name": "value", "type": "string"},
+    ]
+
+    UNSORTED_SCHEMA = [
+        {"name": "key", "type": "int64"},
+        {"name": "value", "type": "string"},
+    ]
+
+    DELTA_NODE_CONFIG = {
+        "resource_limits": {
+            "memory_limits": {
+                "lookup_rows_cache": {
+                    "type": "static",
+                    "value": 0,
+                },
+                "block_cache": {
+                    "type": "static",
+                    "value": 0,
+                }
+            },
+            "tablet_static": {
+                "type": "static",
+                "value": 0,
+            }
+        },
+        "data_node": {
+            "p2p": {
+                "enabled": False,
+            },
+        },
+        "exec_node_is_not_data_node": True
+    }
+
+    DELTA_NODE_FLAVORS = [["data"] for _ in range(NUM_NODES)]
+    DELTA_NODE_FLAVORS[0] = ["exec"]
+    DELTA_NODE_FLAVORS[1] = ["data", "exec"]
+
+    NUM_REMOTE_CLUSTERS = 1
+
+    NUM_MASTERS_REMOTE_0 = 1
+    NUM_SCHEDULERS_REMOTE_0 = 0
+
+    REMOTE_CLUSTER_NAME = "remote_0"
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "controller_agent": {
+            "snapshot_period": 500,
+            "remote_copy_operation_options": {
+                "spec_template": {
+                    "use_remote_master_caches": True,
+                },
+            },
+        },
+    }
+
+    def _set_config(self):
+        update_nodes_dynamic_config({
+            "data_node": {
+                "p2p": {
+                    "enabled": False,
+                },
+            },
+            "exec_node": {
+                "job_input_cache": {
+                    "enabled": True,
+                    "block_cache": {
+                        "compressed_data": {
+                            "capacity": 256 * 1024 * 1024
+                        }
+                    },
+                    "meta_cache": {
+                        "capacity": 256 * 1024 * 1024
+                    }
+                }
+            }
+        })
+
+    def _seed_counter(self, node, path):
+        return profiler_factory().at_node(node).counter(path)
+
+    def _seed_gauge(self, node, path):
+        return profiler_factory().at_node(node).gauge(path)
+
+    def _fill_table(self,
+                    table,
+                    replication_factor,
+                    erasure_codec,
+                    optimize_for,
+                    sort,
+                    compression_codec):
+        schema = self.SORTED_SCHEMA if sort else self.UNSORTED_SCHEMA
+
+        create("table", table, attributes={
+            "schema": schema,
+            "replication_factor": 1,
+            "erasure_codec": erasure_codec,
+            "optimize_for": optimize_for,
+            "compression_codec": compression_codec,
+        })
+
+        for key in range(self.JOB_COUNT):
+            rows = [{"key": key, "value": "value"}]
+            write_table("<append=%true>{}".format(table), rows)
+
+    def _run_job(self, node, sort, retry, cache_disabled):
+        hit_compressed_block_cache = self._seed_counter(node, "exec_node/job_input_cache/block_cache/compressed_data/hit_count")
+        missed_compressed_block_cache = self._seed_counter(node, "exec_node/job_input_cache/block_cache/compressed_data/missed_count")
+
+        hit_meta_cache = self._seed_counter(node, "exec_node/job_input_cache/meta_cache/hit_count")
+        missed_meta_cache = self._seed_counter(node, "exec_node/job_input_cache/meta_cache/missed_count")
+
+        block_compressed_cache_size = self._seed_gauge(node, "exec_node/job_input_cache/block_cache/compressed_data/size")
+        meta_cache_size = self._seed_gauge(node, "exec_node/job_input_cache/meta_cache/size")
+
+        map(
+            in_="<read_via_exec_node=%true>//tmp/input{}".format("[0:1,3:4]" if sort else ""),
+            out="//tmp/output",
+            command="cat",
+            spec={
+                "mapper": {
+                    "format": "json",
+                },
+                "data_weight_per_job": 1,
+                "max_failed_job_count": 1,
+                "scheduling_tag_filter": node
+            })
+
+        if cache_disabled:
+            wait(lambda: missed_compressed_block_cache.get_delta() == 0)
+            wait(lambda: missed_meta_cache.get_delta() == 0)
+
+            wait(lambda: block_compressed_cache_size.get() == 0)
+            wait(lambda: meta_cache_size.get() == 0)
+
+            wait(lambda: hit_compressed_block_cache.get_delta() == 0)
+            wait(lambda: hit_meta_cache.get_delta() == 0)
+            return
+
+        wait(lambda: get("//sys/cluster_nodes/{}/@statistics/memory/job_input_block_cache/limit".format(node)) == 256 * 1024 * 1024)
+        wait(lambda: get("//sys/cluster_nodes/{}/@statistics/memory/job_input_chunk_meta_cache/limit".format(node)) == 256 * 1024 * 1024)
+
+        if not retry:
+            wait(lambda: missed_compressed_block_cache.get_delta() > 0)
+            wait(lambda: missed_meta_cache.get_delta() > 0)
+
+            wait(lambda: block_compressed_cache_size.get() > 0)
+            wait(lambda: meta_cache_size.get() > 0)
+
+            wait(lambda: get("//sys/cluster_nodes/{}/@statistics/memory/job_input_block_cache/used".format(node)) > 0)
+            wait(lambda: get("//sys/cluster_nodes/{}/@statistics/memory/job_input_chunk_meta_cache/used".format(node)) > 0)
+        else:
+            wait(lambda: hit_compressed_block_cache.get_delta() > 0)
+            wait(lambda: hit_meta_cache.get_delta() > 0)
+
+            wait(lambda: block_compressed_cache_size.get() > 0)
+            wait(lambda: meta_cache_size.get() > 0)
+
+    @pytest.mark.timeout(200)
+    @authors("don-dron")
+    @pytest.mark.parametrize("optimize_for", ["scan", "lookup"])
+    @pytest.mark.parametrize("sort", [True, False])
+    @pytest.mark.parametrize("erasure_codec", ["none", "isa_reed_solomon_6_3"])
+    def test_job_input_cache(self, optimize_for, sort, erasure_codec):
+        self._set_config()
+
+        self._fill_table("//tmp/input", 1, erasure_codec, optimize_for, sort, "none")
+        self._fill_table("//tmp/output", 1, erasure_codec, optimize_for, sort, "none")
+
+        nodes_to_run = [
+            self.find_node_with_flavors(["exec"]),
+            self.find_node_with_flavors(["data", "exec"]),
+        ]
+
+        for node in nodes_to_run:
+            self._run_job(node, sort=sort, retry=False, cache_disabled=False)
+            self._run_job(node, sort=sort, retry=True, cache_disabled=False)
+
+    @authors("don-dron")
+    def test_with_disabled_cache(self):
+        self._fill_table("//tmp/input", 1, "none", "scan", True, "none")
+        self._fill_table("//tmp/output", 1, "none", "scan", True, "none")
+
+        nodes_to_run = [
+            self.find_node_with_flavors(["exec"]),
+            self.find_node_with_flavors(["data", "exec"]),
+        ]
+
+        for node in nodes_to_run:
+            self._run_job(node, sort=True, retry=False, cache_disabled=True)
+            self._run_job(node, sort=True, retry=True, cache_disabled=True)
+
+    @authors("don-dron")
+    def test_disable_for_remote_copy(self):
+        self._set_config()
+
+        remote_driver = get_driver(cluster=self.REMOTE_CLUSTER_NAME)
+
+        create("table", "//tmp/t1", driver=remote_driver)
+        write_table("//tmp/t1", {"a": "b"}, driver=remote_driver)
+
+        create("table", "//tmp/t2")
+
+        node = self.find_node_with_flavors(["exec"])
+
+        block_compressed_cache_size = self._seed_gauge(node, "exec_node/job_input_cache/block_cache/compressed_data/size")
+        meta_cache_size = self._seed_gauge(node, "exec_node/job_input_cache/meta_cache/size")
+
+        remote_copy(
+            in_="//tmp/t1",
+            out="//tmp/t2",
+            spec={
+                "cluster_name": self.REMOTE_CLUSTER_NAME,
+                "read_via_exec_node": True
+            },
+        )
+
+        assert read_table("//tmp/t2") == [{"a": "b"}]
+
+        wait(lambda: block_compressed_cache_size.get() == 0)
+        wait(lambda: meta_cache_size.get() == 0)

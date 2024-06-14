@@ -2,9 +2,12 @@
 #include "backup_session.h"
 #include "config.h"
 #include "connection.h"
+#include "helpers.h"
 #include "tablet_helpers.h"
 #include "transaction.h"
 #include "type_handler.h"
+
+#include <yt/yt/client/table_client/record_helpers.h>
 
 #include <yt/yt/ytlib/cell_master_client/cell_directory.h>
 
@@ -43,6 +46,8 @@
 #include <yt/yt/ytlib/query_client/functions_cache.h>
 #include <yt/yt/ytlib/query_client/query_service_proxy.h>
 #include <yt/yt/ytlib/queue_client/registration_manager.h>
+
+#include <yt/yt/ytlib/queue_client/records/queue_producer_session.record.h>
 
 #include <yt/yt/ytlib/security_client/permission_cache.h>
 
@@ -360,7 +365,13 @@ void TransformWithIndexStatement(NAst::TAstHead* head, TStickyTableMountInfoCach
         NAst::TReference repeatedIndexedColumn(unfoldedColumn->Name(), query.Table.Alias);
         NAst::TReference unfoldedIndexerColumn(unfoldedColumn->Name(), index.Alias);
 
-        query.WherePredicate = NAst::TListContainsTrasformer(
+        query.WherePredicate = NAst::TListContainsTransformer(
+            head,
+            repeatedIndexedColumn,
+            unfoldedIndexerColumn)
+            .Visit(query.WherePredicate);
+
+        query.WherePredicate = NAst::TInTransformer(
             head,
             repeatedIndexedColumn,
             unfoldedIndexerColumn)
@@ -1057,7 +1068,7 @@ TLookupRowsResult<IRowset> TClient::DoLookupRowsOnce(
             *schema,
             schema->GetKeyColumnCount(),
             idMapping,
-            nullptr);
+            /*validateDuplicateAndRequiredValueColumns*/ false);
 
         if (evaluator) {
             evaluator->EvaluateKeys(capturedKey, inputRowBuffer);
@@ -1592,7 +1603,6 @@ TSelectRowsResult TClient::DoSelectRowsOnce(
     auto queryExecutor = CreateQueryExecutor(
         memoryChunkProvider,
         Connection_,
-        Connection_->GetInvoker(),
         Connection_->GetColumnEvaluatorCache(),
         Connection_->GetQueryEvaluator(),
         ChannelFactory_,
@@ -1707,13 +1717,12 @@ TSelectRowsResult TClient::DoSelectRowsOnce(
     TFuture<IUnversionedRowsetPtr> asyncRowset;
     std::tie(writer, asyncRowset) = CreateSchemafulRowsetWriter(query->GetTableSchema());
 
-    auto statistics = WaitFor(queryExecutor->Execute(
+    auto statistics = queryExecutor->Execute(
         query,
         externalCGInfo,
         dataSource,
         writer,
-        queryOptions))
-        .ValueOrThrow();
+        queryOptions);
 
     auto rowset = WaitFor(asyncRowset)
         .ValueOrThrow();
@@ -2108,14 +2117,23 @@ void TClient::DoReshardTableWithTabletCount(
     }
 
     if (options.EnableSlicing.value_or(false)) {
-        auto pivots = PickPivotKeysWithSlicing(
-            MakeStrong(this),
-            path,
-            tabletCount,
-            options,
-            Logger);
-        DoReshardTableWithPivotKeys(path, pivots, options);
-        return;
+        try {
+            auto pivots = PickPivotKeysWithSlicing(
+                MakeStrong(this),
+                path,
+                tabletCount,
+                options,
+                Logger);
+            DoReshardTableWithPivotKeys(path, pivots, options);
+            return;
+        } catch (const TErrorException& ex) {
+            if (ex.Error().FindMatching(NChunkClient::EErrorCode::TooManyChunksToFetch)) {
+                YT_LOG_DEBUG(ex,
+                    "Too many chunks have been requested to fetch, fallback to reshard without slicing");
+            } else {
+                throw;
+            }
+        }
     }
 
     auto req = MakeReshardRequest(options);
@@ -2201,7 +2219,7 @@ void TClient::DoTrimTable(
     const TYPath& path,
     int tabletIndex,
     i64 trimmedRowCount,
-    const TTrimTableOptions& /*options*/)
+    const TTrimTableOptions& options)
 {
     const auto& tableMountCache = Connection_->GetTableMountCache();
     auto tableInfo = WaitFor(tableMountCache->GetTableInfo(path))
@@ -2224,7 +2242,7 @@ void TClient::DoTrimTable(
     auto channel = GetCellChannelOrThrow(tabletInfo->CellId);
 
     TTabletServiceProxy proxy(channel);
-    proxy.SetDefaultTimeout(Connection_->GetConfig()->DefaultTrimTableTimeout);
+    proxy.SetDefaultTimeout(options.Timeout.value_or(Connection_->GetConfig()->DefaultTrimTableTimeout));
 
     auto req = proxy.Trim();
     ToProto(req->mutable_tablet_id(), tabletInfo->TabletId);
@@ -2402,14 +2420,7 @@ IQueueRowsetPtr TClient::DoPullQueueImpl(
 
     // The non-native API via SelectRows checks permissions on its own.
     if (checkPermissions && options.UseNativeTabletNodeApi) {
-        NSecurityClient::TPermissionKey permissionKey{
-            .Object = FromObjectId(tableInfo->TableId),
-            .User = Options_.GetAuthenticatedUser(),
-            .Permission = EPermission::Read,
-        };
-        const auto& permissionCache = Connection_->GetPermissionCache();
-        WaitFor(permissionCache->Get(permissionKey))
-            .ThrowOnError();
+        CheckReadPermission(queuePath.GetPath(), tableInfo, Options_, Connection_);
     }
 
     // The code below is used to facilitate reading from [chaos] replicated tables and
@@ -2623,14 +2634,7 @@ IUnversionedRowsetPtr TClient::DoPullQueueViaTabletNodeApi(
     tableInfo->ValidateOrdered();
 
     if (checkPermissions) {
-        NSecurityClient::TPermissionKey permissionKey{
-            .Object = FromObjectId(tableInfo->TableId),
-            .User = Options_.GetAuthenticatedUser(),
-            .Permission = EPermission::Read,
-        };
-        const auto& permissionCache = Connection_->GetPermissionCache();
-        WaitFor(permissionCache->Get(permissionKey))
-            .ThrowOnError();
+        CheckReadPermission(queuePath.GetPath(), tableInfo, Options_, Connection_);
     }
 
     auto tabletInfo = tableInfo->GetTabletByIndexOrThrow(partitionIndex);
@@ -2667,37 +2671,21 @@ IUnversionedRowsetPtr TClient::DoPullQueueViaTabletNodeApi(
         MakeSharedRange(rows, reader->GetRowBuffer()));
 }
 
-IQueueRowsetPtr TClient::DoPullConsumer(
+IQueueRowsetPtr TClient::DoPullQueueConsumer(
     const NYPath::TRichYPath& consumerPath,
     const NYPath::TRichYPath& queuePath,
     std::optional<i64> offset,
     int partitionIndex,
     const TQueueRowBatchReadOptions& rowBatchReadOptions,
-    const TPullConsumerOptions& options)
+    const TPullQueueConsumerOptions& options)
 {
     const auto& tableMountCache = Connection_->GetTableMountCache();
-    auto consumerTableInfo = WaitFor(tableMountCache->GetTableInfo(consumerPath.GetPath()))
+    auto tableInfo = WaitFor(tableMountCache->GetTableInfo(consumerPath.GetPath()))
         .ValueOrThrow();
 
-    NSecurityClient::TPermissionKey permissionKey{
-        .Object = FromObjectId(consumerTableInfo->TableId),
-        .User = Options_.GetAuthenticatedUser(),
-        .Permission = EPermission::Read,
-    };
-    const auto& permissionCache = Connection_->GetPermissionCache();
-    WaitFor(permissionCache->Get(permissionKey))
-        .ThrowOnError();
+    CheckReadPermission(consumerPath.GetPath(), tableInfo, Options_, Connection_);
 
-    auto registrationCheckResult = Connection_->GetQueueConsumerRegistrationManager()->GetRegistration(queuePath, consumerPath);
-    if (!registrationCheckResult.Registration) {
-        THROW_ERROR_EXCEPTION(
-            NYT::NSecurityClient::EErrorCode::AuthorizationError,
-            "Consumer %v is not registered for queue %v",
-            registrationCheckResult.ResolvedConsumer,
-            registrationCheckResult.ResolvedQueue)
-            << TErrorAttribute("raw_queue", queuePath)
-            << TErrorAttribute("raw_consumer", consumerPath);
-    }
+    auto registrationCheckResult = Connection_->GetQueueConsumerRegistrationManager()->GetRegistrationOrThrow(queuePath, consumerPath);
 
     IClientPtr queueClusterClient = MakeStrong(this);
     if (auto queueCluster = queuePath.GetCluster()) {
@@ -2706,8 +2694,7 @@ IQueueRowsetPtr TClient::DoPullConsumer(
             THROW_ERROR_EXCEPTION(
                 "Queue cluster %Qv was not found for path %v",
                 *queueCluster,
-                queuePath
-            );
+                queuePath);
         }
 
         auto queueClientOptions = TClientOptions::FromUser(Options_.GetAuthenticatedUser());
@@ -2720,7 +2707,7 @@ IQueueRowsetPtr TClient::DoPullConsumer(
     if (offset) {
         resultOffset = *offset;
     } else {
-        // PullConsumer is supported only for consumers from current cluster.
+        // PullQueueConsumer is supported only for consumers from current cluster.
         IClientPtr consumerClusterClient = MakeStrong(this);
 
         auto subConsumerClient = CreateSubConsumerClient(consumerClusterClient, queueClusterClient, consumerPath.GetPath(), queuePath);
@@ -2731,14 +2718,12 @@ IQueueRowsetPtr TClient::DoPullConsumer(
                 "Consumer partition was not found during offset calculation (PartitionIndex: %v, ConsumerPath: %v, QueuePath: %v)",
                 partitionIndex,
                 consumerPath,
-                queuePath
+                queuePath);
 
-            );
             THROW_ERROR_EXCEPTION(
                 "Failed to calculate current offset for consumer %v for queue %v",
                 consumerPath,
-                queuePath
-            );
+                queuePath);
         }
         resultOffset = partitions[0].NextRowIndex;
     }
@@ -2850,6 +2835,122 @@ std::vector<TListQueueConsumerRegistrationsResult> TClient::DoListQueueConsumerR
     }
 
     return result;
+}
+
+TCreateQueueProducerSessionResult TClient::DoCreateQueueProducerSession(
+    const NYPath::TRichYPath& producerPath,
+    const NYPath::TRichYPath& queuePath,
+    const TString& sessionId,
+    const std::optional<TYsonString>& userMeta,
+    const TCreateQueueProducerSessionOptions& /*options*/)
+{
+    // NB(apachee): Current implementation does not handle RT/CRT correctly and ignores
+    // cluster in paths completely.
+
+    // XXX(apachee): Maybe everything should be moved in queue_client.
+
+    IClientPtr client = MakeStrong(this);
+
+    auto queueCluster = Connection_->GetClusterName();
+    if (!queueCluster) {
+        THROW_ERROR_EXCEPTION("Cannot serve request, "
+            "cluster connection was not properly configured with a cluster name");
+    }
+
+    auto transaction = WaitFor(client->StartTransaction(NTransactionClient::ETransactionType::Tablet))
+        .ValueOrThrow();
+
+    auto nameTable = NQueueClient::NRecords::TQueueProducerSessionDescriptor::Get()->GetNameTable();
+
+    NQueueClient::NRecords::TQueueProducerSessionKey sessionKey = {
+        .QueueCluster = *queueCluster,
+        .QueuePath = queuePath.GetPath(),
+        .SessionId = sessionId,
+    };
+
+    auto keys = FromRecordKeys(MakeRange(std::array{sessionKey}));
+
+    auto sessionRowset = WaitFor(transaction->LookupRows(
+        producerPath.GetPath(),
+        nameTable,
+        keys))
+        .ValueOrThrow()
+        .Rowset;
+
+    i64 lastSequenceNumber = -1;
+    i64 epoch = 0;
+    auto responseUserMeta = userMeta;
+
+    auto records = ToRecords<NQueueClient::NRecords::TQueueProducerSession>(sessionRowset);
+    // If rows is empty, then create new session.
+    if (!records.empty()) {
+        const auto& record = records[0];
+
+        lastSequenceNumber = record.SequenceNumber;
+        epoch = record.Epoch + 1;
+        if (!responseUserMeta) {
+            responseUserMeta = record.UserMeta;
+        }
+    }
+
+    NQueueClient::NRecords::TQueueProducerSessionPartial resultRecord = {
+        .Key = sessionKey,
+        .SequenceNumber = lastSequenceNumber,
+        .Epoch = epoch,
+    };
+    if (userMeta) {
+        resultRecord.UserMeta = userMeta;
+    }
+
+    auto resultRows = FromRecords(MakeRange(std::array{resultRecord}));
+
+    transaction->WriteRows(producerPath.GetPath(), nameTable, resultRows);
+    WaitFor(transaction->Commit())
+        .ValueOrThrow();
+
+    return TCreateQueueProducerSessionResult{
+        .SequenceNumber = lastSequenceNumber,
+        .Epoch = epoch,
+        .UserMeta = responseUserMeta,
+    };
+}
+
+void TClient::DoRemoveQueueProducerSession(
+    const NYPath::TRichYPath& producerPath,
+    const NYPath::TRichYPath& queuePath,
+    const TString& sessionId,
+    const TRemoveQueueProducerSessionOptions& /*options*/)
+{
+    // NB(apachee): Current implementation does not handle RT/CRT correctly and ignores
+    // cluster in paths completely.
+
+    // XXX(apachee): Maybe everything should be moved in queue_client.
+
+    IClientPtr client = MakeStrong(this);
+
+    auto queueCluster = Connection_->GetClusterName();
+    if (!queueCluster) {
+        THROW_ERROR_EXCEPTION("Cannot serve request, "
+            "cluster connection was not properly configured with a cluster name");
+    }
+
+    auto transaction = WaitFor(client->StartTransaction(NTransactionClient::ETransactionType::Tablet))
+        .ValueOrThrow();
+
+    auto nameTable = NQueueClient::NRecords::TQueueProducerSessionDescriptor::Get()->GetNameTable();
+
+    NQueueClient::NRecords::TQueueProducerSessionKey sessionKey = {
+        .QueueCluster = *queueCluster,
+        .QueuePath = queuePath.GetPath(),
+        .SessionId = sessionId,
+    };
+
+    auto keys = FromRecordKeys(MakeRange(std::array{sessionKey}));
+
+    transaction->DeleteRows(producerPath.GetPath(), nameTable, keys);
+
+    WaitFor(transaction->Commit())
+        .ValueOrThrow();
 }
 
 TSyncAlienCellsResult TClient::DoSyncAlienCells(

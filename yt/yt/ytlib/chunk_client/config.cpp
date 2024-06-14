@@ -13,6 +13,9 @@ void TRemoteReaderOptions::Register(TRegistrar registrar)
 
     registrar.Parameter("enable_p2p", &TThis::EnableP2P)
         .Default(false);
+
+    registrar.Parameter("use_proxying_data_node_service", &TThis::UseProxyingDataNodeService)
+        .Default(false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -166,7 +169,7 @@ void TChunkReplicaCacheConfig::Register(TRegistrar registrar)
     registrar.Parameter("expiration_time", &TThis::ExpirationTime)
         .Default(TDuration::Minutes(15));
     registrar.Parameter("expiration_sweep_period", &TThis::ExpirationSweepPeriod)
-        .Default(TDuration::Minutes(1));
+        .Default(TDuration::Minutes(15));
     registrar.Parameter("max_chunks_per_locate", &TThis::MaxChunksPerLocate)
         .Default(1'000);
 }

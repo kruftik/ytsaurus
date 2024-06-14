@@ -73,7 +73,7 @@ public:
         , TrafficMeter_(std::move(trafficMeter))
         , TargetReplicas_(std::move(targetReplicas))
         , SessionId_(sessionId)
-        , Logger(ChunkClientLogger.WithTag("TransactionId: %v", TransactionId_))
+        , Logger(ChunkClientLogger().WithTag("TransactionId: %v", TransactionId_))
     {
         Config_->UploadReplicationFactor = std::min(
             Config_->UploadReplicationFactor,
@@ -223,7 +223,7 @@ private:
 
     void OpenSession()
     {
-        auto finally = Finally([&] () {
+        auto finally = Finally([&] {
             Initialized_ = true;
         });
 
@@ -326,7 +326,7 @@ private:
             *req->mutable_chunk_meta() = *ChunkMeta_;
 
             auto memoryUsageGuard = TMemoryUsageTrackerGuard::Acquire(
-                Options_->MemoryTracker,
+                Options_->MemoryUsageTracker,
                 req->mutable_chunk_meta()->ByteSize());
 
             FilterProtoExtensions(req->mutable_chunk_meta()->mutable_extensions(), GetMasterChunkMetaExtensionTagsFilter());
@@ -362,22 +362,21 @@ private:
 
             DataStatistics_ = rspOrError.Value()->statistics();
         } else {
-            auto batchReq = proxy.ExecuteBatch();
-            GenerateMutationId(batchReq);
-            batchReq->set_suppress_upstream_sync(true);
-            auto* req = batchReq->add_confirm_chunk_subrequests();
+            auto req = proxy.ConfirmChunk();
+            GenerateMutationId(req);
             fillRequest(req);
+            auto* multicellSyncExt = req->Header().MutableExtension(NObjectClient::NProto::TMulticellSyncExt::multicell_sync_ext);
+            multicellSyncExt->set_suppress_upstream_sync(true);
 
-            auto batchRspOrError = WaitFor(batchReq->Invoke());
+            auto rspOrError = WaitFor(req->Invoke());
             THROW_ERROR_EXCEPTION_IF_FAILED(
-                GetCumulativeError(batchRspOrError),
+                rspOrError,
                 NChunkClient::EErrorCode::MasterCommunicationFailed,
                 "Failed to confirm chunk %v",
                 SessionId_.ChunkId);
 
-            const auto& batchRsp = batchRspOrError.Value();
-            const auto& rsp = batchRsp->confirm_chunk_subresponses(0);
-            DataStatistics_ = rsp.statistics();
+            const auto& rsp = rspOrError.Value();
+            DataStatistics_ = rsp->statistics();
         }
 
         Closed_ = true;

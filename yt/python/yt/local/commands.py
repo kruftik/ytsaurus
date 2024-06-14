@@ -116,7 +116,9 @@ def start(master_count=1,
           rpc_proxy_count=0,
           master_cache_count=0,
           tablet_balancer_count=0,
+          discovery_server_count=0,
           queue_agent_count=0,
+          kafka_proxy_count=0,
           cypress_proxy_count=0,
           rpc_proxy_config=None,
           master_config=None,
@@ -127,11 +129,13 @@ def start(master_count=1,
           global_cluster_connection_config=None,
           controller_agent_config=None,
           queue_agent_config=None,
+          kafka_proxy_config=None,
           master_cache_config=None,
           http_proxy_ports=None,
           https_proxy_ports=None,
           http_proxy_count=1,
           rpc_proxy_ports=None,
+          discovery_server_ports=None,
           id=None,
           local_cypress_dir=None,
           enable_debug_logging=False,
@@ -141,6 +145,7 @@ def start(master_count=1,
           mock_tvm_id=None,
           tmpfs_path=None,
           port_range_start=None,
+          node_port_set_size=None,
           listen_port_pool=None,
           fqdn=None,
           path=None,
@@ -165,7 +170,8 @@ def start(master_count=1,
           enable_master_cache=False,
           clock_count=0,
           chaos_node_count=0,
-          replicated_table_tracker_count=0):
+          replicated_table_tracker_count=0,
+          job_proxy_logging_mode=None):
     require(master_count >= 1, lambda: YtError("Cannot start local YT instance without masters"))
 
     path = get_root_path(path)
@@ -194,6 +200,16 @@ def start(master_count=1,
     if scheduler_count == 0:
         controller_agent_count = 0
 
+    job_proxy_logging = {
+        "mode": job_proxy_logging_mode or "simple",
+    }
+
+    job_proxy_log_manager = {
+        "sharding_key_length": 3,
+        "logs_storage_period": "7d",
+        "directory_traversal_concurrency": None,
+    }
+
     yt_config = LocalYtConfig(
         master_count=master_count,
         clock_count=clock_count,
@@ -210,8 +226,11 @@ def start(master_count=1,
         replicated_table_tracker_count=replicated_table_tracker_count,
         # TODO: Should we default to a fixed name, like "primary" in integration tests?
         cluster_name=sandbox_id,
+        discovery_server_count=discovery_server_count,
         queue_agent_count=queue_agent_count,
+        kafka_proxy_count=kafka_proxy_count,
         delta_queue_agent_config=_load_config(queue_agent_config),
+        delta_kafka_proxy_config=_load_config(kafka_proxy_config),
         delta_master_config=_load_config(master_config),
         delta_scheduler_config=_load_config(scheduler_config),
         delta_controller_agent_config=_load_config(controller_agent_config),
@@ -225,6 +244,7 @@ def start(master_count=1,
         http_proxy_ports=http_proxy_ports,
         https_proxy_ports=https_proxy_ports,
         rpc_proxy_ports=rpc_proxy_ports,
+        discovery_server_ports=discovery_server_ports,
         enable_master_cache=enable_master_cache,
         enable_debug_logging=enable_debug_logging,
         enable_structured_logging=enable_structured_logging,
@@ -236,6 +256,7 @@ def start(master_count=1,
         jobs_environment_type=jobs_environment_type,
         use_slot_user_id=False,
         jobs_resource_limits=jobs_resource_limits,
+        node_port_set_size=node_port_set_size,
         listen_port_pool=listen_port_pool,
         fqdn=fqdn or get_fqdn(),
         optimize_config=True,
@@ -247,7 +268,9 @@ def start(master_count=1,
         local_cypress_dir=local_cypress_dir,
         meta_files_suffix=meta_files_suffix,
         wait_tablet_cell_initialization=wait_tablet_cell_initialization,
-        init_operations_archive=init_operations_archive)
+        init_operations_archive=init_operations_archive,
+        job_proxy_logging=job_proxy_logging,
+        job_proxy_log_manager=job_proxy_log_manager)
 
     environment = YTInstance(
         sandbox_path,

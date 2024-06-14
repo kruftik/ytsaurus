@@ -24,6 +24,8 @@
 #include <yt/yt/server/lib/misc/restart_manager.h>
 #include <yt/yt/server/lib/misc/disk_change_checker.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/orchid/orchid_service.h>
 
 #include <yt/yt/ytlib/api/native/connection.h>
@@ -60,7 +62,7 @@ using namespace NNodeTrackerClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = MasterCacheLogger;
+static constexpr auto& Logger = MasterCacheLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -72,9 +74,9 @@ public:
         : Config_(std::move(config))
     {
         if (Config_->AbortOnUnrecognizedOptions) {
-            AbortOnUnrecognizedOptions(Logger, Config_);
+            AbortOnUnrecognizedOptions(Logger(), Config_);
         } else {
-            WarnForUnrecognizedOptions(Logger, Config_);
+            WarnForUnrecognizedOptions(Logger(), Config_);
         }
     }
 
@@ -187,6 +189,7 @@ private:
 
         Connection_ = NApi::NNative::CreateConnection(Config_->ClusterConnection);
         Connection_->GetClusterDirectorySynchronizer()->Start();
+        Connection_->GetMasterCellDirectorySynchronizer()->Start();
 
         RootClient_ = Connection_->CreateClient({.User = NSecurityClient::RootUserName});
 
@@ -225,7 +228,7 @@ private:
         RpcServer_->RegisterService(CreateRestartService(
             restartManager,
             GetControlInvoker(),
-            MasterCacheLogger,
+            MasterCacheLogger(),
             NativeAuthenticator_));
 
         DiskManagerProxy_ = CreateDiskManagerProxy(Config_->DiskManagerProxy);
@@ -235,16 +238,18 @@ private:
         DiskChangeChecker_ = New<TDiskChangeChecker>(
             DiskInfoProvider_,
             GetControlInvoker(),
-            Logger);
+            Logger());
 
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/config",
-            CreateVirtualNode(ConvertTo<INodePtr>(Config_)));
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/dynamic_config_manager",
-            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        if (Config_->ExposeConfigInOrchid) {
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/config",
+                CreateVirtualNode(ConvertTo<INodePtr>(Config_)));
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/dynamic_config_manager",
+                CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        }
         SetNodeByYPath(
             OrchidRoot_,
             "/disk_monitoring",

@@ -17,7 +17,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static inline const NLogging::TLogger Logger("AccessChecker");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "AccessChecker");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -36,10 +36,10 @@ public:
         , Enabled_(Config_->Enabled)
     {
         const auto& coordinator = Bootstrap_->GetCoordinator();
-        coordinator->SubscribeOnSelfRoleChanged(BIND(&TAccessChecker::OnProxyRoleUpdated, MakeWeak(this)));
+        coordinator->SubscribeOnSelfRoleChanged(BIND_NO_PROPAGATE(&TAccessChecker::OnProxyRoleUpdated, MakeWeak(this)));
 
         const auto& dynamicConfigManager = Bootstrap_->GetDynamicConfigManager();
-        dynamicConfigManager->SubscribeConfigChanged(BIND(&TAccessChecker::OnDynamicConfigChanged, MakeWeak(this)));
+        dynamicConfigManager->SubscribeConfigChanged(BIND_NO_PROPAGATE(&TAccessChecker::OnDynamicConfigChanged, MakeWeak(this)));
     }
 
     TError CheckAccess(const TString& user) const override

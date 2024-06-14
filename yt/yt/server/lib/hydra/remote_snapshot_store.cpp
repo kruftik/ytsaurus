@@ -3,6 +3,10 @@
 #include "config.h"
 #include "snapshot.h"
 
+#include <yt/yt/ytlib/hydra/config.h>
+
+#include <yt/yt/ytlib/hydra/proto/hydra_manager.pb.h>
+
 #include <yt/yt/client/api/client.h>
 #include <yt/yt/client/api/config.h>
 #include <yt/yt/client/api/connection.h>
@@ -10,10 +14,9 @@
 #include <yt/yt/client/api/file_writer.h>
 #include <yt/yt/client/api/transaction.h>
 
-#include <yt/yt/client/ypath/rich.h>
+#include <yt/yt/client/object_client/helpers.h>
 
-#include <yt/yt/ytlib/hydra/proto/hydra_manager.pb.h>
-#include <yt/yt/ytlib/hydra/config.h>
+#include <yt/yt/client/ypath/rich.h>
 
 #include <yt/yt/core/concurrency/async_stream.h>
 #include <yt/yt/core/concurrency/scheduler.h>
@@ -62,12 +65,11 @@ public:
         , SecondaryPath_(std::move(secondaryPath))
         , Client_(client)
         , PrerequisiteTransactionId_(prerequisiteTransactionId)
-        , Logger(HydraLogger.WithTag(
+        , Logger(HydraLogger().WithTag(
             "PrimaryPath: %v, SecondaryPath: %v",
             PrimaryPath_,
             SecondaryPath_))
-    {
-    }
+    { }
 
     ISnapshotReaderPtr CreateReader(int snapshotId) override
     {
@@ -106,7 +108,7 @@ private:
         TReader(TRemoteSnapshotStorePtr store, int snapshotId)
             : Store_(store)
             , SnapshotId_(snapshotId)
-            , Logger(HydraLogger.WithTag("PrimaryPath: %v, SecondaryPath: %v",
+            , Logger(HydraLogger().WithTag("PrimaryPath: %v, SecondaryPath: %v",
                 Store_->PrimaryPath_,
                 Store_->SecondaryPath_))
         { }
@@ -237,7 +239,7 @@ private:
             : Store_(store)
             , SnapshotId_(snapshotId)
             , Meta_(meta)
-            , Logger(HydraLogger.WithTag("PrimaryPath: %v, SecondaryPath: %v",
+            , Logger(HydraLogger().WithTag("PrimaryPath: %v, SecondaryPath: %v",
                 Store_->PrimaryPath_,
                 Store_->SecondaryPath_))
         { }
@@ -432,7 +434,7 @@ private:
                 try {
                     id = FromString<int>(key);
                 } catch (const std::exception& ex) {
-                    YT_LOG_WARNING("Unrecognized item (Key: %v)%",
+                    YT_LOG_WARNING("Unrecognized item (Key: %v)",
                         key);
                     continue;
                 }

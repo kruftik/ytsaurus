@@ -43,16 +43,17 @@ public:
 
     virtual TFuture<NApi::TSelectRowsResult> SelectRows(
         ESequoiaTable table,
-        const TSelectRowsRequest& request,
+        const TSelectRowsQuery& query,
         NTransactionClient::TTimestamp timestamp) override
     {
-        FORWARD_METHOD(SelectRows, (table, request, timestamp))
+        FORWARD_METHOD(SelectRows, (table, query, timestamp))
     }
 
     virtual TFuture<ISequoiaTransactionPtr> StartTransaction(
-        const NApi::TTransactionStartOptions& options) override
+        const NApi::TTransactionStartOptions& options,
+        const TSequoiaTransactionSequencingOptions& sequencingOptions) override
     {
-        FORWARD_METHOD(StartTransaction, (options))
+        FORWARD_METHOD(StartTransaction, (options, sequencingOptions))
     }
 
     #undef FORWARD_METHOD

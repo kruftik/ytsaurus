@@ -52,6 +52,8 @@
 
 #include <yt/yt/ytlib/cypress_client/rpc_helpers.h>
 
+#include <yt/yt/ytlib/table_client/schema.h>
+
 #include <yt/yt/ytlib/tablet_client/backup.h>
 #include <yt/yt/ytlib/tablet_client/config.h>
 
@@ -105,7 +107,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TableServerLogger;
+static constexpr auto& Logger = TableServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -183,7 +185,8 @@ void TTableNodeProxy::ListSystemAttributes(std::vector<TAttributeDescriptor>* de
     bool isSorted = table->IsSorted();
     bool isExternal = table->IsExternal();
     bool isQueue = table->IsQueue();
-    bool isConsumer = table->IsConsumer();
+    bool isQueueConsumer = table->IsQueueConsumer();
+    bool isQueueProducer = table->IsQueueProducer();
 
     TBase::DoListSystemAttributes(descriptors, /*showTabletAttributes*/ isDynamic);
 
@@ -386,14 +389,23 @@ void TTableNodeProxy::ListSystemAttributes(std::vector<TAttributeDescriptor>* de
         .SetWritable(true)
         .SetPresent(isDynamic && isSorted));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::QueueConsumerStatus)
-        .SetPresent(isConsumer)
+        .SetPresent(isQueueConsumer)
         .SetOpaque(true));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::QueueConsumerPartitions)
-        .SetPresent(isConsumer)
+        .SetPresent(isQueueConsumer)
         .SetOpaque(true));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::VitalQueueConsumer)
         .SetWritable(true)
-        .SetPresent(isConsumer));
+        .SetPresent(isQueueConsumer));
+    descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::TreatAsQueueProducer)
+        .SetWritable(true)
+        .SetPresent(isDynamic && isSorted));
+    descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::QueueProducerStatus)
+        .SetPresent(isQueueProducer)
+        .SetOpaque(true));
+    descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::QueueProducerPartitions)
+        .SetPresent(isQueueProducer)
+        .SetOpaque(true));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::MountConfig)
         .SetWritable(true));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::EffectiveMountConfig)
@@ -410,6 +422,11 @@ void TTableNodeProxy::ListSystemAttributes(std::vector<TAttributeDescriptor>* de
         .SetPresent(isDynamic && !table->SecondaryIndices().empty()));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::IndexTo)
         .SetPresent(isDynamic && table->GetIndexTo()));
+    descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::CustomRuntimeData)
+        .SetWritable(true)
+        .SetRemovable(true)
+        .SetOpaque(true)
+        .SetPresent(static_cast<bool>(table->CustomRuntimeData())));
 }
 
 bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsumer* consumer)
@@ -420,7 +437,7 @@ bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsum
     bool isDynamic = table->IsDynamic();
     bool isSorted = table->IsSorted();
     bool isExternal = table->IsExternal();
-    bool isConsumer = table->IsConsumer();
+    bool isQueueConsumer = table->IsQueueConsumer();
 
     const auto& tabletManager = Bootstrap_->GetTabletManager();
     const auto& timestampProvider = Bootstrap_->GetTimestampProvider();
@@ -432,13 +449,13 @@ bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsum
                 break;
             }
             BuildYsonFluently(consumer)
-                .Value(table->ComputeTotalStatistics().data_weight());
+                .Value(table->ComputeTotalStatistics().DataWeight);
             return true;
         }
 
         case EInternedAttributeKey::ChunkRowCount:
             BuildYsonFluently(consumer)
-                .Value(statistics.row_count());
+                .Value(statistics.RowCount);
             return true;
 
         case EInternedAttributeKey::RowCount:
@@ -446,7 +463,7 @@ bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsum
                 break;
             }
             BuildYsonFluently(consumer)
-                .Value(statistics.row_count());
+                .Value(statistics.RowCount);
             return true;
 
         case EInternedAttributeKey::UnmergedRowCount:
@@ -454,7 +471,7 @@ bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsum
                 break;
             }
             BuildYsonFluently(consumer)
-                .Value(statistics.row_count());
+                .Value(statistics.RowCount);
             return true;
 
         case EInternedAttributeKey::Sorted:
@@ -954,16 +971,25 @@ bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsum
             }
 
             BuildYsonFluently(consumer)
-                .Value(table->GetTreatAsConsumer());
+                .Value(table->GetTreatAsQueueConsumer());
             return true;
 
         case EInternedAttributeKey::VitalQueueConsumer:
-            if (!isConsumer) {
+            if (!isQueueConsumer) {
                 break;
             }
 
             BuildYsonFluently(consumer)
                 .Value(table->GetIsVitalConsumer());
+            return true;
+
+        case EInternedAttributeKey::TreatAsQueueProducer:
+            if (!isDynamic || !isSorted) {
+                break;
+            }
+
+            BuildYsonFluently(consumer)
+                .Value(table->GetTreatAsQueueProducer());
             return true;
 
         case EInternedAttributeKey::MountConfig:
@@ -1073,6 +1099,16 @@ bool TTableNodeProxy::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsum
             return true;
         }
 
+        case EInternedAttributeKey::CustomRuntimeData:
+            if (!table->CustomRuntimeData()) {
+                break;
+            }
+
+            BuildYsonFluently(consumer)
+                .Value(table->CustomRuntimeData());
+
+            return true;
+
         default:
             break;
     }
@@ -1086,7 +1122,8 @@ TFuture<TYsonString> TTableNodeProxy::GetBuiltinAttributeAsync(TInternedAttribut
     auto chunkLists = table->GetChunkLists();
     bool isExternal = table->IsExternal();
     bool isQueue = table->IsQueue();
-    bool isConsumer = table->IsConsumer();
+    bool isQueueConsumer = table->IsQueueConsumer();
+    bool isQueueProducer = table->IsQueueProducer();
 
     switch (key) {
         case EInternedAttributeKey::TableChunkFormatStatistics:
@@ -1142,7 +1179,15 @@ TFuture<TYsonString> TTableNodeProxy::GetBuiltinAttributeAsync(TInternedAttribut
 
         case EInternedAttributeKey::QueueConsumerStatus:
         case EInternedAttributeKey::QueueConsumerPartitions: {
-            if (!isConsumer) {
+            if (!isQueueConsumer) {
+                break;
+            }
+            return GetQueueAgentAttributeAsync(Bootstrap_, table->GetQueueAgentStage(), GetPath(), key);
+        }
+
+        case EInternedAttributeKey::QueueProducerStatus:
+        case EInternedAttributeKey::QueueProducerPartitions: {
+            if (!isQueueProducer) {
                 break;
             }
             return GetQueueAgentAttributeAsync(Bootstrap_, table->GetQueueAgentStage(), GetPath(), key);
@@ -1298,6 +1343,15 @@ bool TTableNodeProxy::RemoveBuiltinAttribute(TInternedAttributeKey key)
             ValidateNoTransaction();
             auto* lockedTable = LockThisImpl();
             lockedTable->SetQueueAgentStage(std::nullopt);
+            return true;
+        }
+
+        case EInternedAttributeKey::CustomRuntimeData: {
+            auto* lockedTable = LockThisImpl();
+            lockedTable->CustomRuntimeData() = {};
+
+            Bootstrap_->GetTabletManager()->SetCustomRuntimeData(lockedTable, {});
+
             return true;
         }
 
@@ -1610,15 +1664,15 @@ bool TTableNodeProxy::SetBuiltinAttribute(TInternedAttributeKey key, const TYson
             }
 
             auto* lockedTable = LockThisImpl();
-            auto isConsumerObjectBefore = lockedTable->IsTrackedConsumerObject();
-            lockedTable->SetTreatAsConsumer(ConvertTo<bool>(value));
-            auto isConsumerObjectAfter = lockedTable->IsTrackedConsumerObject();
+            auto isQueueConsumerObjectBefore = lockedTable->IsTrackedQueueConsumerObject();
+            lockedTable->SetTreatAsQueueConsumer(ConvertTo<bool>(value));
+            auto isQueueConsumerObjectAfter = lockedTable->IsTrackedQueueConsumerObject();
 
-            if (isConsumerObjectAfter != isConsumerObjectBefore) {
-                if (isConsumerObjectAfter) {
-                    tableManager->RegisterConsumer(table);
+            if (isQueueConsumerObjectAfter != isQueueConsumerObjectBefore) {
+                if (isQueueConsumerObjectAfter) {
+                    tableManager->RegisterQueueConsumer(table);
                 } else {
-                    tableManager->UnregisterConsumer(table);
+                    tableManager->UnregisterQueueConsumer(table);
                 }
             }
 
@@ -1630,12 +1684,37 @@ bool TTableNodeProxy::SetBuiltinAttribute(TInternedAttributeKey key, const TYson
         case EInternedAttributeKey::VitalQueueConsumer: {
             ValidateNoTransaction();
 
-            if (!table->IsConsumer()) {
+            if (!table->IsQueueConsumer()) {
                 break;
             }
 
             auto* lockedTable = LockThisImpl();
             lockedTable->SetIsVitalConsumer(ConvertTo<bool>(value));
+
+            SetModified(EModificationType::Attributes);
+
+            return true;
+        }
+
+        case EInternedAttributeKey::TreatAsQueueProducer: {
+            ValidateNoTransaction();
+
+            if (!table->IsDynamic() || !table->IsSorted()) {
+                break;
+            }
+
+            auto* lockedTable = LockThisImpl();
+            auto isQueueProducerObjectBefore = lockedTable->IsTrackedQueueProducerObject();
+            lockedTable->SetTreatAsQueueProducer(ConvertTo<bool>(value));
+            auto isQueueProducerObjectAfter = lockedTable->IsTrackedQueueProducerObject();
+
+            if (isQueueProducerObjectAfter != isQueueProducerObjectBefore) {
+                if (isQueueProducerObjectAfter) {
+                    tableManager->RegisterQueueProducer(table);
+                } else {
+                    tableManager->UnregisterQueueProducer(table);
+                }
+            }
 
             SetModified(EModificationType::Attributes);
 
@@ -1671,6 +1750,15 @@ bool TTableNodeProxy::SetBuiltinAttribute(TInternedAttributeKey key, const TYson
 
             auto* hunkStorageNode = node->As<THunkStorageNode>();
             lockedTable->SetHunkStorageNode(hunkStorageNode);
+
+            return true;
+        }
+
+        case EInternedAttributeKey::CustomRuntimeData: {
+            auto* lockedTable = LockThisImpl();
+            lockedTable->CustomRuntimeData() = value;
+
+            Bootstrap_->GetTabletManager()->SetCustomRuntimeData(lockedTable, value);
 
             return true;
         }
@@ -1892,6 +1980,9 @@ DEFINE_YPATH_SERVICE_METHOD(TTableNodeProxy, GetMountInfo)
         auto* protoIndexInfo = response->add_indices();
         ToProto(protoIndexInfo->mutable_index_table_id(), index->GetIndexTable()->GetId());
         protoIndexInfo->set_index_kind(ToProto<i32>(index->GetKind()));
+        if (const auto& predicate = index->Predicate()) {
+            ToProto(protoIndexInfo->mutable_predicate(), *predicate);
+        }
     }
 
     if (trunkTable->IsReplicated()) {
@@ -2091,6 +2182,36 @@ DEFINE_YPATH_SERVICE_METHOD(TTableNodeProxy, Alter)
             dynamic,
             table->IsEmpty() && !table->IsDynamic());
 
+        if (table->IsDynamic()) {
+            for (const auto* index : table->SecondaryIndices()) {
+                const auto& indexTableSchema = index->GetIndexTable()->GetSchema()->AsTableSchema();
+                switch (index->GetKind()) {
+                    case ESecondaryIndexKind::FullSync:
+                        ValidateFullSyncIndexSchema(*schema, *indexTableSchema);
+                        break;
+                    case ESecondaryIndexKind::Unfolding:
+                        FindUnfoldingColumnAndValidate(*schema, *indexTableSchema);
+                        break;
+                    default:
+                        YT_ABORT();
+                }
+            }
+
+            if (const auto* index = table->GetIndexTo()) {
+                const auto& tableSchema = index->GetTable()->GetSchema()->AsTableSchema();
+                switch (index->GetKind()) {
+                    case ESecondaryIndexKind::FullSync:
+                        ValidateFullSyncIndexSchema(*tableSchema, *schema);
+                        break;
+                    case ESecondaryIndexKind::Unfolding:
+                        FindUnfoldingColumnAndValidate(*tableSchema, *schema);
+                        break;
+                    default:
+                        YT_ABORT();
+                }
+            }
+        }
+
         if (!config->EnableDescendingSortOrder ||
             dynamic && !config->EnableDescendingSortOrderDynamic)
         {
@@ -2136,21 +2257,7 @@ DEFINE_YPATH_SERVICE_METHOD(TTableNodeProxy, Alter)
                 return tableManager->GetOrCreateNativeMasterTableSchema(*schema, table);
             }
 
-            // COMPAT(h0pless): RefactorSchemaExport
-            if (options.Schema) {
-                // COMPAT(h0pless): Remove this after schema migration is complete.
-                if (!options.SchemaId) {
-                    YT_LOG_ALERT("Created native schema on an external cell tag (TableId: %v)",
-                        table->GetId());
-                    return tableManager->GetOrCreateNativeMasterTableSchema(*schema, table);
-                }
-
-                YT_LOG_ALERT("Created imported schema on an external cell outside of designated mutation "
-                    "(TableId: %v)",
-                    table->GetId());
-                return tableManager->CreateImportedMasterTableSchema(*schema, table, options.SchemaId);
-            }
-
+            YT_VERIFY(!options.Schema);
             auto* existingSchema = tableManager->GetMasterTableSchema(options.SchemaId);
             tableManager->SetTableSchema(table, existingSchema);
             return existingSchema;

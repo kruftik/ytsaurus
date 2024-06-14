@@ -60,9 +60,20 @@ void TDynamicSecurityManagerConfig::Register(TRegistrar registrar)
     registrar.Parameter("forbid_irreversible_changes", &TThis::ForbidIrreversibleAclChanges)
         .Default(false);
 
+    registrar.Parameter("fix_subject_tag_filter_iterator_never_skipping_first_ace", &TThis::FixSubjectTagFilterIteratorNeverSkippingFirstAce)
+        .Default(false)
+        .DontSerializeDefault();
+
+    registrar.Parameter("enable_subject_tag_filters", &TThis::EnableSubjectTagFilters)
+        .Default(true)
+        .DontSerializeDefault();
+
     registrar.Parameter("user_statistics_flush_period", &TThis::UserStatisticsFlushPeriod)
         .GreaterThan(TDuration::Zero())
         .Default(TDuration::Seconds(1));
+
+    registrar.Parameter("disable_update_user_last_seen", &TThis::DisableUpdateUserLastSeen)
+        .Default(false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

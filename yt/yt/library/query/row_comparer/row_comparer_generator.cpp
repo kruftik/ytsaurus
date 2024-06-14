@@ -1,6 +1,7 @@
 
 #include "llvm_types.h"
 
+#include <yt/yt/client/table_client/composite_compare.h>
 #include <yt/yt/client/table_client/llvm_types.h>
 #include <yt/yt/client/table_client/unversioned_row.h>
 
@@ -33,9 +34,19 @@ using namespace llvm;
 
 ////////////////////////////////////////////////////////////////////////////////
 
+static int CompareYsonValues(ui32 lhsLength, const void* lhsData, ui32 rhsLength, const void* rhsData)
+{
+    NYson::TYsonStringBuf lhsBuf{TStringBuf(static_cast<const char*>(lhsData), lhsLength)};
+    NYson::TYsonStringBuf rhsBuf{TStringBuf(static_cast<const char*>(rhsData), rhsLength)};
+    return NYT::NTableClient::CompareYsonValues(lhsBuf, rhsBuf);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 static void RegisterComparerRoutinesImpl(TRoutineRegistry* registry)
 {
     registry->RegisterRoutine("memcmp", ::memcmp);
+    registry->RegisterRoutine("ysoncmp", CompareYsonValues);
 }
 
 static TRoutineRegistry* GetComparerRoutineRegistry()
@@ -53,7 +64,7 @@ class TComparerBuilder
 {
 public:
     TComparerBuilder(
-        TCGModulePtr module,
+        TCGModulePtr cgModule,
         TRange<EValueType> keyColumnTypes);
 
     void BuildDDComparer(TString& functionName);
@@ -71,7 +82,10 @@ private:
     Value* CreateMin(Value* lhs, Value* rhs,  EValueType type);
 
     void BuildCmp(Value* lhs, Value* rhs, EValueType type, int index);
+    //! Create comparer for EValueType::String values.
     void BuildStringCmp(Value* lhsLength, Value* lhsData, Value* rhsLength, Value* rhsData, int index);
+    //! Create comparer for EValueType::Composite and EValueType::Any values.
+    void BuildYsonCmp(Value* lhsLength, Value* lhsData, Value* rhsLength, Value* rhsData, int index);
     void BuildIterationLimitCheck(Value* length, int index);
     void BuildSentinelTypeCheck(Value* type);
     void BuildMainLoop(
@@ -151,7 +165,7 @@ public:
         : TValueBuilderBase(builder, keyPtr)
         , NullKeyMask_(nullKeyMask)
     {
-        YT_VERIFY(nullKeyMask->getType() == Type::getInt64Ty(Builder_.Context_));
+        YT_VERIFY(nullKeyMask->getType() == Type::getInt128Ty(Builder_.Context_));
         YT_VERIFY((keyPtr->getType() == TTypeBuilder<TDynamicValueData*>::Get(Builder_.Context_)));
     }
 
@@ -159,13 +173,15 @@ public:
     {
         YT_VERIFY(index < MaxKeyColumnCountInDynamicTable);
         auto* nullKeyBit = Builder_.CreateAnd(
-            Builder_.getInt64(1UL << index),
+            Builder_.CreateShl(
+                ConstantInt::get(Builder_.getInt128Ty(), 1),
+                ConstantInt::get(Builder_.getInt128Ty(), index)),
             NullKeyMask_);
         const auto& type = TTypeBuilder<TUnversionedValue>::TType::Get(Builder_.getContext());
         auto* nullType = ConstantInt::get(type, static_cast<int>(EValueType::Null));
         auto* schemaType = ConstantInt::get(type, static_cast<int>(Builder_.KeyColumnTypes_[index]));
         return Builder_.CreateSelect(
-            Builder_.CreateICmpNE(nullKeyBit, Builder_.getInt64(0)),
+            Builder_.CreateICmpNE(nullKeyBit, Builder_.getIntN(128, 0)),
             nullType,
             schemaType);
     }
@@ -221,6 +237,7 @@ private:
             case EValueType::Double:
                 return TTypeBuilder<TDynamicValueData>::TDouble::Get(Builder_.Context_);
             case EValueType::String:
+            case EValueType::Any:
                 return TTypeBuilder<TDynamicValueData>::TStringType::Get(Builder_.Context_);
             default:
                 YT_ABORT();
@@ -309,11 +326,11 @@ private:
 };
 
 TComparerBuilder::TComparerBuilder(
-    TCGModulePtr module,
+    TCGModulePtr cgModule,
     TRange<EValueType> keyColumnTypes)
-    : IRBuilder(module->GetContext())
+    : IRBuilder(cgModule->GetContext())
     , KeyColumnTypes_(keyColumnTypes)
-    , Module_(std::move(module))
+    , Module_(std::move(cgModule))
     , Context_(Module_->GetContext())
 { }
 
@@ -400,21 +417,21 @@ Value* TComparerBuilder::CreateCmp(Value* lhs, Value* rhs, EValueType type, bool
 Value* TComparerBuilder::CreateMin(Value* lhs, Value* rhs, EValueType type)
 {
     YT_VERIFY(lhs->getType() == rhs->getType());
-    return CreateSelect(CreateCmp(lhs, rhs, type, true), lhs, rhs);
+    return CreateSelect(CreateCmp(lhs, rhs, type, /*isLessThan*/ true), lhs, rhs);
 }
 
 void TComparerBuilder::BuildCmp(Value* lhs, Value* rhs, EValueType type, int index)
 {
     auto* trueBB = CreateBB("cmp.lower");
     auto* falseBB = CreateBB("cmp.not.lower");
-    CreateCondBr(CreateCmp(lhs, rhs, type, true), trueBB, falseBB);
+    CreateCondBr(CreateCmp(lhs, rhs, type, /*isLessThan*/ true), trueBB, falseBB);
     SetInsertPoint(trueBB);
     CreateRet(getInt32(-(index + 1)));
     SetInsertPoint(falseBB);
 
     trueBB = CreateBB("cmp.greater");
     falseBB = CreateBB("cmp.equal");
-    CreateCondBr(CreateCmp(lhs, rhs, type, false), trueBB, falseBB);
+    CreateCondBr(CreateCmp(lhs, rhs, type, /*isLessThan*/ false), trueBB, falseBB);
     SetInsertPoint(trueBB);
     CreateRet(getInt32(index + 1));
     SetInsertPoint(falseBB);
@@ -439,6 +456,24 @@ void TComparerBuilder::BuildStringCmp(Value* lhsLength, Value* lhsData, Value* r
     CreateRet(CreateSelect(CreateICmpSGT(memcmpResult, getInt32(0)), getInt32(index + 1), getInt32(-(index + 1))));
     SetInsertPoint(falseBB);
     BuildCmp(lhsLength, rhsLength, EValueType::Int64, index);
+}
+
+void TComparerBuilder::BuildYsonCmp(Value* lhsLength, Value* lhsData, Value* rhsLength, Value* rhsData, int index)
+{
+    auto* cmpResult = CreateCall(
+        Module_->GetRoutine("ysoncmp"),
+        {
+            lhsLength,
+            lhsData,
+            rhsLength,
+            rhsData
+        });
+    auto* trueBB = CreateBB("ysoncmp.is.not.zero");
+    auto* falseBB = CreateBB("ysoncmp.is.zero");
+    CreateCondBr(CreateICmpNE(cmpResult, getInt32(0)), trueBB, falseBB);
+    SetInsertPoint(trueBB);
+    CreateRet(CreateSelect(CreateICmpSGT(cmpResult, getInt32(0)), getInt32(index + 1), getInt32(-(index + 1))));
+    SetInsertPoint(falseBB);
 }
 
 void TComparerBuilder::BuildIterationLimitCheck(Value* iterationsLimit, int index)
@@ -493,6 +528,12 @@ void TComparerBuilder::BuildMainLoop(
             auto* lhsData = lhsBuilder.GetStringData(index);
             auto* rhsData = rhsBuilder.GetStringData(index);
             BuildStringCmp(lhsLength, lhsData, rhsLength, rhsData, index);
+        } else if (type == EValueType::Composite || type == EValueType::Any) {
+            auto* lhsLength = lhsBuilder.GetStringLength(index);
+            auto* rhsLength = rhsBuilder.GetStringLength(index);
+            auto* lhsData = lhsBuilder.GetStringData(index);
+            auto* rhsData = rhsBuilder.GetStringData(index);
+            BuildYsonCmp(lhsLength, lhsData, rhsLength, rhsData, index);
         } else {
             auto* lhs = lhsBuilder.GetData(index, type);
             auto* rhs = rhsBuilder.GetData(index, type);
@@ -511,8 +552,13 @@ void TComparerBuilder::BuildMainLoop(
 
 TCGKeyComparers GenerateComparers(TRange<EValueType> keyColumnTypes)
 {
-    auto module = TCGModule::Create(GetComparerRoutineRegistry());
-    auto builder = TComparerBuilder(module, keyColumnTypes);
+    THROW_ERROR_EXCEPTION_IF(keyColumnTypes.Size() > MaxKeyColumnCountInDynamicTable,
+        "Key column count too large. Got: %v, limit: %v",
+        keyColumnTypes.Size(),
+        MaxKeyColumnCountInDynamicTable);
+
+    auto cgModule = TCGModule::Create(GetComparerRoutineRegistry());
+    auto builder = TComparerBuilder(cgModule, keyColumnTypes);
     auto ddComparerName = TString("DDCompare");
     auto duComparerName = TString("DUCompare");
     auto uuComparerName = TString("UUCompare");
@@ -521,15 +567,33 @@ TCGKeyComparers GenerateComparers(TRange<EValueType> keyColumnTypes)
     builder.BuildDUComparer(duComparerName);
     builder.BuildUUComparer(uuComparerName);
 
-    module->ExportSymbol(ddComparerName);
-    module->ExportSymbol(duComparerName);
-    module->ExportSymbol(uuComparerName);
+    cgModule->ExportSymbol(ddComparerName);
+    cgModule->ExportSymbol(duComparerName);
+    cgModule->ExportSymbol(uuComparerName);
 
-    auto ddComparer = module->GetCompiledFunction<TDDComparerSignature>(ddComparerName);
-    auto duComparer = module->GetCompiledFunction<TDUComparerSignature>(duComparerName);
-    auto uuComparer = module->GetCompiledFunction<TUUComparerSignature>(uuComparerName);
+    auto ddComparer = cgModule->GetCompiledFunction<TDDComparerSignature>(ddComparerName);
+    auto duComparer = cgModule->GetCompiledFunction<TDUComparerSignature>(duComparerName);
+    auto uuComparer = cgModule->GetCompiledFunction<TUUComparerSignature>(uuComparerName);
 
     return TCGKeyComparers{ddComparer, duComparer, uuComparer};
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TCallback<TUUComparerSignature> GenerateStaticTableKeyComparer(TRange<EValueType> keyColumnTypes)
+{
+    THROW_ERROR_EXCEPTION_IF(keyColumnTypes.Size() > MaxKeyColumnCountInDynamicTable,
+        "Key column count too large. Got: %v, limit: %v",
+        keyColumnTypes.Size(),
+        MaxKeyColumnCountInDynamicTable);
+
+    auto module = TCGModule::Create(GetComparerRoutineRegistry());
+    auto builder = TComparerBuilder(module, keyColumnTypes);
+
+    auto uuComparerName = TString("UUCompare");
+    builder.BuildUUComparer(uuComparerName);
+    module->ExportSymbol(uuComparerName);
+    return module->GetCompiledFunction<TUUComparerSignature>(uuComparerName);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

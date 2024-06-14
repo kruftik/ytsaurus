@@ -194,8 +194,7 @@ private:
             // Select queries with expired leases.
             auto selectQuery = Format(
                 "[query_id], [incarnation], [assigned_tracker], [lease_transaction_id], [engine], [user], [query], [settings], [files] from [%v]",
-                StateRoot_ + "/active_queries",
-                SelfAddress_);
+                StateRoot_ + "/active_queries");
             auto selectResult = WaitFor(StateClient_->SelectRows(selectQuery))
                 .ValueOrThrow();
             queryRecords = ToRecords<TActiveQuery>(selectResult.Rowset);
@@ -271,7 +270,7 @@ private:
         VERIFY_INVOKER_AFFINITY(ControlInvoker_);
 
         auto queryId = queryRecord.Key.QueryId;
-        auto Logger = NQueryTracker::Logger.WithTag("QueryId: %v", queryId);
+        auto Logger = NQueryTracker::Logger().WithTag("QueryId: %v", queryId);
         YT_LOG_DEBUG("Starting acquisition transaction");
         auto transaction = WaitFor(StateClient_->StartTransaction(ETransactionType::Tablet))
             .ValueOrThrow();
@@ -398,7 +397,7 @@ private:
     {
         VERIFY_INVOKER_AFFINITY(ControlInvoker_);
 
-        auto Logger = QueryTrackerLogger.WithTag("QueryId: %v, Incarnation: %v", queryId, incarnation);
+        auto Logger = QueryTrackerLogger().WithTag("QueryId: %v, Incarnation: %v", queryId, incarnation);
 
         if (auto iter = AcquiredQueries_.find(queryId);
             iter == AcquiredQueries_.end() || iter->second.Incarnation != incarnation)
@@ -527,7 +526,7 @@ private:
     {
         VERIFY_INVOKER_AFFINITY(ControlInvoker_);
 
-        auto Logger = NQueryTracker::Logger.WithTag("QueryId: %v", queryId);
+        auto Logger = NQueryTracker::Logger().WithTag("QueryId: %v", queryId);
 
         try {
             YT_LOG_DEBUG("Starting finish transaction");
@@ -569,7 +568,7 @@ private:
                     .Files = activeQueryRecord->Files,
                     .Settings = activeQueryRecord->Settings,
                     .User = activeQueryRecord->User,
-                    .AccessControlObject = activeQueryRecord->AccessControlObject,
+                    .AccessControlObjects = activeQueryRecord->AccessControlObjects,
                     .StartTime = activeQueryRecord->StartTime,
                     .State = finalState,
                     .Progress = activeQueryRecord->Progress,
@@ -593,7 +592,7 @@ private:
                     .Key = TFinishedQueryByStartTimeKey{.StartTime = activeQueryRecord->StartTime, .QueryId = queryId},
                     .Engine = activeQueryRecord->Engine,
                     .User = activeQueryRecord->User,
-                    .AccessControlObject = activeQueryRecord->AccessControlObject,
+                    .AccessControlObjects = activeQueryRecord->AccessControlObjects,
                     .State = finalState,
                     .FilterFactors = activeQueryRecord->FilterFactors,
                 };

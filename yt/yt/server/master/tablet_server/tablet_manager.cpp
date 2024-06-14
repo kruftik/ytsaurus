@@ -73,6 +73,9 @@
 #include <yt/yt/server/master/table_server/table_manager.h>
 #include <yt/yt/server/master/table_server/table_node.h>
 
+// COMPAT(babenko)
+#include <yt/yt/server/node/tablet_node/serialize.h>
+
 #include <yt/yt/server/lib/tablet_node/config.h>
 #include <yt/yt/server/lib/tablet_node/proto/tablet_manager.pb.h>
 
@@ -173,7 +176,7 @@ using TTabletResources = NTabletServer::TTabletResources;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletServerLogger;
+static constexpr auto& Logger = TabletServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -194,19 +197,19 @@ public:
 
         RegisterLoader(
             "TabletManager.Keys",
-            BIND(&TImpl::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::LoadKeys, Unretained(this)));
         RegisterLoader(
             "TabletManager.Values",
-            BIND(&TImpl::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "TabletManager.Keys",
-            BIND(&TImpl::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "TabletManager.Values",
-            BIND(&TImpl::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::SaveValues, Unretained(this)));
 
         auto primaryCellTag = Bootstrap_->GetMulticellManager()->GetPrimaryCellTag();
         DefaultTabletCellBundleId_ = MakeWellKnownId(EObjectType::TabletCellBundle, primaryCellTag, 0xffffffffffffffff);
@@ -236,6 +239,7 @@ public:
         RegisterMethod(BIND_NO_PROPAGATE(&TImpl::HydraDeallocateServant, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TImpl::HydraReportSmoothMovementProgress, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TImpl::HydraReportSmoothMovementAborted, Unretained(this)));
+        RegisterMethod(BIND_NO_PROPAGATE(&TImpl::HydraMaterializeExtraMountConfigKeys, Unretained(this)));
 
         const auto& tabletNodeTracker = Bootstrap_->GetTabletNodeTracker();
         tabletNodeTracker->SubscribeHeartbeat(BIND_NO_PROPAGATE(&TImpl::OnTabletNodeHeartbeat, MakeWeak(this)));
@@ -347,7 +351,7 @@ public:
         objectManager->RefObject(tablet);
 
         YT_LOG_DEBUG(
-            "Tablet created (TableId: %v, TabletId: %v, Type: %lv, Account: %v)",
+            "Tablet created (TableId: %v, TabletId: %v, Type: %v, Account: %v)",
             table->GetId(),
             tablet->GetId(),
             type,
@@ -933,7 +937,7 @@ public:
         return action;
     }
 
-    void DestroyTabletAction(TTabletAction* action)
+    void ZombifyTabletAction(TTabletAction* action)
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
 
@@ -943,9 +947,10 @@ public:
             if (!action->IsFinished()) {
                 bundle->DecreaseActiveTabletActionCount();
             }
+            action->SetTabletCellBundle(nullptr);
         }
 
-        YT_LOG_DEBUG("Tablet action destroyed (ActionId: %v, TabletBalancerCorrelationId: %v)",
+        YT_LOG_DEBUG("Tablet action zombified (ActionId: %v, TabletBalancerCorrelationId: %v)",
             action->GetId(),
             action->GetCorrelationId());
     }
@@ -1503,6 +1508,29 @@ public:
             trimmedRowCounts);
 
         UpdateTabletState(table);
+    }
+
+    void SetCustomRuntimeData(TTableNode* table, NYson::TYsonString data)
+    {
+        if (table->IsExternal()) {
+            return;
+        }
+
+        const auto& hiveManager = Bootstrap_->GetHiveManager();
+
+        for (auto* tablet : table->Tablets()) {
+            if (tablet->GetState() == ETabletState::Unmounted) {
+                continue;
+            }
+
+            auto* mailbox = hiveManager->GetMailbox(tablet->GetNodeEndpointId());
+            TReqSetCustomRuntimeData req;
+            ToProto(req.mutable_tablet_id(), tablet->GetId());
+            if (data) {
+                req.set_custom_runtime_data(data.ToString());
+            }
+            hiveManager->PostMessage(mailbox, req);
+        }
     }
 
     void DestroyTabletOwner(TTabletOwnerBase* table)
@@ -2714,6 +2742,15 @@ public:
         }
     }
 
+    void MaterizlizeExtraMountConfigKeys(TCellTag cellTag) const
+    {
+        NProto::TReqMaterializeExtraMountConfigKeys request;
+        ToProto(request.mutable_table_mount_config_keys(), MountConfigKeysFromNodes_);
+
+        const auto& multicellManager = Bootstrap_->GetMulticellManager();
+        multicellManager->PostToMaster(request, cellTag);
+    }
+
     DECLARE_ENTITY_MAP_ACCESSORS(Tablet, TTabletBase);
     DECLARE_ENTITY_MAP_ACCESSORS(TableReplica, TTableReplica);
     DECLARE_ENTITY_MAP_ACCESSORS(TabletAction, TTabletAction);
@@ -2809,7 +2846,7 @@ private:
     bool FillMountConfigKeys_ = false;
 
     //! Hash parts of the avenue ids generated in current mutation.
-    THashSet<ui32> GeneratedAvenueIdHashes_;
+    THashSet<ui32> GeneratedAvenueIdEntropies_;
 
     // COMPAT(ifsmirnov)
     bool RecomputeAggregateTabletStatistics_ = false;
@@ -3301,7 +3338,7 @@ private:
                         throw;
                     }
 
-                    GeneratedAvenueIdHashes_.clear();
+                    GeneratedAvenueIdEntropies_.clear();
 
                     // TODO(ifsmirnov): YT-20959 - send updated settings to sibling
                     // and unban remount.
@@ -3545,13 +3582,13 @@ private:
                 // No break intentionally.
             case ETabletActionState::Failed: {
                 UnbindTabletAction(action);
+                if (auto* bundle = action->GetTabletCellBundle()) {
+                    bundle->DecreaseActiveTabletActionCount();
+                }
                 const auto now = GetCurrentMutationContext()->GetTimestamp();
                 if (action->GetExpirationTime() <= now) {
                     const auto& objectManager = Bootstrap_->GetObjectManager();
                     objectManager->UnrefObject(action);
-                }
-                if (auto* bundle = action->GetTabletCellBundle()) {
-                    bundle->DecreaseActiveTabletActionCount();
                 }
                 break;
             }
@@ -3740,7 +3777,7 @@ private:
                 IsDynamicStoreReadEnabled(typedTable, GetDynamicConfig()));
         }
 
-        GeneratedAvenueIdHashes_.clear();
+        GeneratedAvenueIdEntropies_.clear();
 
         const auto& objectManager = Bootstrap_->GetObjectManager();
         TTabletResources resourceUsageDelta;
@@ -3824,7 +3861,7 @@ private:
 
     TAvenueEndpointId GenerateAvenueEndpointId(TTabletBase* tablet)
     {
-        ui32 hash = HashFromId(tablet->GetId());
+        ui32 entropy = EntropyFromId(tablet->GetId());
 
         // Try to keep as many lower bits as possible.
         {
@@ -3832,17 +3869,17 @@ private:
             ui32 upperBitMask = 0;
             ui32 saltOffset = 32;
 
-            while (GeneratedAvenueIdHashes_.contains(hash)) {
+            while (GeneratedAvenueIdEntropies_.contains(entropy)) {
                 if (salt == upperBitMask) {
                     --saltOffset;
                     upperBitMask ^= 1u << saltOffset;
                 }
                 ++salt;
-                hash = (hash & ~upperBitMask) ^ (salt << saltOffset);
+                entropy = (entropy & ~upperBitMask) ^ (salt << saltOffset);
             }
         }
 
-        GeneratedAvenueIdHashes_.insert(hash);
+        GeneratedAvenueIdEntropies_.insert(entropy);
 
         auto* mutationContext = GetCurrentMutationContext();
 
@@ -3850,7 +3887,7 @@ private:
             EObjectType::AliceAvenueEndpoint,
             CellTagFromId(tablet->GetId()),
             mutationContext->GetVersion(),
-            hash);
+            entropy);
 
         mutationContext->CombineStateHash(result);
 
@@ -3904,6 +3941,10 @@ private:
             reqReplicatable.set_retained_timestamp(tablet->GetRetainedTimestamp());
             if (!table->IsPhysicallySorted()) {
                 reqReplicatable.set_trimmed_row_count(tablet->GetTrimmedRowCount());
+            }
+
+            if (const auto& customRuntimeData = table->CustomRuntimeData()) {
+                reqReplicatable.set_custom_runtime_data(customRuntimeData.ToString());
             }
 
             req.set_mount_revision(tablet->Servant().GetMountRevision());
@@ -4891,7 +4932,20 @@ private:
         }
 
         for (auto [actionId, action] : TabletActionMap_) {
-            // NB: Process non-alive objects to pair with DestroyTabletAction.
+            // COMPAT(ifsmirnov): EMasterReign::ZombifyTabletAction
+            if (!IsObjectAlive(action)) {
+                // Unbinding was earlier performed in Destroy instead of Zombify.
+                // We take care of actions which had zero RC during the update
+                // so neither handler was executed. Note that while UnbindTabletAction is
+                // idempotent, ZombifyTabletActions() also operates with bundle state
+                // which is not yet initialized, so we cannot call the method as-is.
+                UnbindTabletAction(action);
+                action->SetTabletCellBundle(nullptr);
+
+                // NB: this is not a part of the compat and should be kept during cleanup.
+                continue;
+            }
+
             auto bundle = action->GetTabletCellBundle();
             if (!bundle) {
                 continue;
@@ -5676,7 +5730,7 @@ private:
             auxiliaryServant.GetMountRevision() != targetMountRevision)
         {
             YT_LOG_DEBUG("Mount revision mismatch, will not switch servants "
-                "(TabletId: %v, ExpectedSourceMountRevision: %v, ExpectedTargetMountRevision: %v, ",
+                "(TabletId: %v, ExpectedSourceMountRevision: %v, ExpectedTargetMountRevision: %v, "
                 "ActualSourceMountRevision: %v, ActualTargetMountRevision: %v)",
                 tablet->GetId(),
                 sourceMountRevision,
@@ -5745,7 +5799,7 @@ private:
 
         if (auxiliaryServant.GetMountRevision() != auxiliaryMountRevision) {
             YT_LOG_DEBUG("Mount revision mismatch, will not deallocate servant "
-                "(TabletId: %v, ExpectedAuxiliaryMountRevision: %v, ",
+                "(TabletId: %v, ExpectedAuxiliaryMountRevision: %v, "
                 "ActualSourceMountRevision: %v, ActualTargetMountRevision: %v)",
                 tablet->GetId(),
                 auxiliaryMountRevision,
@@ -5822,6 +5876,14 @@ private:
         if (auto* action = tablet->GetAction()) {
             OnTabletActionDisturbed(action, error);
         }
+    }
+
+    void HydraMaterializeExtraMountConfigKeys(NProto::TReqMaterializeExtraMountConfigKeys* request)
+    {
+        YT_VERIFY(Bootstrap_->IsSecondaryMaster());
+
+        auto tableMountConfigKeys = FromProto<std::vector<TString>>(request->table_mount_config_keys());
+        UpdateExtraMountConfigKeys(std::move(tableMountConfigKeys));
     }
 
     void HydraUpdateTableReplicaStatistics(NProto::TReqUpdateTableReplicaStatistics* request)
@@ -6698,7 +6760,7 @@ private:
             if (multicellManager->IsPrimaryMaster()) {
                 *bundle->ResourceUsage().Remote(cellTag) = newResourceUsage;
             } else {
-                bundle->ResourceUsage().Cluster() = newResourceUsage;
+                bundle->ResourceUsage().Cluster() = newResourceUsage + bundle->ResourceUsage().Local();
             }
         }
     }
@@ -6730,38 +6792,53 @@ private:
 
         YT_LOG_INFO("Sending tablet cell bundle resource usage gossip");
 
-        NProto::TReqSetTabletCellBundleResourceUsage request;
-        request.set_cell_tag(ToProto<int>(multicellManager->GetCellTag()));
-
         const auto& cellManager = Bootstrap_->GetTamedCellManager();
-        for (auto* bundleBase : cellManager->CellBundles(ECellarType::Tablet)) {
-            if (!IsObjectAlive(bundleBase)) {
-                continue;
-            }
 
-            YT_VERIFY(bundleBase->GetType() == EObjectType::TabletCellBundle);
-            auto* bundle = bundleBase->As<TTabletCellBundle>();
-            auto* entry = request.add_entries();
-            ToProto(entry->mutable_bundle_id(), bundle->GetId());
+        auto fillBundles = [&] (auto& request, TCellTag cellTag) {
+            bool isPrimary = multicellManager->IsPrimaryMaster();
 
-            if (multicellManager->IsPrimaryMaster()) {
-                ToProto(entry->mutable_resource_usage(), bundle->ResourceUsage().Cluster());
-            } else {
-                ToProto(entry->mutable_resource_usage(), bundle->ResourceUsage().Local());
+            for (auto* bundleBase : cellManager->CellBundles(ECellarType::Tablet)) {
+                if (!IsObjectAlive(bundleBase)) {
+                    continue;
+                }
+
+                YT_VERIFY(bundleBase->GetType() == EObjectType::TabletCellBundle);
+                auto* bundle = bundleBase->As<TTabletCellBundle>();
+                auto& resourceUsage = bundle->ResourceUsage();
+
+                auto* entry = request.add_entries();
+                ToProto(entry->mutable_bundle_id(), bundle->GetId());
+                ToProto(
+                    entry->mutable_resource_usage(),
+                    isPrimary
+                        ? resourceUsage.Cluster() - *resourceUsage.Remote(cellTag)
+                        : resourceUsage.Local());
             }
-        }
+        };
 
         if (multicellManager->IsPrimaryMaster()) {
-            multicellManager->PostToSecondaryMasters(request, false);
+            for (auto cellTag : multicellManager->GetRegisteredMasterCellTags()) {
+                NProto::TReqSetTabletCellBundleResourceUsage request;
+                request.set_cell_tag(multicellManager->GetCellTag().Underlying());
+
+                fillBundles(request, cellTag);
+
+                multicellManager->PostToMaster(request, cellTag, false);
+            }
         } else {
-            multicellManager->PostToMaster(request, PrimaryMasterCellTagSentinel, false);
+            NProto::TReqSetTabletCellBundleResourceUsage request;
+            request.set_cell_tag(multicellManager->GetCellTag().Underlying());
+
+            fillBundles(request, /*cellTag*/ {});
+
+            multicellManager->PostToPrimaryMaster(request, false);
         }
 
         if (multicellManager->IsMulticell() && multicellManager->IsPrimaryMaster()) {
             NProto::TReqUpdateTabletCellBundleResourceUsage request;
             const auto& hydraManager = Bootstrap_->GetHydraFacade()->GetHydraManager();
             YT_UNUSED_FUTURE(CreateMutation(hydraManager, request)
-                ->CommitAndLog(Logger));
+                ->CommitAndLog(Logger()));
         }
     }
 
@@ -7600,6 +7677,11 @@ void TTabletManager::Reshard(
         trimmedRowCounts);
 }
 
+void TTabletManager::SetCustomRuntimeData(TTableNode* table, NYson::TYsonString data)
+{
+    Impl_->SetCustomRuntimeData(table, std::move(data));
+}
+
 void TTabletManager::ValidateCloneTabletOwner(
     TTabletOwnerBase* sourceNode,
     ENodeCloneMode mode,
@@ -7717,6 +7799,11 @@ void TTabletManager::UpdateExtraMountConfigKeys(std::vector<TString> keys)
     Impl_->UpdateExtraMountConfigKeys(std::move(keys));
 }
 
+void TTabletManager::MaterizlizeExtraMountConfigKeys(TCellTag cellTag) const
+{
+    Impl_->MaterizlizeExtraMountConfigKeys(cellTag);
+}
+
 TTableReplica* TTabletManager::CreateTableReplica(
     TReplicatedTableNode* table,
     const TString& clusterName,
@@ -7802,9 +7889,9 @@ TTabletAction* TTabletManager::CreateTabletAction(
         expirationTimeout);
 }
 
-void TTabletManager::DestroyTabletAction(TTabletAction* action)
+void TTabletManager::ZombifyTabletAction(TTabletAction* action)
 {
-    Impl_->DestroyTabletAction(action);
+    Impl_->ZombifyTabletAction(action);
 }
 
 void TTabletManager::MergeTable(TTableNode* originatingNode, NTableServer::TTableNode* branchedNode)

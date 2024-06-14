@@ -72,19 +72,19 @@ public class SkiffSerializer implements AutoCloseable, Flushable {
         }
     }
 
-    public void serializeUint8(Long number) {
+    public void serializeUint8(long number) {
         serializeByte((byte) (number & 0xFF));
     }
 
-    public void serializeUint16(Long number) {
+    public void serializeUint16(long number) {
         serializeShort((short) (number & 0xFF_FF));
     }
 
-    public void serializeUint32(Long number) {
+    public void serializeUint32(long number) {
         serializeInt((int) (number & 0xFF_FF_FF_FFL));
     }
 
-    public void serializeUint64(Long number) {
+    public void serializeUint64(long number) {
         serializeLong(number);
     }
 
@@ -117,7 +117,7 @@ public class SkiffSerializer implements AutoCloseable, Flushable {
         }
     }
 
-    public void serializeBytes(byte[] bytes) {
+    public void serializeString(byte[] bytes) {
         serializeInt(bytes.length);
         try {
             byteOS.write(bytes);

@@ -17,6 +17,8 @@
 
 #include <yt/yt/ytlib/controller_agent/public.h>
 
+#include <yt/yt/library/tracing/jaeger/sampler.h>
+
 #include <yt/yt/core/concurrency/throughput_throttler.h>
 
 namespace NYT::NExecNode {
@@ -35,7 +37,7 @@ using NScheduler::TIncarnationId;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ExecNodeLogger;
+static constexpr auto& Logger = ExecNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -47,9 +49,9 @@ TControllerAgentConnectorPool::TControllerAgentConnector::TControllerAgentConnec
     , Channel_(ControllerAgentConnectorPool_->CreateChannel(ControllerAgentDescriptor_))
     , HeartbeatExecutor_(New<TRetryingPeriodicExecutor>(
         ControllerAgentConnectorPool_->Bootstrap_->GetControlInvoker(),
-        BIND_NO_PROPAGATE([weakThis = MakeWeak(this)] {
-            auto strongThis = weakThis.Lock();
-            return strongThis ? strongThis->SendHeartbeat() : TError("Controller agent connector is destroyed");
+        BIND_NO_PROPAGATE([this, weakThis = MakeWeak(this)] {
+            auto this_ = weakThis.Lock();
+            return this_ ? SendHeartbeat() : TError("Controller agent connector is destroyed");
         }),
         GetConfig()->HeartbeatExecutor))
     , StatisticsThrottler_(CreateReconfigurableThroughputThrottler(
@@ -189,7 +191,7 @@ TControllerAgentConnectorPool::TControllerAgentConnector::SettleJob(
 
                 default:
                     YT_LOG_FATAL(
-                        "Unexpected value in job_info_or_error (ControllerAgentDescriptor: %v, OperationId: %v, AllocationId: %v, Value: %v",
+                        "Unexpected value in job_info_or_error (ControllerAgentDescriptor: %v, OperationId: %v, AllocationId: %v, Value: %v)",
                         ControllerAgentDescriptor_,
                         operationId,
                         allocationId,
@@ -252,6 +254,9 @@ TError TControllerAgentConnectorPool::TControllerAgentConnector::DoSendHeartbeat
         requestTraceContext = TTraceContext::NewRoot("AgentHeartbeatRequest");
         requestTraceContext->SetRecorded();
         requestTraceContext->AddTag("node_id", ToString(nodeId));
+
+        static const TString ControllerAgentConnectorTracingUserName = "controller_agent_connector";
+        ControllerAgentConnectorPool_->TracingSampler_->SampleTraceContext(ControllerAgentConnectorTracingUserName, requestTraceContext);
     }
 
     auto contextGuard = TTraceContextGuard(requestTraceContext);
@@ -267,13 +272,16 @@ TError TControllerAgentConnectorPool::TControllerAgentConnector::DoSendHeartbeat
 
     PrepareHeartbeatRequest(nodeId, nodeDescriptor, request, context);
 
-    auto requestFuture = request->Invoke();
     YT_LOG_INFO(
         "Heartbeat sent to agent (AgentAddress: %v, IncarnationId: %v)",
         ControllerAgentDescriptor_.Address,
         ControllerAgentDescriptor_.IncarnationId);
 
-    auto responseOrError = WaitFor(std::move(requestFuture));
+    {
+        request->set_sequence_number(SequenceNumber_);
+        ++SequenceNumber_;
+    }
+    auto responseOrError = WaitFor(std::move(request->Invoke()));
     if (!responseOrError.IsOK()) {
         auto [minBackoff, maxBackoff] = HeartbeatExecutor_->GetBackoffInterval();
         YT_LOG_ERROR(
@@ -423,6 +431,7 @@ TControllerAgentConnectorPool::TControllerAgentConnectorPool(
     IBootstrap* const bootstrap)
     : DynamicConfig_(New<TControllerAgentConnectorDynamicConfig>())
     , Bootstrap_(bootstrap)
+    , TracingSampler_(New<TSampler>(DynamicConfig_.Acquire()->TracingSampler))
 { }
 
 void TControllerAgentConnectorPool::Start()
@@ -503,7 +512,7 @@ std::vector<TIncarnationId> TControllerAgentConnectorPool::GetRegisteredAgentInc
     return incarnationIds;
 }
 
-std::optional<TControllerAgentDescriptor> TControllerAgentConnectorPool::GetDescriptorByIncarnationId(TIncarnationId incarnationId) const
+std::optional<TControllerAgentDescriptor> TControllerAgentConnectorPool::FindDescriptorByIncarnationId(TIncarnationId incarnationId) const
 {
     for (const auto& [descriptor, _] : ControllerAgentConnectors_) {
         if (descriptor.IncarnationId == incarnationId) {
@@ -511,6 +520,14 @@ std::optional<TControllerAgentDescriptor> TControllerAgentConnectorPool::GetDesc
         }
     }
     return std::nullopt;
+}
+
+TControllerAgentDescriptor TControllerAgentConnectorPool::GetDescriptorByIncarnationId(TIncarnationId incarnationId) const
+{
+    auto result = FindDescriptorByIncarnationId(incarnationId);
+    YT_VERIFY(result);
+
+    return *result;
 }
 
 IChannelPtr TControllerAgentConnectorPool::CreateChannel(const TControllerAgentDescriptor& agentDescriptor)
@@ -542,6 +559,8 @@ void TControllerAgentConnectorPool::OnConfigUpdated(
     for (const auto& [agentDescriptor, controllerAgentConnector] : ControllerAgentConnectors_) {
         controllerAgentConnector->OnConfigUpdated(newConfig);
     }
+
+    TracingSampler_->UpdateConfig(newConfig->TracingSampler);
 }
 
 void TControllerAgentConnectorPool::OnJobFinished(const TJobPtr& job)

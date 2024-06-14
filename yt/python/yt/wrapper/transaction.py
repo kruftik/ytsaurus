@@ -9,12 +9,7 @@ from yt.common import YT_NULL_TRANSACTION_ID as null_transaction_id
 
 import yt.logger as logger
 
-try:
-    from yt.packages.six import PY3
-    from yt.packages.six.moves._thread import interrupt_main
-except ImportError:
-    from six import PY3
-    from six.moves._thread import interrupt_main
+from _thread import interrupt_main
 
 from copy import deepcopy
 from time import sleep
@@ -105,7 +100,7 @@ class Transaction(object):
 
     def __init__(self, timeout=None, deadline=None, attributes=None, ping=None, interrupt_on_failed=True,
                  transaction_id=None, ping_ancestor_transactions=None, type="master", acquire=None,
-                 ping_period=None, ping_timeout=None,
+                 ping_period=None, ping_timeout=None, prerequisite_transaction_ids=None,
                  client=None):
         if transaction_id == null_transaction_id:
             ping = False
@@ -126,7 +121,20 @@ class Transaction(object):
         self._stack = get_option("_transaction_stack", self._client)
         self._stack.init(get_command_param("transaction_id", self._client),
                          get_command_param("ping_ancestor_transactions", self._client))
+
+        if self.transaction_id is not None and prerequisite_transaction_ids:
+            raise RuntimeError("prerequisite_transaction_ids={!r} must be None or empty when transaction_id is not None".format(prerequisite_transaction_ids))
+
         if self.transaction_id is None:
+            if self._acquire is None:
+                self._acquire = True
+            elif not self._acquire:
+                raise RuntimeError(
+                    'acquire={!r} (false value) is not allowed when '
+                    'transaction_id is not specified'
+                    .format(self._acquire)
+                )
+
             timeout = time_option_to_milliseconds(get_value(
                 timeout,
                 max(
@@ -142,16 +150,8 @@ class Transaction(object):
                                                     attributes=attributes,
                                                     type=type,
                                                     sticky=self.sticky,
+                                                    prerequisite_transaction_ids=prerequisite_transaction_ids,
                                                     client=self._client)
-
-            if self._acquire is None:
-                self._acquire = True
-            elif not self._acquire:
-                raise RuntimeError(
-                    'acquire={!r} (false value) is not allowed when '
-                    'transaction_id is not specified'
-                    .format(self._acquire)
-                )
         elif self._ping:
             from .cypress_commands import get
             timeout = get("#{}/@timeout".format(self.transaction_id), client=client)
@@ -455,7 +455,7 @@ _transaction_aborter = None
 
 def add_transaction_to_abort(transaction):
     global _transaction_aborter
-    if PY3 and sys.is_finalizing():
+    if sys.is_finalizing():
         return
     if _transaction_aborter is None:
         _transaction_aborter = _TransactionAborter()

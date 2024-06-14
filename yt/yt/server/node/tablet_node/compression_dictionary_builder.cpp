@@ -25,7 +25,7 @@
 #include <yt/yt/ytlib/chunk_client/confirming_writer.h>
 #include <yt/yt/ytlib/chunk_client/deferred_chunk_meta.h>
 
-#include <yt/yt/ytlib/misc/memory_reference_tracker.h>
+#include <yt/yt/ytlib/misc/memory_usage_tracker.h>
 
 #include <yt/yt/ytlib/table_client/cached_versioned_chunk_meta.h>
 
@@ -57,7 +57,7 @@ using namespace NTransactionClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -94,7 +94,7 @@ public:
         , StoreIds_(std::move(storeIds))
         , StoreWeights_(std::move(storeWeights))
         , SemaphoreGuard_(std::move(semaphoreGuard))
-        , Logger(TabletNodeLogger
+        , Logger(TabletNodeLogger()
             .WithTag("Policy: %v", Policy_)
             .WithTag("CellId: %v", Slot_->GetCellId())
             .WithTag("%v", tablet->GetLoggingTag()))
@@ -111,7 +111,7 @@ public:
         TClientChunkReadOptions chunkReadOptions{
             .WorkloadDescriptor = TWorkloadDescriptor(WorkloadCategory_),
             .ReadSessionId = TReadSessionId::Create(),
-            .MemoryReferenceTracker = Bootstrap_->GetNodeMemoryReferenceTracker()->WithCategory(
+            .MemoryUsageTracker = Bootstrap_->GetNodeMemoryUsageTracker()->WithCategory(
                 EMemoryCategory::TabletBackground)
         };
 
@@ -672,7 +672,7 @@ private:
                 columnInfo.Dictionary = dictionaryOrError.Value();
             } else {
                 YT_LOG_DEBUG(dictionaryOrError,
-                    "Compression dictionary training error occurred; builder will skip corresponding column ",
+                    "Compression dictionary training error occurred; builder will skip corresponding column "
                     "(ColumnId: %v)",
                     columnId);
             }

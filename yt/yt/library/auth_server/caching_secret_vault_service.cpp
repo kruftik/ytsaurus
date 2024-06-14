@@ -9,7 +9,7 @@ namespace NYT::NAuth {
 
 using namespace NConcurrency;
 
-static const auto& Logger = AuthLogger;
+static constexpr auto& Logger = AuthLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -27,7 +27,7 @@ public:
         NProfiling::TProfiler profiler)
         : TAsyncExpiringCache(
             config->Cache,
-            AuthLogger.WithTag("Cache: SecretVault"),
+            AuthLogger().WithTag("Cache: SecretVault"),
             std::move(profiler))
         , Underlying_(std::move(underlying))
     { }
@@ -49,12 +49,12 @@ public:
         return AllSet(asyncResults);
     }
 
-    TFuture<TString> GetDelegationToken(TDelegationTokenRequest request) override
+    TFuture<TDelegationTokenResponse> GetDelegationToken(TDelegationTokenRequest request) override
     {
         return Underlying_->GetDelegationToken(std::move(request));
     }
 
-    void RevokeDelegationToken(TRevokeDelegationTokenRequest request) noexcept override
+    void RevokeDelegationToken(TRevokeDelegationTokenRequest request) override
     {
         Underlying_->RevokeDelegationToken(std::move(request));
     }

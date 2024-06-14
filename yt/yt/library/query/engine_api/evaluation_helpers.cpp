@@ -1,7 +1,5 @@
 #include "evaluation_helpers.h"
 
-#include "position_independent_value_transfer.h"
-
 #include <yt/yt/library/query/base/private.h>
 #include <yt/yt/library/query/base/query.h>
 #include <yt/yt/library/query/base/query_helpers.h>
@@ -12,7 +10,7 @@ using namespace NConcurrency;
 using namespace NTableClient;
 using namespace NWebAssembly;
 
-static const auto& Logger = QueryClientLogger;
+static constexpr auto& Logger = QueryClientLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -104,139 +102,6 @@ TString ConvertLikePatternToRegex(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-constexpr ssize_t BufferLimit = 512_KB;
-
-struct TTopCollectorBufferTag
-{ };
-
-////////////////////////////////////////////////////////////////////////////////
-
-TTopCollector::TTopCollector(
-    i64 limit,
-    TCompartmentFunction<TComparerFunction> comparer,
-    size_t rowSize,
-    IMemoryChunkProviderPtr memoryChunkProvider)
-    : Comparer_(comparer)
-    , RowSize_(rowSize)
-    , MemoryChunkProvider_(std::move(memoryChunkProvider))
-{
-    Rows_.reserve(limit);
-}
-
-std::pair<const TPIValue*, int> TTopCollector::Capture(const TPIValue* row)
-{
-    if (EmptyContextIds_.empty()) {
-        if (GarbageMemorySize_ > TotalMemorySize_ / 2) {
-            // Collect garbage.
-
-            std::vector<std::vector<size_t>> contextsToRows(Contexts_.size());
-            for (size_t rowId = 0; rowId < Rows_.size(); ++rowId) {
-                contextsToRows[Rows_[rowId].second].push_back(rowId);
-            }
-
-            auto context = MakeExpressionContext(TTopCollectorBufferTag(), MemoryChunkProvider_);
-
-            TotalMemorySize_ = 0;
-            AllocatedMemorySize_ = 0;
-            GarbageMemorySize_ = 0;
-
-            for (size_t contextId = 0; contextId < contextsToRows.size(); ++contextId) {
-                for (auto rowId : contextsToRows[contextId]) {
-                    auto* oldRow = Rows_[rowId].first;
-                    i64 savedSize = context.GetSize();
-                    auto* newRow = CapturePIValueRange(
-                        &context,
-                        MakeRange(oldRow, RowSize_),
-                        NWebAssembly::EAddressSpace::WebAssembly,
-                        NWebAssembly::EAddressSpace::WebAssembly,
-                        /*captureValues*/ true)
-                        .Begin();
-                    Rows_[rowId].first = newRow;
-                    AllocatedMemorySize_ += context.GetSize() - savedSize;
-                }
-
-                TotalMemorySize_ += context.GetCapacity();
-
-                if (context.GetSize() < BufferLimit) {
-                    EmptyContextIds_.push_back(contextId);
-                }
-
-                std::swap(context, Contexts_[contextId]);
-                context.Clear();
-            }
-        } else {
-            // Allocate context and add to emptyContextIds.
-            EmptyContextIds_.push_back(Contexts_.size());
-            Contexts_.push_back(MakeExpressionContext(TTopCollectorBufferTag(), MemoryChunkProvider_));
-        }
-    }
-
-    YT_VERIFY(!EmptyContextIds_.empty());
-
-    auto contextId = EmptyContextIds_.back();
-    auto& context = Contexts_[contextId];
-
-    auto savedSize = context.GetSize();
-    auto savedCapacity = context.GetCapacity();
-
-    TPIValue* capturedRow = CapturePIValueRange(
-        &context,
-        MakeRange(row, RowSize_),
-        NWebAssembly::EAddressSpace::WebAssembly,
-        NWebAssembly::EAddressSpace::WebAssembly,
-        /*captureValues*/ true)
-        .Begin();
-
-    AllocatedMemorySize_ += context.GetSize() - savedSize;
-    TotalMemorySize_ += context.GetCapacity() - savedCapacity;
-
-    if (context.GetSize() >= BufferLimit) {
-        EmptyContextIds_.pop_back();
-    }
-
-    return std::pair(capturedRow, contextId);
-}
-
-void TTopCollector::AccountGarbage(const TPIValue* row)
-{
-    row = ConvertPointerFromWasmToHost(row, RowSize_);
-    GarbageMemorySize_ += GetUnversionedRowByteSize(RowSize_);
-    for (int index = 0; index < static_cast<int>(RowSize_); ++index) {
-        auto& value = row[index];
-        if (IsStringLikeType(EValueType(value.Type))) {
-            GarbageMemorySize_ += value.Length;
-        }
-    }
-}
-
-void TTopCollector::AddRow(const TPIValue* row)
-{
-    if (Rows_.size() < Rows_.capacity()) {
-        auto capturedRow = Capture(row);
-        Rows_.emplace_back(capturedRow);
-        std::push_heap(Rows_.begin(), Rows_.end(), Comparer_);
-    } else if (!Rows_.empty() && !Comparer_(Rows_.front().first, row)) {
-        auto capturedRow = Capture(row);
-        std::pop_heap(Rows_.begin(), Rows_.end(), Comparer_);
-        AccountGarbage(Rows_.back().first);
-        Rows_.back() = capturedRow;
-        std::push_heap(Rows_.begin(), Rows_.end(), Comparer_);
-    }
-}
-
-std::vector<const TPIValue*> TTopCollector::GetRows() const
-{
-    std::vector<const TPIValue*> result;
-    result.reserve(Rows_.size());
-    for (const auto& [value, _] : Rows_) {
-        result.push_back(value);
-    }
-    std::sort(result.begin(), result.end(), Comparer_);
-    return result;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
 TMultiJoinClosure::TItem::TItem(
     IMemoryChunkProviderPtr chunkProvider,
     size_t keySize,
@@ -273,7 +138,7 @@ void TCGQueryInstance::Run(
     TRange<TPIValue> literalValues,
     TRange<void*> opaqueData,
     TRange<size_t> opaqueDataSizes,
-    TExecutionContext* context)
+    TExecutionContext* context) const
 {
     Callback_(literalValues, opaqueData, opaqueDataSizes, context, Compartment_.get());
 }
@@ -309,7 +174,7 @@ void TCGExpressionInstance::Run(
     TRange<size_t> opaqueDataSizes,
     TValue* result,
     TRange<TValue> inputRow,
-    const TRowBufferPtr& buffer)
+    const TRowBufferPtr& buffer) const
 {
     Callback_(literalValues, opaqueData, opaqueDataSizes, result, inputRow, buffer, Compartment_.get());
 }
@@ -349,22 +214,22 @@ TCGAggregateInstance::TCGAggregateInstance(
     , Compartment_(std::move(compartment))
 { }
 
-void TCGAggregateInstance::RunInit(const TRowBufferPtr& buffer, TValue* state)
+void TCGAggregateInstance::RunInit(const TRowBufferPtr& buffer, TValue* state) const
 {
     Callbacks_.Init(buffer, state, Compartment_.get());
 }
 
-void TCGAggregateInstance::RunUpdate(const TRowBufferPtr& buffer, TValue* state, TRange<TValue> arguments)
+void TCGAggregateInstance::RunUpdate(const TRowBufferPtr& buffer, TValue* state, TRange<TValue> arguments) const
 {
     Callbacks_.Update(buffer, state, arguments, Compartment_.get());
 }
 
-void TCGAggregateInstance::RunMerge(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState)
+void TCGAggregateInstance::RunMerge(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState) const
 {
     Callbacks_.Merge(buffer, firstState, secondState, Compartment_.get());
 }
 
-void TCGAggregateInstance::RunFinalize(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState)
+void TCGAggregateInstance::RunFinalize(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState) const
 {
     Callbacks_.Finalize(buffer, firstState, secondState, Compartment_.get());
 }
@@ -410,14 +275,12 @@ std::pair<TQueryPtr, TDataSource> GetForeignQuery(
             YT_LOG_DEBUG("Using join via prefix ranges");
             std::vector<TRow> prefixKeys;
             for (auto key : keys) {
-                prefixKeys.push_back(permanentBuffer->CaptureRow(MakeRange(key.Begin(), foreignKeyPrefix), false));
+                prefixKeys.push_back(permanentBuffer->CaptureRow(
+                    MakeRange(key.Begin(), foreignKeyPrefix),
+                    /*captureValues*/ false));
             }
             prefixKeys.erase(std::unique(prefixKeys.begin(), prefixKeys.end()), prefixKeys.end());
             dataSource.Keys = MakeSharedRange(std::move(prefixKeys), std::move(permanentBuffer));
-        }
-
-        for (size_t index = 0; index < foreignKeyPrefix; ++index) {
-            dataSource.Schema.push_back(foreignEquations[index]->LogicalType);
         }
 
         newQuery->InferRanges = false;

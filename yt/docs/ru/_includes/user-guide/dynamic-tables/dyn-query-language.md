@@ -317,12 +317,12 @@ $ echo '{a=0;b={c=[]}}' | yt insert-rows --table '//tmp/test' --format yson
 $ echo '{a=1;b={c=[1;2;3]}}' | yt insert-rows --table '//tmp/test' --format yson
 $ echo '{a=2;b={c=[4]}}' | yt insert-rows --table '//tmp/test' --format yson
 
-$ yt select-rows 't.b.c from `//tmp/test` as t' --syntax-version 2 --format json 
+$ yt select-rows 't.b.c from `//tmp/test` as t' --syntax-version 2 --format json
 {"t.b.c":[]}
 {"t.b.c":[1,2,3]}
 {"t.b.c":[4]}
 
-$ yt select-rows 't.b.c[0] from `//tmp/test` as t' --syntax-version 2 --format json 
+$ yt select-rows 't.b.c[0] from `//tmp/test` as t' --syntax-version 2 --format json
 {"t.b.c[0]":null}
 {"t.b.c[0]":1}
 {"t.b.c[0]":4}
@@ -344,15 +344,17 @@ $ yt select-rows 't.b.c[0] from `//tmp/test` as t' --syntax-version 2 --format j
     Функции принимают два аргумента: `(yson, path)`, где:
     - `yson` — значение типа `any`, содержащее YSON;
     - `path` — строка, содержащая путь до нужного поля в формате [YPATH](../../../user-guide/storage/ypath.md).
-    
+
     Версия с префиксом `try_` в случае отсутствия поля нужного типа по заданному пути возвращает `NULL`. Версия без `try_` возвращает ошибку при отсутствии поля.
-    
+
     Пример: для строки таблицы `{column=<attr=4>{key3=2;k={k2=<b=7>3;k3=10};lst=<a=[1;{a=3};{b=7u}]>[0;1;<a={b=4}>2]}}` `try_get_uint64(column, "/lst/@a/2/b")` вернёт значение `7u`.
-2. `list_contains(list, value) :: any -> (string | int64 | uint64| boolean) -> boolean`
+2. `list_contains(list, value) :: any -> (string | int64 | uint64 | boolean) -> boolean`
     Ищет `value` в YSON-списке `list`, имеющем тип `any`. Значение `value` скалярного типа. Список не обязан быть гомогенным (т. е. может содержать значения разных типов), сравнение выполняется с учётом типа.
-3. `any_to_yson_string(yson) :: any -> string`
+3.  `list_has_intersection(list, list) :: any -> any -> boolean`
+    Принимает на вход два YSON-списка и возвращает `true`, если они имеют хотя бы один общий элемент. Списки обязаны быть гомогенными.
+4. `any_to_yson_string(yson) :: any -> string`
     Преобразует значение типа `any` в строку, содержащую его binary-[YSON](../../../user-guide/storage/yson.md) представление.
-4. `yson_length(yson) :: any -> int64`
+5. `yson_length(yson) :: any -> int64`
     Вычисляет количество элементов в списке или словаре.
 
 ##### Формирование YSON
@@ -658,6 +660,23 @@ $ yt select-rows 't.b.c[0] from `//tmp/test` as t' --syntax-version 2 --format j
 - `range_expansion_limit` — максимальное количество диапазонов, которое будет выведено из условия WHERE;
 - `fail_on_incomplete_result` — определяет поведение в случае превышения `input_row_limit` или `output_row_limit`;
 - `memory_limit_per_node` — ограничение на объём памяти, доступной запросу на одном узле кластера.
+
+### Именованные параметры
+
+В тексте запроса можно использовать parameter placeholders. Пример использования:
+
+```sql
+a from `//t` where b = {first} and (c, d) > {second}
+```
+
+Параметры `first` и `second` задаются через YSON-словарь, который можно указать в параметре запроса `placeholder_values`:
+
+```python
+client.select_rows(
+  "a from `//t` where b = {first} and (c, d) > {second}",
+  placeholder_values={'first': 1, 'second': [2, 'b']},
+)
+```
 
 ### Распределение ресурсов между запросами
 Для выполнении запросов используется fair share CPU планировщик. Планирование запросов осуществляется на каждой ноде независимо. По умолчанию каждый исполняемый запрос в пределах ноды получает равные ресурсы (CPU). Благодаря этому нода, загруженная несколькими тяжелыми запросами, сможет предсказуемо быстро выполнить легкий запрос. Однако это не спасает от ситуации, когда ноду кластера загружают очень большим количеством запросов. В таком случае запросы будут замедляться пропорционально количеству выполняемых запросов в единицу времени. Например, один из пользователей системы может задать множество запросов и получить большую часть CPU. В качестве мер противодействия такой ситуации есть поддержка двухуровнего fair share: кроме разделения ресурса (CPU) между запросами, запросы можно объединять в группы и разделять ресурс между группами запросов. Для объединения запросов в группы (например, по пользователю) предусмотрена возможность указания вычислительного пула (параметр запроса `execution_pool`). Запросы с одинаковым параметрам `execution_pool` попадут в одну группу. Каждая группа будет получать свою долю ресурсов. Внутри группы ресурсы будут делиться между отдельными запросами.

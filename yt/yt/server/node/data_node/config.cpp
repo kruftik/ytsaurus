@@ -100,7 +100,20 @@ void TChunkLocationConfig::ApplyDynamicInplace(const TChunkLocationDynamicConfig
     }
     UpdateYsonStructField(ThrottleDuration, dynamicConfig.ThrottleDuration);
 
+    UpdateYsonStructField(EnableUncategorizedThrottler, dynamicConfig.EnableUncategorizedThrottler);
+    UpdateYsonStructField(UncategorizedThrottler, dynamicConfig.UncategorizedThrottler);
+
     UpdateYsonStructField(CoalescedReadMaxGapSize, dynamicConfig.CoalescedReadMaxGapSize);
+
+    UpdateYsonStructField(ReadMemoryLimit, dynamicConfig.ReadMemoryLimit);
+
+    UpdateYsonStructField(WriteMemoryLimit, dynamicConfig.WriteMemoryLimit);
+
+    UpdateYsonStructField(PendingReadIOLimit, dynamicConfig.PendingReadIOLimit);
+
+    UpdateYsonStructField(PendingWriteIOLimit, dynamicConfig.PendingWriteIOLimit);
+
+    UpdateYsonStructField(SessionCountLimit, dynamicConfig.SessionCountLimit);
 }
 
 void TChunkLocationConfig::Register(TRegistrar registrar)
@@ -112,10 +125,29 @@ void TChunkLocationConfig::Register(TRegistrar registrar)
     registrar.Parameter("throttlers", &TThis::Throttlers)
         .Default();
 
+    registrar.Parameter("enable_uncategorized_throttler", &TThis::EnableUncategorizedThrottler)
+        .Default(false);
+
+    registrar.Parameter("uncategorized_throttler", &TThis::UncategorizedThrottler)
+        .DefaultNew();
+
     registrar.Parameter("io_engine_type", &TThis::IOEngineType)
         .Default(NIO::EIOEngineType::ThreadPool);
     registrar.Parameter("io_config", &TThis::IOConfig)
         .Optional();
+
+    registrar.Parameter("read_memory_limit", &TThis::ReadMemoryLimit)
+        .Default(10_GB);
+    registrar.Parameter("write_memory_limit", &TThis::WriteMemoryLimit)
+        .Default(10_GB);
+
+    registrar.Parameter("pending_io_read_limit", &TThis::PendingReadIOLimit)
+        .Default(10_GB);
+    registrar.Parameter("pending_io_write_limit", &TThis::PendingWriteIOLimit)
+        .Default(10_GB);
+
+    registrar.Parameter("session_count_limit", &TThis::SessionCountLimit)
+        .Default(1000);
 
     registrar.Parameter("throttle_duration", &TThis::ThrottleDuration)
         .Default(TDuration::Seconds(30));
@@ -156,8 +188,25 @@ void TChunkLocationDynamicConfig::Register(TRegistrar registrar)
         .Optional();
     registrar.Parameter("throttle_duration", &TThis::ThrottleDuration)
         .Optional();
+    registrar.Parameter("enable_uncategorized_throttler", &TThis::EnableUncategorizedThrottler)
+        .Optional();
+    registrar.Parameter("uncategorized_throttler", &TThis::UncategorizedThrottler)
+        .Optional();
     registrar.Parameter("coalesced_read_max_gap_size", &TThis::CoalescedReadMaxGapSize)
         .GreaterThanOrEqual(0)
+        .Optional();
+
+    registrar.Parameter("read_memory_limit", &TThis::ReadMemoryLimit)
+        .Optional();
+    registrar.Parameter("write_memory_limit", &TThis::WriteMemoryLimit)
+        .Optional();
+
+    registrar.Parameter("pending_io_read_limit", &TThis::PendingReadIOLimit)
+        .Optional();
+    registrar.Parameter("pending_io_write_limit", &TThis::PendingWriteIOLimit)
+        .Optional();
+
+    registrar.Parameter("session_count_limit", &TThis::SessionCountLimit)
         .Optional();
 }
 
@@ -309,6 +358,9 @@ void TLayerLocationConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("location_is_absolute", &TThis::LocationIsAbsolute)
         .Default(true);
+
+    registrar.Parameter("resides_on_tmpfs", &TThis::ResidesOnTmpfs)
+        .Default(false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -416,6 +468,8 @@ void TMasterConnectorDynamicConfig::Register(TRegistrar registrar)
         .Default(1000000);
     registrar.Parameter("enable_profiling", &TThis::EnableProfiling)
         .Default(false);
+    registrar.Parameter("location_uuid_to_disable_during_full_heartbeat", &TThis::LocationUuidToDisableDuringFullHeartbeat)
+        .Default();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -923,9 +977,6 @@ void TDataNodeDynamicConfig::Register(TRegistrar registrar)
     registrar.Parameter("abort_on_location_disabled", &TThis::AbortOnLocationDisabled)
         .Default(false);
 
-    registrar.Parameter("track_memory_after_session_completion", &TThis::TrackMemoryAfterSessionCompletion)
-        .Default(true);
-
     registrar.Parameter("track_system_jobs_memory", &TThis::TrackSystemJobsMemory)
         .Default(true);
 
@@ -933,7 +984,7 @@ void TDataNodeDynamicConfig::Register(TRegistrar registrar)
         .Default();
 
     registrar.Parameter("use_disable_send_blocks", &TThis::UseDisableSendBlocks)
-        .Default(false);
+        .Default(true);
 
     registrar.Parameter("p2p", &TThis::P2P)
         .Optional();

@@ -32,8 +32,6 @@ print(client.list("/"))
 
 Существует возможность передавать заданный набор параметров во все запросы, задаваемые через клиент (например, `trace_id`). Для этого есть специальный метод [create_client_with_command_params](https://pydoc.ytsaurus.tech/yt.wrapper.html?highlight=create_client_with#yt.wrapper.client.create_client_with_command_params), который позволяет указать произвольный набор опций, которые будут передавать во все вызовы API.
 
-<!--Пример todo использования данной функциональности для указания предварительных условий.-->
-
 #### Потокобезопасность { #threadsafety }
 
 Даже если вы пользуетесь не потоками (threading), а процессами (multiprocessing), то совет также остается в силе. Одна из причин: если в главном процессе вы уже задавали запрос к кластеру, то был инициализирован connection pool до этого кластера в рамках глобального клиента. Поэтому после fork процессы будут использовать одни и те же сокеты при общении с кластером, что приведет к разнообразным проблемам.
@@ -105,9 +103,11 @@ client = yt.YtClient(config=my_config)
 
 Для изменения настроек логирования необходимо изменять `LOGGER`.
 
-Первичная настройка логгера (при загрузке модуля) регулируется переменными окружения `YT_LOG_LEVEL` и `YT_LOG_PATTERN`. Переменная `YT_LOG_LEVEL`, регулирующая уровень логирования, принимает одно из значений `DEBUG`, `INFO`, `WARNING`, `ERROR`, переменная `YT_LOG_PATTERN`, регулирующая форматирование лог-сообщений принимает строку форматирования логгера, подробнее можно прочитать в [документации](https://docs.python.org/3/library/logging.html#logging.Formatter) по Python.
+Первичная настройка логгера (при загрузке модуля) регулируется переменными окружения `YT_LOG_LEVEL`, `YT_LOG_PATTERN` и `YT_LOG_PATH`.
+Переменная `YT_LOG_LEVEL`, регулирующая уровень логирования, принимает одно из значений `DEBUG`, `INFO`, `WARNING`, `ERROR`, переменная `YT_LOG_PATTERN`, регулирующая форматирование лог-сообщений принимает строку форматирования логгера, подробнее можно прочитать в [документации](https://docs.python.org/3/library/logging.html#logging.Formatter) по Python, а переменная окружения `YT_LOG_PATH` позволяет указать путь до лог-файла.
 
 По умолчанию уровень логирования равен INFO, и логирование происходит в stderr.
+
 
 
 #### Настройка токена { #configuration_token }
@@ -186,7 +186,7 @@ client = yt.YtClient(config=my_config)
 
 Подробнее про форматы можно прочитать [в разделе](../../../user-guide/storage/formats.md).
 
-Для каждого есть имеется отдельный класс:
+Для каждого формата существует отдельный класс:
   - [YsonFormat](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.format.YsonFormat);
   - [JsonFormat](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.format.JsonFormat);
   - [DsvFormat](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.format.DsvFormat);
@@ -504,7 +504,7 @@ class Row:
 
 #### Схемы { #table_schema }
 
-Каждая таблица в YT имеет [схему](../../../user-guide/storage/static-schema.md). В Python API есть соответствующий класс [TableSchema](https://pydoc.yt.yandex.net/yt.wrapper.schema.html#yt.wrapper.schema.table_schema.TableSchema). Основной способ создания схемы — из [датакласса](#dataclass): `schema = TableSchema.from_row_type(Row)`, в частности, это происходит автоматически при записи таблицы.Однако иногда приходится собирать схему вручную, это может быть удобно делать с помощью builder-интерфейса, например:
+Каждая таблица в {{product-name}} имеет [схему](../../../user-guide/storage/static-schema.md). В Python API есть соответствующий класс [TableSchema](https://pydoc.ytsaurus.tech/yt.wrapper.schema.html#yt.wrapper.schema.table_schema.TableSchema). Основной способ создания схемы — из [датакласса](#dataclass): `schema = TableSchema.from_row_type(Row)`, в частности, это происходит автоматически при записи таблицы. Однако иногда приходится собирать схему вручную, это может быть удобно делать с помощью builder-интерфейса, например:
 
 ```python
 import yt.type_info.typing as ti
@@ -851,28 +851,8 @@ sys     1m40.660s
 **A:** На то есть две причины:
 Входной поток нужно разбить на строки. В JSON это можно сделать просто, поделив его по `\n`, в формате YSON это делается намного сложнее. Поскольку эта операция однопоточная, она является слабым местом и вся запись блокируется ей.
 
+
 ### Работа с транзакциями и локами { #transaction_commands }
-
-- [start_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.start_transaction) — создать новую транзакцию с заданным таймаутом (в мс);
-
-- [abort_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.abort_transaction) — прервать транзакцию с данным ID;
-
-- [commit_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.commit_transaction) — закоммитить транзакцию с данным ID;
-
-- [ping_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.ping_transaction) — выполнить пинг транзакции для продления срока жизни.
-
-
-Эти функции дают исключение [YtResponseError](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.errors.YtResponseError) с `.is_resolve_error() == True` в случае, если транзакция не найдена.
-
-- [lock](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.lock) — берет лок на указанный узел под текущей транзакцией, записанной в `TRANSACTION_ID`. В случае waitable лока и указанного `wait_for` ждет взятия лока в течение `wait_for` миллисекунд. Если дождаться не удалось — возвращает исключение.
-
-- [unlock](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.unlock) — снимает с указанного узла все [явные](../../../user-guide/storage/transactions.md#implicit_locks) локи, взятые текущей транзакцией (записанной в `TRANSACTION_ID`), — как уже взятые, так и ожидающие в очереди. Если локов нет, не имеет эффекта. Если разблокировка невозможна (потому что заблокированная версия узла содержит изменения по сравнению с оригинальной версией), возвращает исключение.
-
-  {% note info "Примечание" %}
-
-  Завершение транзакции (как успешное, так и нет) снимает все взятые ею блокировки; `unlock` нужен лишь в тех случаях, когда необходимо разблокировать узел, не завершая транзакции.
-
-  {% endnote %}
 
 - [Transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.transaction.Transaction) — **однопоточный** класс-обертка, для создания, коммита или аборта транзакций. Поддерживает синтаксис контекстного менеджера (`with` statement), то есть в случае успешного выхода из scope транзакция коммитится, а иначе прерывается. Все команды в scope запускаются под указанной транзакцией. Поддерживается возможность создавать вложенные scope'ы. Параметр `ping` (по умолчанию равен `True`) в конструкторе отвечает за запуск пингующего треда. При отсутствии пинга операция будет принудительно отменена по истечении таймаута.
 
@@ -902,6 +882,31 @@ with yt.Transaction():
    3. `interrupt_main`: бросить исключение `KeyboardInterrupt` в главном треде
    4. `send_signal`: послать процессу сигнал `SIGUSR1`.
    5. `terminate_process`: прибить процесс
+
+
+Транзакциями можно управлять и на более низком уровне (в отличии от контекстного менеджера `Transaction` такие транзакции не прорастают автоматически в команды):
+
+- [start_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.start_transaction) — создать новую транзакцию с заданным таймаутом (в мс);
+
+- [abort_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.abort_transaction) — прервать транзакцию с данным ID;
+
+- [commit_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.commit_transaction) — закоммитить транзакцию с данным ID;
+
+- [ping_transaction](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.ping_transaction) — выполнить пинг транзакции для продления срока жизни.
+
+
+Эти функции дают исключение [YtResponseError](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.errors.YtResponseError) с `.is_resolve_error() == True` в случае, если транзакция не найдена.
+
+- [lock](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.lock) — берет лок на указанный узел под текущей транзакцией. В случае waitable лока и указанного `wait_for` ждет взятия лока в течение `wait_for` миллисекунд. Если дождаться не удалось — возвращает исключение.
+
+- [unlock](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.client_impl.YtClient.unlock) — снимает с указанного узла все [явные](../../../user-guide/storage/transactions.md#implicit_locks) локи, взятые текущей транзакцией. Как уже взятые, так и ожидающие в очереди. Если локов нет, не имеет эффекта. Если разблокировка невозможна (потому что заблокированная версия узла содержит изменения по сравнению с оригинальной версией), возвращает исключение.
+
+  {% note info "Примечание" %}
+
+  Завершение транзакции (как успешное, так и нет) снимает все взятые ею блокировки; `unlock` нужен лишь в тех случаях, когда необходимо разблокировать узел, не завершая транзакции.
+
+  {% endnote %}
+
 
 ### Запуск операций { #run_operation_commands }
 
@@ -1176,9 +1181,17 @@ yt.get_attribute("//sys/groups/testers", "members")
 
 Для того, чтобы запустить операцию, необходимо описать специальный класс-наследник `yt.wrapper.TypedJob` и передать объект данного класса в [функцию](#run_operation_commands) запуска операции (либо указать в соответствующем поле [SpecBuilder-а](#spec_builders)).
 
- В классе джоба обязательно должен быть определен метод `__call__(self, row)` (для mapper-а) или `__call__(self, rows)` (для reducer-а). На вход данному методу приходят строки таблицы (в случае reducer-а один вызов `__call__` соответствует набору строк с одинаковым ключом). Он обязан вернуть (**с помощью `yield`**) строки которые нужно записать в выходную таблицу. Если выходных таблиц несколько, нужно использовать класс-обёртку `yt.wrapper.OutputRow`, конструктор которого принимает записываемую строку и `table_index` в виде именованного параметра (смотрите [пример](../../../api/python/examples.md#table_switches) в туториале).
+В классе джоба обязательно должен быть определен метод `__call__(self, row)` (для mapper-а) или `__call__(self, rows)` (для reducer-а). На вход данному методу приходят строки таблицы (в случае reducer-а один вызов `__call__` соответствует набору строк с одинаковым ключом). Он обязан вернуть (**с помощью `yield`**) строки, которые нужно записать в выходную таблицу. Если выходных таблиц несколько, нужно использовать класс-обёртку `yt.wrapper.OutputRow`, конструктор которого принимает записываемую строку и `table_index` в виде именованного параметра (смотрите [пример](../../../api/python/examples.md#table_switches) в туториале).
 
-Дополнительно можно определить методы `start(self)` (будет вызван ровно один раз перед обработкой записей джоба) и `finish(self)` (будет вызван один раз после обработки записей джоба), которые, как и `__call__`, могут генерировать (с помощью `yield`) новые записи, что позволяет, например, удобно делать агрегирующие операции (не вызываются для "честных" агрегирующих операций типа `@yt.aggregator`). А также метод [`.prepare_operation(self, context, preparer)`](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.prepare_operation.TypedJob.prepare_operation). Он используется для указания типов строк входных и выходных таблиц, а также для модификации спеки операции. Более подробно смотрите [ниже](#prepare_operation) и примеры в туториале: [раз](../../../api/python/examples.md#prepare_operation) и [два](#examples.md#grep).
+Дополнительно можно определить методы:
+- `start(self)` — будет вызван ровно один раз перед обработкой записей джоба;
+- `finish(self)` — будет вызван один раз после обработки записей джоба.
+
+Эти методы, как и `__call__`, могут генерировать с помощью `yield` новые записи. Это позволяет делать буферизацию или какое-то накапливание данных. Эти методы не вызываются для операций, помеченных `@yt.aggregator` и получающих весь вход целиком.
+
+Также можно определить метод [.prepare_operation(self, context, preparer)](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.prepare_operation.TypedJob.prepare_operation). Он используется для указания типов строк входных и выходных таблиц, а также для модификации спеки операции. Для более подробной информации смотрите раздел [Подготовка операции из джоба](#prepare_operation), а также изучите примеры:
+- [{#T}](../../../api/python/examples.md#prepare_operation);
+- [{#T}](../../../api/python/examples.md#grep).
 
 ### Подготовка операции из джоба { #prepare_operation }
 
@@ -1189,7 +1202,7 @@ yt.get_attribute("//sys/groups/testers", "members")
 
 Объект [`context`](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.prepare_operation.OperationPreparationContext) позволяет получать информацию о входных и выходных потоках: их количество, схемы и пути к таблицам.
 
-смотрите примеры в туториале: [раз](../../../api/python/examples.md#prepare_operation) и [два](#examples.md#grep).
+смотрите примеры в туториале: [раз](../../../api/python/examples.md#prepare_operation) и [два](../../../api/python/examples.md#grep).
 
 Если запускается MapReduce с несколькими промежуточными потоками, то требуется также переопределить метод [.get_intermediate_stream_count(self)](https://pydoc.ytsaurus.tech/yt.wrapper.html#yt.wrapper.prepare_operation.TypedJob.get_intermediate_stream_count), вернув из него количество промежуточных потоков. Смотрите [пример](../../../api/python/examples.md#map_reduce_multiple_intermediate_streams).
 
@@ -1310,8 +1323,8 @@ if __name__ == "__main__":
 
 ### Porto-слои { #porto_layers }
 
-При запуске операции можно указать, какой [образ ФС](../../../user-guide/data-processing/porto/layer-paths.md) необходимо подготовить перед запуском джобов.
-Есть некоторый набор [готовых слоёв](../../../user-guide/data-processing/porto/layer-paths.md#gotovye-sloi-v-kiparise), которые находятся по пути `//porto_layers`.
+При запуске операции можно указать, какой [образ ФС](../../../user-guide/data-processing/layers/layer-paths.md) необходимо подготовить перед запуском джобов.
+Есть некоторый набор [готовых слоёв](../../../user-guide/data-processing/layers/layer-paths.md#gotovye-sloi-v-kiparise), которые находятся по пути `//porto_layers`.
 
 Указать путь до нужного слоя можно через параметр `layer_paths` в спеке джоба, например, так:
 ```python
@@ -1406,13 +1419,14 @@ def reducer(key, rows):
 
    ```python
    import yt.yson as yson
-   s = yson.YsonString("a")
+   s = yson.YsonString(b"a")
+   s == b"a" # True
    s.attributes["b"] = "c"
-   s == "a" # False
+   s == b"a" # False
 
-   str(s) == "a" # True
+   bytes(s) == b"a" # True
 
-   other_s = yson.YsonString("a")
+   other_s = yson.YsonString(b"a")
    other_s == s # False
 
    other_s.attributes["b"] = "c"

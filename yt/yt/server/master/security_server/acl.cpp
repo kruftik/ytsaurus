@@ -26,7 +26,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SecurityServerLogger;
+static constexpr auto& Logger = SecurityServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -164,6 +164,11 @@ static void DoDeserializeAclOrThrow(
             if (!IsObjectAlive(subject)) {
                 tmpMissingSubjects.emplace_back(name);
                 continue;
+            }
+            if (subject->IsUser()) {
+                subject->AsUser()->AlertIfPendingRemoval(
+                    Format("User pending for removal was mentioned in ACL (User: %v)",
+                    subject->GetName()));
             }
 
             ace.Subjects.push_back(subject);

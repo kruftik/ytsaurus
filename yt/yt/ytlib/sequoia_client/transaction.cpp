@@ -28,8 +28,11 @@
 #include <yt/yt/client/table_client/row_buffer.h>
 #include <yt/yt/client/table_client/wire_protocol.h>
 #include <yt/yt/client/table_client/record_descriptor.h>
+#include <yt/yt/client/table_client/name_table.h>
 
 #include <yt/yt/client/tablet_client/table_mount_cache.h>
+
+#include <yt/yt/library/query/engine_api/column_evaluator.h>
 
 #include <yt/yt/core/actions/future.h>
 
@@ -54,24 +57,9 @@ using namespace NTabletClient;
 using namespace NTransactionClient;
 using namespace NYPath;
 
+using NNative::IClientPtr;
+
 ////////////////////////////////////////////////////////////////////////////////
-
-#define FOR_EACH_TRANSACTION_ACTION_TYPE() \
-    XX(TReqCloneNode, 100) \
-    XX(TReqDetachChild, 200) \
-    XX(TReqRemoveNode, 300) \
-    XX(TReqCreateNode, 400) \
-    XX(TReqAttachChild, 500) \
-    XX(TReqSetNode, 600)
-
-#define XX(type, priority) \
-    {type::GetDescriptor()->full_name(), priority},
-
-static const THashMap<TString, int> MasterActionTypeToExecutionPriority{
-    FOR_EACH_TRANSACTION_ACTION_TYPE()
-};
-#undef XX
-#undef FOR_EACH_TRANSACTION_ACTION_TYPE
 
 struct TDatalessLockRowRequest
 {
@@ -97,34 +85,33 @@ struct TDeleteRowRequest
     TLegacyKey Key;
 };
 
-#define FOR_EACH_REQUEST_TYPE() \
-    XX(TDatalessLockRowRequest, 100) \
-    XX(TLockRowRequest, 200) \
-    XX(TDeleteRowRequest, 300) \
-    XX(TWriteRowRequest, 400)
-
-#define XX(type, priority) \
-    REGISTER_TABLE_REQUEST_TYPE(type, priority)
-
-FOR_EACH_REQUEST_TYPE()
-#undef XX
-#undef FOR_EACH_REQUEST_TYPE
-
 class TSequoiaTransaction
     : public ISequoiaTransaction
 {
 public:
     TSequoiaTransaction(
         ISequoiaClientPtr sequoiaClient,
-        NApi::NNative::IClientPtr nativeRootClient,
-        NApi::NNative::IClientPtr groundRootClient)
+        IClientPtr nativeRootClient,
+        IClientPtr groundRootClient,
+        const TSequoiaTransactionSequencingOptions& sequencingOptions)
         : SequoiaClient_(std::move(sequoiaClient))
         , NativeRootClient_(std::move(nativeRootClient))
         , GroundRootClient_(std::move(groundRootClient))
         , Logger(SequoiaClient_->GetLogger())
         , SerializedInvoker_(CreateSerializedInvoker(
             NativeRootClient_->GetConnection()->GetInvoker()))
+        , SequencingOptions_(sequencingOptions)
     { }
+
+    TTransactionId GetId() const override
+    {
+        return Transaction_->GetId();
+    }
+
+    TTimestamp GetStartTimestamp() const override
+    {
+        return Transaction_->GetStartTimestamp();
+    }
 
     TFuture<ISequoiaTransactionPtr> Start(const TTransactionStartOptions& options)
     {
@@ -138,9 +125,7 @@ public:
             StartOptions_.Timeout = config->SequoiaConnection->SequoiaTransactionTimeout;
         }
 
-        TTransactionStartOptions startOptions;
-        startOptions.Timeout = StartOptions_.Timeout;
-        return transactionManager->Start(ETransactionType::Tablet, startOptions)
+        return transactionManager->Start(ETransactionType::Tablet, StartOptions_)
             .Apply(BIND(&TSequoiaTransaction::OnTransactionStarted, MakeStrong(this))
                 .AsyncVia(SerializedInvoker_));
     }
@@ -177,11 +162,11 @@ public:
 
     virtual TFuture<TSelectRowsResult> SelectRows(
         ESequoiaTable table,
-        const TSelectRowsRequest& request) override
+        const TSelectRowsQuery& query) override
     {
         return SequoiaClient_->SelectRows(
             table,
-            request,
+            query,
             Transaction_->GetStartTimestamp());
     }
 
@@ -282,11 +267,17 @@ public:
 
         auto guard = Guard(Lock_);
 
+        auto entropy = RandomGenerator_->Generate<ui32>();
+        // TODO(kvk1920): exacly the same code exists in |TObjectManager|. Think
+        // about moving it into more general place.
+        if (objectType == EObjectType::Transaction || objectType == EObjectType::NestedTransaction) {
+            entropy &= 0xffff;
+        }
         auto id = MakeSequoiaId(
             objectType,
             cellTag,
             Transaction_->GetStartTimestamp(),
-            RandomGenerator_->Generate<ui32>());
+            entropy);
         if (sequoia) {
             YT_ASSERT(IsSequoiaId(id));
         } else {
@@ -301,11 +292,9 @@ public:
     {
         auto connection = NativeRootClient_->GetNativeConnection();
 
-        YT_LOG_DEBUG("Started synchronizing master cell directory");
         const auto& cellDirectorySynchronizer = connection->GetMasterCellDirectorySynchronizer();
         WaitFor(cellDirectorySynchronizer->RecentSync())
             .ThrowOnError();
-        YT_LOG_DEBUG("Master cell directory synchronized successfully");
 
         return connection->GetRandomMasterCellTagWithRoleOrThrow(
             NCellMasterClient::EMasterCellRole::SequoiaNodeHost);
@@ -334,8 +323,9 @@ private:
 
     std::unique_ptr<TRandomGenerator> RandomGenerator_;
 
-
     const IInvokerPtr SerializedInvoker_;
+
+    const TSequoiaTransactionSequencingOptions SequencingOptions_;
 
     struct TSequoiaTransactionTag
     { };
@@ -369,11 +359,13 @@ private:
 
     struct TTableCommitSession final
     {
-        NYPath::TYPath Path;
+        explicit TTableCommitSession(ESequoiaTable table)
+            : Table(table)
+        { }
 
         ESequoiaTable Table;
-
         std::vector<TRequest> Requests;
+        TEnumIndexedArray<ETableSchemaKind, TNameTableToSchemaIdMapping> ColumnIdMappings;
     };
     using TTableCommitSessionPtr = TIntrusivePtr<TTableCommitSession>;
 
@@ -410,10 +402,7 @@ private:
             return it->second;
         }
 
-        auto session = New<TTableCommitSession>();
-        const auto* tableDescriptor = ITableDescriptor::Get(table);
-        session->Path = GetTablePath(tableDescriptor);
-        session->Table = table;
+        auto session = New<TTableCommitSession>(table);
         EmplaceOrCrash(TableCommitSessions_, table, session);
         return session;
     }
@@ -468,31 +457,44 @@ private:
     {
         VERIFY_INVOKER_AFFINITY(SerializedInvoker_);
 
+        const auto* tableDescriptor = ITableDescriptor::Get(session->Table);
+        auto path = GetSequoiaTablePath(NativeRootClient_, tableDescriptor);
+
         const auto& tableMountCache = GroundRootClient_->GetTableMountCache();
-        return tableMountCache->GetTableInfo(session->Path)
+        return tableMountCache->GetTableInfo(path)
             .Apply(BIND(&TSequoiaTransaction::OnGotTableMountInfo, MakeWeak(this), session)
                 .AsyncVia(SerializedInvoker_));
     }
 
     void SortRequests()
     {
-        auto getActionPriority = [] (const TTransactionActionData& data) {
-            return GetOrCrash(MasterActionTypeToExecutionPriority, data.Type);
-        };
-        for (auto& [_, masterCellCommitSession] : MasterCellCommitSessions_) {
-            auto& actions = masterCellCommitSession->TransactionActions;
-            SortBy(actions, getActionPriority);
+        if (const auto* sequencer = SequencingOptions_.TransactionActionSequencer) {
+            for (auto& [_, masterCellCommitSession] : MasterCellCommitSessions_) {
+                auto& actions = masterCellCommitSession->TransactionActions;
+                SortBy(actions, [&] (const TTransactionActionData& actionData) {
+                    return sequencer->GetActionPriority(actionData.Type);
+                });
+            }
         }
 
-        auto getRequestPriority = [] (const TRequest& request) {
-            return Visit(request,
-                [&] <class T> (const T&) {
-                    return TRequestTypeTraits<T>::Priority;
+        if (const auto& priorities = SequencingOptions_.RequestPriorities) {
+            for (auto& [_, session] : TableCommitSessions_) {
+                auto& requests = session->Requests;
+                SortBy(requests, [&] (const TRequest& request) {
+                    #define HANDLE_REQUEST_KIND(RequestKind) \
+                        [&] (const T##RequestKind##Request&) { \
+                            return priorities->RequestKind; \
+                        }
+
+                    return Visit(request,
+                        HANDLE_REQUEST_KIND(DatalessLockRow),
+                        HANDLE_REQUEST_KIND(LockRow),
+                        HANDLE_REQUEST_KIND(WriteRow),
+                        HANDLE_REQUEST_KIND(DeleteRow));
+
+                    #undef HANDLE_REQUEST_KIND
                 });
-        };
-        for (auto& [_, session] : TableCommitSessions_) {
-            auto& requests = session->Requests;
-            SortBy(requests, getRequestPriority);
+            }
         }
     }
 
@@ -509,16 +511,78 @@ private:
         return AllSucceeded(std::move(futures));
     }
 
+    TLegacyKey PrepareRow(
+        const TTableCommitSessionPtr& session,
+        const TTableMountInfoPtr& tableMountInfo,
+        const TColumnEvaluatorPtr& evaluator,
+        TUnversionedRow row)
+    {
+        const auto& primarySchema = tableMountInfo->Schemas[ETableSchemaKind::Primary];
+        const auto& modificationIdMapping = session->ColumnIdMappings[ETableSchemaKind::Primary];
+        auto capturedRow = RowBuffer_->CaptureAndPermuteRow(
+            row,
+            *primarySchema,
+            primarySchema->GetKeyColumnCount(),
+            modificationIdMapping,
+            /*validateDuplicateAndRequiredValueColumns*/ false);
+        if (evaluator) {
+            evaluator->EvaluateKeys(capturedRow, RowBuffer_);
+        }
+        return capturedRow;
+    }
+
     void OnGotTableMountInfo(
         const TTableCommitSessionPtr& session,
         const TTableMountInfoPtr& tableMountInfo)
     {
         VERIFY_INVOKER_AFFINITY(SerializedInvoker_);
 
+        const auto& primarySchema = tableMountInfo->Schemas[ETableSchemaKind::Primary];
+        const auto& writeSchema = tableMountInfo->Schemas[ETableSchemaKind::Write];
+        const auto& deleteSchema = tableMountInfo->Schemas[ETableSchemaKind::Delete];
+        const auto& lockSchema = tableMountInfo->Schemas[ETableSchemaKind::Lock];
+
+        for (auto schemaKind : {ETableSchemaKind::Primary, ETableSchemaKind::Write, ETableSchemaKind::Delete, ETableSchemaKind::Lock}) {
+            session->ColumnIdMappings[schemaKind] = BuildColumnIdMapping(
+                *tableMountInfo->Schemas[schemaKind],
+                ITableDescriptor::Get(session->Table)->GetRecordDescriptor()->GetNameTable(),
+                /*allowMissingKeyColumns*/ false);
+        }
+
+        const auto& writeIdMapping = session->ColumnIdMappings[ETableSchemaKind::Write];
+        const auto& deleteIdMapping = session->ColumnIdMappings[ETableSchemaKind::Delete];
+        const auto& lockIdMapping = session->ColumnIdMappings[ETableSchemaKind::Lock];
+
+        const auto& nameTable = ITableDescriptor::Get(session->Table)->GetRecordDescriptor()->GetNameTable();
+
+        auto evaluatorCache = GroundRootClient_->GetNativeConnection()->GetColumnEvaluatorCache();
+        auto evaluator = tableMountInfo->NeedKeyEvaluation ? evaluatorCache->Find(primarySchema) : nullptr;
+
+        std::vector<int> columnIndexToLockIndex;
+        GetLocksMapping(
+            *primarySchema,
+            /*fullAtomicity*/ true,
+            &columnIndexToLockIndex);
+
         for (auto& request : session->Requests) {
             Visit(request,
                 [&] (const TDatalessLockRowRequest& request) {
-                    auto tabletInfo = GetSortedTabletForRow(tableMountInfo, request.Key, /*validateWrite*/ true);
+                    ValidateClientKey(
+                        request.Key,
+                        *lockSchema,
+                        lockIdMapping,
+                        nameTable);
+
+                    auto preparedKey = PrepareRow(
+                        session,
+                        tableMountInfo,
+                        evaluator,
+                        request.Key);
+
+                    auto tabletInfo = GetSortedTabletForRow(
+                        tableMountInfo,
+                        preparedKey,
+                        /*validateWrite*/ true);
 
                     TLockMask lockMask;
                     lockMask.Set(PrimaryLockIndex, request.LockType);
@@ -528,8 +592,15 @@ private:
                         .TabletCellId = tabletInfo->CellId
                     };
 
-                    auto tabletCommitSession = GetOrCreateTabletCommitSession(tabletInfo->TabletId, /*dataless*/ true, tableMountInfo, tabletInfo);
-                    tabletCommitSession->SubmitUnversionedRow(EWireProtocolCommand::WriteAndLockRow, request.Key, lockMask);
+                    auto tabletCommitSession = GetOrCreateTabletCommitSession(
+                        tabletInfo->TabletId,
+                        /*dataless*/ true,
+                        tableMountInfo,
+                        tabletInfo);
+                    tabletCommitSession->SubmitUnversionedRow(
+                        EWireProtocolCommand::WriteAndLockRow,
+                        preparedKey,
+                        lockMask);
 
                     auto guard = Guard(Lock_);
 
@@ -537,43 +608,103 @@ private:
                     masterCellCommitSession->TabletCellIds.insert(tabletInfo->CellId);
 
                     auto& writeSet = masterCellCommitSession->WriteSet[session->Table];
-                    EmplaceOrCrash(writeSet, request.Key, lockedRowInfo);
+                    EmplaceOrCrash(writeSet, preparedKey, lockedRowInfo);
                 },
                 [&] (const TLockRowRequest& request) {
-                    auto tabletInfo = GetSortedTabletForRow(tableMountInfo, request.Key, /*validateWrite*/ true);
+                    ValidateClientKey(
+                        request.Key,
+                        *lockSchema,
+                        lockIdMapping,
+                        nameTable);
+
+                    auto preparedKey = PrepareRow(
+                        session,
+                        tableMountInfo,
+                        evaluator,
+                        request.Key);
+
+                    auto tabletInfo = GetSortedTabletForRow(
+                        tableMountInfo,
+                        preparedKey,
+                        /*validateWrite*/ true);
 
                     TLockMask lockMask;
                     lockMask.Set(PrimaryLockIndex, request.LockType);
 
-                    auto tabletCommitSession = GetOrCreateTabletCommitSession(tabletInfo->TabletId, /*dataless*/ false, tableMountInfo, tabletInfo);
-                    tabletCommitSession->SubmitUnversionedRow(EWireProtocolCommand::WriteAndLockRow, request.Key, lockMask);
+                    auto tabletCommitSession = GetOrCreateTabletCommitSession(
+                        tabletInfo->TabletId,
+                        /*dataless*/ false,
+                        tableMountInfo,
+                        tabletInfo);
+                    tabletCommitSession->SubmitUnversionedRow(
+                        EWireProtocolCommand::WriteAndLockRow,
+                        preparedKey,
+                        lockMask);
                 },
                 [&] (const TWriteRowRequest& request) {
-                    auto tabletInfo = GetSortedTabletForRow(tableMountInfo, request.Row, /*validateWrite*/ true);
+                    ValidateClientDataRow(
+                        request.Row,
+                        *writeSchema,
+                        writeIdMapping,
+                        nameTable);
+
+                    auto preparedRow = PrepareRow(
+                        session,
+                        tableMountInfo,
+                        evaluator,
+                        request.Row);
+
+                    auto tabletInfo = GetSortedTabletForRow(
+                        tableMountInfo,
+                        preparedRow,
+                        /*validateWrite*/ true);
 
                     TLockMask lockMask;
                     if (tableMountInfo->IsSorted()) {
-                        std::vector<int> columnIndexToLockIndex;
-                        GetLocksMapping(
-                            *tableMountInfo->Schemas[ETableSchemaKind::Write],
-                            true,
-                            &columnIndexToLockIndex);
-
-                        for (const auto& value: request.Row) {
+                        for (const auto& value : request.Row) {
                             if (auto lockIndex = columnIndexToLockIndex[value.Id]; lockIndex != -1) {
                                 lockMask.Set(lockIndex, request.LockType);
                             }
                         }
                     }
 
-                    auto tabletCommitSession = GetOrCreateTabletCommitSession(tabletInfo->TabletId, /*dataless*/ false, tableMountInfo, tabletInfo);
-                    tabletCommitSession->SubmitUnversionedRow(EWireProtocolCommand::WriteAndLockRow, request.Row, lockMask);
+                    auto tabletCommitSession = GetOrCreateTabletCommitSession(
+                        tabletInfo->TabletId,
+                        /*dataless*/ false,
+                        tableMountInfo,
+                        tabletInfo);
+                    tabletCommitSession->SubmitUnversionedRow(
+                        EWireProtocolCommand::WriteAndLockRow,
+                        preparedRow,
+                        lockMask);
                 },
                 [&] (const TDeleteRowRequest& request) {
-                    auto tabletInfo = GetSortedTabletForRow(tableMountInfo, request.Key, /*validateWrite*/ true);
+                    ValidateClientKey(
+                        request.Key,
+                        *deleteSchema,
+                        deleteIdMapping,
+                        nameTable);
 
-                    auto tabletCommitSession = GetOrCreateTabletCommitSession(tabletInfo->TabletId, /*dataless*/ false, tableMountInfo, tabletInfo);
-                    tabletCommitSession->SubmitUnversionedRow(EWireProtocolCommand::DeleteRow, request.Key, TLockMask{});
+                    auto preparedKey = PrepareRow(
+                        session,
+                        tableMountInfo,
+                        evaluator,
+                        request.Key);
+
+                    auto tabletInfo = GetSortedTabletForRow(
+                        tableMountInfo,
+                        preparedKey,
+                        /*validateWrite*/ true);
+
+                    auto tabletCommitSession = GetOrCreateTabletCommitSession(
+                        tabletInfo->TabletId,
+                        /*dataless*/ false,
+                        tableMountInfo,
+                        tabletInfo);
+                    tabletCommitSession->SubmitUnversionedRow(
+                        EWireProtocolCommand::DeleteRow,
+                        preparedKey,
+                        TLockMask());
                 },
                 [&] (auto) { YT_ABORT(); });
         }
@@ -659,11 +790,6 @@ private:
         Transaction_->ChooseCoordinator(options);
         return Transaction_->Commit(options).AsVoid();
     }
-
-    NYPath::TYPath GetTablePath(const ITableDescriptor* tableDescriptor) const
-    {
-        return GetSequoiaTablePath(NativeRootClient_, tableDescriptor);
-    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -672,14 +798,16 @@ namespace NDetail {
 
 TFuture<ISequoiaTransactionPtr> StartSequoiaTransaction(
     ISequoiaClientPtr sequoiaClient,
-    NApi::NNative::IClientPtr nativeRootClient,
-    NApi::NNative::IClientPtr groundRootClient,
-    const TTransactionStartOptions& options)
+    IClientPtr nativeRootClient,
+    IClientPtr groundRootClient,
+    const TTransactionStartOptions& options,
+    const TSequoiaTransactionSequencingOptions& sequencingOptions)
 {
     auto transaction = New<TSequoiaTransaction>(
         std::move(sequoiaClient),
         std::move(nativeRootClient),
-        std::move(groundRootClient));
+        std::move(groundRootClient),
+        sequencingOptions);
     return transaction->Start(options);
 }
 

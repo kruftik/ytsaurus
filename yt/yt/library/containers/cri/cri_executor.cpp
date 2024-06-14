@@ -8,6 +8,7 @@
 #include <yt/yt/core/rpc/retrying_channel.h>
 
 #include <yt/yt/core/misc/error.h>
+#include <yt/yt/core/misc/fs.h>
 #include <yt/yt/core/misc/proc.h>
 #include <yt/yt/core/misc/protobuf_helpers.h>
 
@@ -89,7 +90,6 @@ public:
         , PodDescriptor_(podDescriptor)
         , PodSpec_(std::move(podSpec))
         , PollPeriod_(pollPeriod)
-        , Logger(NCri::Logger)
     {
         // Just for symmetry with sibling classes.
         AddArgument(Path_);
@@ -133,7 +133,7 @@ private:
     const TCriPodSpecPtr PodSpec_;
     const TDuration PollPeriod_;
 
-    NLogging::TLogger Logger;
+    NLogging::TLogger Logger = NCri::Logger();
 
     TCriDescriptor ContainerDescriptor_;
 
@@ -231,10 +231,23 @@ public:
         TStringBuilder cgroup;
         cgroup.AppendString(Config_->BaseCgroup);
         cgroup.AppendString("/");
-        cgroup.AppendString(podName);
+
         if (Config_->BaseCgroup.EndsWith(SystemdSliceSuffix)) {
+            auto sliceName = podName;
+
+            // Build name of nested slice in systemd notaion, see manpage systemd.slice.
+            SubstGlobal(sliceName, "-", "_");
+            auto parentSlice = NFS::GetFileNameWithoutExtension(Config_->BaseCgroup);
+            if (parentSlice != "-") {
+                sliceName = Format("%v-%v", parentSlice, sliceName);
+            }
+
+            cgroup.AppendString(sliceName);
             cgroup.AppendString(SystemdSliceSuffix);
+        } else {
+            cgroup.AppendString(podName);
         }
+
         return cgroup.Flush();
     }
 
@@ -579,8 +592,10 @@ public:
             auto guard = Guard(SpinLock_);
             if (auto* pullFuture = InflightImagePulls_.FindPtr(image.Image)) {
                 YT_LOG_DEBUG("Waiting for in-flight docker image pull (Image: %v)", image);
-                return pullFuture->ToImmediatelyCancelable().Apply(BIND([=, this, this_ = MakeStrong(this)] {
+                return pullFuture->ToImmediatelyCancelable()
+                    .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TError& error) {
                         // Ignore errors and retry pull after end of previous concurrent attempt.
+                        Y_UNUSED(error);
                         return PullImage(image, /*always*/ false, authConfig, podSpec);
                     }));
             }
@@ -727,14 +742,21 @@ private:
         }
     }
 
-    static TRetryChecker GetRetryChecker()
+    TRetryChecker GetRetryChecker()
     {
-        static const auto Result = BIND_NO_PROPAGATE([] (const TError& error) {
-            return IsRetriableError(error) ||
-                   (error.GetCode() == NYT::EErrorCode::Generic &&
-                    error.GetMessage() == "server is not initialized yet");
+        return BIND_NO_PROPAGATE([config = Config_] (const TError& error) {
+            if (IsRetriableError(error)) {
+                return true;
+            }
+            if (error.GetCode() == NYT::EErrorCode::Generic) {
+                for (const auto& prefix: config->RetryErrorPrefixes) {
+                    if (error.GetMessage().StartsWith(prefix)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         });
-        return Result;
     }
 };
 

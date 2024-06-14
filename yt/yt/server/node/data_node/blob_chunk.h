@@ -90,6 +90,7 @@ private:
         TPromise<std::vector<NChunkClient::TBlock>> SessionPromise = NewPromise<std::vector<NChunkClient::TBlock>>();
         TPromise<void> DiskFetchPromise;
         NIO::TBlocksExtPtr BlocksExt;
+        TLocationMemoryGuard LocationMemoryGuard;
         TPendingIOGuard PendingIOGuard;
         std::atomic<bool> Finished = false;
     };
@@ -108,7 +109,7 @@ private:
     NIO::TChunkFileReaderPtr GetReader();
     void ReleaseReader(NThreading::TWriterGuard<NThreading::TReaderWriterSpinLock>& writerGuard) override;
 
-    TSharedRef WrapBlockWithDelayedReferenceHolder(TSharedRef&& rawReference, TDuration delayBeforeFree);
+    TSharedRef WrapBlockWithDelayedReferenceHolder(TSharedRef rawReference, TDuration delayBeforeFree);
 
     void CompleteSession(const TReadBlockSetSessionPtr& session);
     static void FailSession(const TReadBlockSetSessionPtr& session, const TError& error);

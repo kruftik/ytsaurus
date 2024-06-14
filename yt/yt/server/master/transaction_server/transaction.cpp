@@ -29,7 +29,76 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TransactionServerLogger;
+static constexpr auto& Logger = TransactionServerLogger;
+
+////////////////////////////////////////////////////////////////////////////////
+
+int TBranchedNodeSet::Size() const noexcept
+{
+    return std::ssize(Nodes_);
+}
+
+bool TBranchedNodeSet::Empty() const noexcept
+{
+    return Nodes_.empty();
+}
+
+void TBranchedNodeSet::Clear()
+{
+    Nodes_.clear();
+    NodeToIndex_.clear();
+}
+
+TBranchedNodeSet::TIterator TBranchedNodeSet::begin() const noexcept
+{
+    return Nodes_.begin();
+}
+
+TBranchedNodeSet::TIterator TBranchedNodeSet::end() const noexcept
+{
+    return Nodes_.end();
+}
+
+NCypressServer::TCypressNode* TBranchedNodeSet::GetAnyNode()
+{
+    return Nodes_.back();
+}
+
+void TBranchedNodeSet::InsertOrCrash(NCypressServer::TCypressNode* node)
+{
+    NYT::EmplaceOrCrash(NodeToIndex_, node, Nodes_.size());
+    Nodes_.push_back(node);
+}
+
+void TBranchedNodeSet::EraseOrCrash(NCypressServer::TCypressNode* node)
+{
+    auto it = NodeToIndex_.find(node);
+    YT_VERIFY(it != NodeToIndex_.end());
+
+    auto index = it->second;
+    YT_ASSERT(index < std::ssize(Nodes_));
+
+    if (index < std::ssize(Nodes_) - 1) {
+        // Move last element to the place of removed element.
+        GetOrCrash(NodeToIndex_, Nodes_.back()) = index;
+        Nodes_[index] = Nodes_.back();
+    }
+
+    Nodes_.pop_back();
+    NodeToIndex_.erase(it);
+}
+
+void TBranchedNodeSet::Persist(const NCellMaster::TPersistenceContext& context)
+{
+    NYT::Persist(context, Nodes_);
+    if (context.IsLoad()) {
+        NodeToIndex_.clear();
+        NodeToIndex_.reserve(Nodes_.size());
+        for (int index = 0; index < std::ssize(Nodes_); ++index) {
+            EmplaceOrCrash(NodeToIndex_, Nodes_[index], index);
+        }
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -110,6 +179,8 @@ void TTransaction::Save(NCellMaster::TSaveContext& context) const
     Save(context, AccountResourceUsageLeases_);
     Save(context, IsSequoiaTransaction_);
     Save(context, SequoiaWriteSet_);
+    Save(context, AuthenticationIdentity_.User);
+    Save(context, AuthenticationIdentity_.UserTag);
 }
 
 void TTransaction::Load(NCellMaster::TLoadContext& context)
@@ -142,17 +213,9 @@ void TTransaction::Load(NCellMaster::TLoadContext& context)
     Load(context, TablesWithBackupCheckpoints_);
     Load(context, Depth_);
     Load(context, Upload_);
-    // COMPAT(h0pless)
-    if (context.GetVersion() >= EMasterReign::TooManyLocksCheck) {
-        Load(context, RecursiveLockCount_);
-    }
-
+    Load(context, RecursiveLockCount_);
     Load(context, NativeCommitMutationRevision_);
-
-    // COMPAT(gritukan)
-    if (context.GetVersion() >= EMasterReign::CypressTransactions) {
-        Load(context, IsCypressTransaction_);
-    }
+    Load(context, IsCypressTransaction_);
 
     // COMPAT(gritukan)
     if (context.GetVersion() >= EMasterReign::TabletPrerequisites) {
@@ -170,6 +233,15 @@ void TTransaction::Load(NCellMaster::TLoadContext& context)
         context.GetVersion() < EMasterReign::SaneTxActionAbortFix)
     {
         Load(context, PreparedActionCount_);
+    }
+
+    // COMPAT(kvk1920)
+    if (context.GetVersion() >= EMasterReign::FixCypressTransactionMirroring ||
+        (context.GetVersion() >= EMasterReign::FixCypressTransactionMirroring_24_1 &&
+         context.GetVersion() < EMasterReign::DropLegacyClusterNodeMap))
+    {
+        Load(context, AuthenticationIdentity_.User);
+        Load(context, AuthenticationIdentity_.UserTag);
     }
 }
 

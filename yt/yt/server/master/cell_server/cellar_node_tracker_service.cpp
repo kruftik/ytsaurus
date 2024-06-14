@@ -30,7 +30,7 @@ public:
             bootstrap,
             TCellarNodeTrackerServiceProxy::GetDescriptor(),
             EAutomatonThreadQueue::CellarNodeTrackerService,
-            CellServerLogger)
+            CellServerLogger())
     {
         RegisterMethod(RPC_SERVICE_METHOD_DESC(Heartbeat)
             .SetHeavy(true));
@@ -42,6 +42,9 @@ private:
         ValidateClusterInitialized();
         ValidatePeer(EPeerKind::Leader);
         SyncWithUpstream();
+
+        const auto& multicellManager = Bootstrap_->GetMulticellManager();
+        multicellManager->ValidateRegisteredMasterCell();
 
         auto nodeId = FromProto<TNodeId>(request->node_id());
 

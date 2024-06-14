@@ -157,6 +157,7 @@ CHECKS_LIST = [
     "operations_satisfaction",
     "operations_snapshots",
     "proxy",
+    "queue_api",
     "queue_agent_alerts",
     "query_tracker_alerts",
     "query_tracker_yql_liveness",
@@ -280,6 +281,24 @@ def create_odin_checks_config():
                     "node_threshold": 100000,
                     "total_threshold": 1000000
                 }
+            },
+            "query_tracker_yql_liveness": {
+                "check_timeout": 240,
+                "options": {
+                    "soft_query_timeout": 165,
+                },
+            },
+            "query_tracker_chyt_liveness": {
+                "check_timeout": 60,
+                "options": {
+                    "soft_query_timeout": 30,
+                },
+            },
+            "query_tracker_ql_liveness": {
+                "check_timeout": 60,
+                "options": {
+                    "soft_query_timeout": 30,
+                },
             },
         },
     }

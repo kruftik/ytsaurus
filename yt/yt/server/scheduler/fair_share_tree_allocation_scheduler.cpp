@@ -112,8 +112,7 @@ void SortAllocationsWithPreemptionInfo(std::vector<TAllocationWithPreemptionInfo
             }
 
             return lhs.Allocation->GetStartTime() < rhs.Allocation->GetStartTime();
-        }
-    );
+        });
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -227,10 +226,10 @@ std::optional<bool> IsPrioritySchedulingSegmentModuleAssignmentEnabled(const TSc
     switch (element->GetType()) {
         case ESchedulerElementType::Root:
             return false;
-        case ESchedulerElementType::Operation:
-            return {};
         case ESchedulerElementType::Pool:
             return static_cast<const TSchedulerPoolElement*>(element)->GetConfig()->EnablePrioritySchedulingSegmentModuleAssignment;
+        case ESchedulerElementType::Operation:
+            YT_UNIMPLEMENTED();
     }
 }
 
@@ -897,18 +896,13 @@ TSchedulingStageProfilingCounters::TSchedulingStageProfilingCounters(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void FormatValue(TStringBuilderBase* builder, const TAllocationWithPreemptionInfo& allocationInfo, TStringBuf /*format*/)
+void FormatValue(TStringBuilderBase* builder, const TAllocationWithPreemptionInfo& allocationInfo, TStringBuf /*spec*/)
 {
     builder->AppendFormat(
         "{AllocationId: %v, PreemptionStatus: %v, OperationId: %v}",
         allocationInfo.Allocation->GetId(),
         allocationInfo.PreemptionStatus,
         allocationInfo.OperationElement->GetId());
-}
-
-TString ToString(const TAllocationWithPreemptionInfo& allocationInfo)
-{
-    return ToStringViaBuilder(allocationInfo);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1493,7 +1487,7 @@ const TDynamicAttributes& TScheduleAllocationsContext::DynamicAttributesOf(const
 bool TScheduleAllocationsContext::CheckScheduleAllocationTimeoutExpired() const
 {
     if (SchedulingContext_->GetNow() >= SchedulingDeadline_) {
-        SchedulingContext_->SetNodeSchedulingResult(ENodeSchedulingResult::Timeout);
+        SchedulingContext_->SetSchedulingStopReason(ESchedulingStopReason::Timeout);
         return true;
     }
     return false;
@@ -2545,6 +2539,16 @@ void TFairShareTreeAllocationScheduler::ProcessSchedulingHeartbeat(
         nodeState->LastRunningAllocationStatisticsUpdateTime = schedulingContext->GetNow();
         nodeState->ForceRunningAllocationStatisticsUpdate = false;
     }
+    if (IsGpuTree()) {
+        nodeState->RunningAllocations.clear();
+        nodeState->RunningAllocations.reserve(schedulingContext->RunningAllocations().size());
+        for (const auto& allocation : schedulingContext->RunningAllocations()) {
+            TFairShareTreeAllocationSchedulerAllocationState fairShareTreeAllocationSchedulerAllocationState;
+            fairShareTreeAllocationSchedulerAllocationState.OperationId = allocation->GetOperationId();
+            fairShareTreeAllocationSchedulerAllocationState.ResourceLimits = allocation->ResourceLimits();
+            EmplaceOrCrash(nodeState->RunningAllocations, allocation->GetId(), std::move(fairShareTreeAllocationSchedulerAllocationState));
+        }
+    }
 
     bool hasUserSlotsBefore = !nodeState->Descriptor || nodeState->Descriptor->ResourceLimits.GetUserSlots() > 0;
     bool hasUserSlotsAfter = schedulingContext->GetNodeDescriptor()->ResourceLimits.GetUserSlots() > 0;
@@ -2670,6 +2674,11 @@ void TFairShareTreeAllocationScheduler::RegisterOperation(const TSchedulerOperat
             operationState->SchedulingSegmentModule);
     }
 
+    if (IsGpuTree()) {
+        LogStructuredGpuEventFluently(EGpuSchedulingLogEventType::OperationRegistered)
+            .Item("operation_id").Value(operationId);
+    }
+
     EmplaceOrCrash(
         OperationIdToState_,
         operationId,
@@ -2680,15 +2689,22 @@ void TFairShareTreeAllocationScheduler::RegisterOperation(const TSchedulerOperat
         New<TFairShareTreeAllocationSchedulerOperationSharedState>(
             StrategyHost_,
             element->Spec()->UpdatePreemptibleAllocationsListLoggingPeriod,
-            Logger.WithTag("OperationId: %v", operationId)));
+            Logger().WithTag("OperationId: %v", operationId)));
 }
 
 void TFairShareTreeAllocationScheduler::UnregisterOperation(const TSchedulerOperationElement* element)
 {
     VERIFY_THREAD_AFFINITY(ControlThread);
 
-    EraseOrCrash(OperationIdToState_, element->GetOperationId());
-    EraseOrCrash(OperationIdToSharedState_, element->GetOperationId());
+    auto operationId = element->GetOperationId();
+
+    if (IsGpuTree()) {
+        LogStructuredGpuEventFluently(EGpuSchedulingLogEventType::OperationUnregistered)
+            .Item("operation_id").Value(operationId);
+    }
+
+    EraseOrCrash(OperationIdToState_, operationId);
+    EraseOrCrash(OperationIdToSharedState_, operationId);
 }
 
 void TFairShareTreeAllocationScheduler::OnOperationMaterialized(const TSchedulerOperationElement* element)
@@ -2826,7 +2842,8 @@ void TFairShareTreeAllocationScheduler::BuildSchedulingAttributesForNode(TNodeId
 
     fluent
         .Item("scheduling_segment").Value(nodeState->SchedulingSegment)
-        .Item("running_job_statistics").Value(nodeState->RunningAllocationStatistics);
+        .Item("running_job_statistics").Value(nodeState->RunningAllocationStatistics)
+        .Item("running_allocations").Value(nodeState->RunningAllocations);
 }
 
 void TFairShareTreeAllocationScheduler::BuildSchedulingAttributesStringForOngoingAllocations(
@@ -2979,7 +2996,17 @@ void TFairShareTreeAllocationScheduler::BuildElementYson(
         .ITEM_VALUE_IF_SUITABLE_FOR_FILTER(
             filter,
             "effective_aggressive_preemption_allowed",
-            attributes.EffectiveAggressivePreemptionAllowed);
+            attributes.EffectiveAggressivePreemptionAllowed)
+        .DoIf(!element->IsOperation(), [&] (TFluentMap fluent) {
+            fluent.ITEM_VALUE_IF_SUITABLE_FOR_FILTER(
+                filter,
+                "priority_scheduling_segment_module_assignment_enabled",
+                IsPrioritySchedulingSegmentModuleAssignmentEnabled(element));
+        })
+        .ITEM_VALUE_IF_SUITABLE_FOR_FILTER(
+            filter,
+            "effective_priority_scheduling_segment_module_assignment_enabled",
+            attributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled);
 }
 
 TAllocationSchedulerPostUpdateContext TFairShareTreeAllocationScheduler::CreatePostUpdateContext(TSchedulerRootElement* rootElement)
@@ -3009,8 +3036,8 @@ void TFairShareTreeAllocationScheduler::PostUpdate(
 
     InitializeStaticAttributes(fairSharePostUpdateContext, postUpdateContext);
 
-    PublishFairShareAndUpdatePreemptionAttributes(postUpdateContext->RootElement, postUpdateContext);
     UpdateEffectiveRecursiveAttributes(postUpdateContext->RootElement, postUpdateContext);
+    PublishFairShare(postUpdateContext->RootElement, postUpdateContext);
 
     ProcessUpdatedStarvationStatuses(fairSharePostUpdateContext, postUpdateContext);
 
@@ -3155,6 +3182,11 @@ INodePtr TFairShareTreeAllocationScheduler::BuildPersistentState() const
     return ConvertToNode(persistentState);
 }
 
+bool TFairShareTreeAllocationScheduler::IsGpuTree() const
+{
+    return Config_->MainResource == EJobResourceType::Gpu;
+}
+
 void TFairShareTreeAllocationScheduler::OnAllocationStartedInTest(
     TSchedulerOperationElement* element,
     TAllocationId allocationId,
@@ -3165,7 +3197,7 @@ void TFairShareTreeAllocationScheduler::OnAllocationStartedInTest(
         element,
         allocationId,
         resourceUsage,
-        /*precommitedResources*/ {},
+        /*precommittedResources*/ {},
         /*scheduleAllocationEpoch*/ TControllerEpoch(0));
 }
 
@@ -3597,48 +3629,33 @@ void TFairShareTreeAllocationScheduler::CollectSchedulableOperationsPerPriority(
     }
 }
 
-void TFairShareTreeAllocationScheduler::PublishFairShareAndUpdatePreemptionAttributes(
+void TFairShareTreeAllocationScheduler::PublishFairShare(
     TSchedulerElement* element,
     TAllocationSchedulerPostUpdateContext* postUpdateContext) const
 {
-    // TODO(omgronny): Move EffectiveAggressivePreemptionAllowed update to UpdateEffectiveRecursiveAttributes.
-    auto& attributes = postUpdateContext->StaticAttributesList.AttributesOf(element);
-    auto aggressivePreemptionAllowed = IsAggressivePreemptionAllowed(element);
-    if (element->IsRoot()) {
-        YT_VERIFY(aggressivePreemptionAllowed);
-        attributes.EffectiveAggressivePreemptionAllowed = *aggressivePreemptionAllowed;
-    } else {
-        const auto* parent = element->GetParent();
-        YT_VERIFY(parent);
-        const auto& parentAttributes = postUpdateContext->StaticAttributesList.AttributesOf(parent);
-
-        attributes.EffectiveAggressivePreemptionAllowed = aggressivePreemptionAllowed
-            .value_or(parentAttributes.EffectiveAggressivePreemptionAllowed);
-    }
-
     switch (element->GetType()) {
         case ESchedulerElementType::Pool:
         case ESchedulerElementType::Root:
-            PublishFairShareAndUpdatePreemptionAttributesAtCompositeElement(static_cast<TSchedulerCompositeElement*>(element), postUpdateContext);
+            PublishFairShareAtCompositeElement(static_cast<TSchedulerCompositeElement*>(element), postUpdateContext);
             break;
         case ESchedulerElementType::Operation:
-            PublishFairShareAndUpdatePreemptionAttributesAtOperation(static_cast<TSchedulerOperationElement*>(element), postUpdateContext);
+            PublishFairShareAtOperation(static_cast<TSchedulerOperationElement*>(element), postUpdateContext);
             break;
         default:
             YT_ABORT();
     }
 }
 
-void TFairShareTreeAllocationScheduler::PublishFairShareAndUpdatePreemptionAttributesAtCompositeElement(
+void TFairShareTreeAllocationScheduler::PublishFairShareAtCompositeElement(
     TSchedulerCompositeElement* element,
     TAllocationSchedulerPostUpdateContext* postUpdateContext) const
 {
     for (const auto& child : element->EnabledChildren()) {
-        PublishFairShareAndUpdatePreemptionAttributes(child.Get(), postUpdateContext);
+        PublishFairShare(child.Get(), postUpdateContext);
     }
 }
 
-void TFairShareTreeAllocationScheduler::PublishFairShareAndUpdatePreemptionAttributesAtOperation(
+void TFairShareTreeAllocationScheduler::PublishFairShareAtOperation(
     TSchedulerOperationElement* element,
     TAllocationSchedulerPostUpdateContext* postUpdateContext) const
 {
@@ -3660,20 +3677,6 @@ void TFairShareTreeAllocationScheduler::UpdateEffectiveRecursiveAttributes(
     const TSchedulerElement* element,
     TAllocationSchedulerPostUpdateContext* postUpdateContext)
 {
-    auto& attributes = postUpdateContext->StaticAttributesList.AttributesOf(element);
-    auto prioritySchedulingSegmentModuleAssignmentEnabled = IsPrioritySchedulingSegmentModuleAssignmentEnabled(element);
-    if (element->IsRoot()) {
-        YT_VERIFY(prioritySchedulingSegmentModuleAssignmentEnabled);
-        attributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled = *prioritySchedulingSegmentModuleAssignmentEnabled;
-    } else {
-        const auto* parent = element->GetParent();
-        YT_VERIFY(parent);
-        const auto& parentAttributes = postUpdateContext->StaticAttributesList.AttributesOf(parent);
-
-        attributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled = prioritySchedulingSegmentModuleAssignmentEnabled
-            .value_or(parentAttributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled);
-    }
-
     switch (element->GetType()) {
         case ESchedulerElementType::Pool:
         case ESchedulerElementType::Root:
@@ -3691,15 +3694,48 @@ void TFairShareTreeAllocationScheduler::UpdateEffectiveRecursiveAttributesAtComp
     const TSchedulerCompositeElement* element,
     TAllocationSchedulerPostUpdateContext* postUpdateContext)
 {
+    auto& attributes = postUpdateContext->StaticAttributesList.AttributesOf(element);
+    auto prioritySchedulingSegmentModuleAssignmentEnabled = IsPrioritySchedulingSegmentModuleAssignmentEnabled(element);
+    auto aggressivePreemptionAllowed = IsAggressivePreemptionAllowed(element);
+    if (element->IsRoot()) {
+        YT_VERIFY(prioritySchedulingSegmentModuleAssignmentEnabled);
+        attributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled = *prioritySchedulingSegmentModuleAssignmentEnabled;
+
+        YT_VERIFY(aggressivePreemptionAllowed);
+        attributes.EffectiveAggressivePreemptionAllowed = *aggressivePreemptionAllowed;
+    } else {
+        const auto* parent = element->GetParent();
+        YT_VERIFY(parent);
+        const auto& parentAttributes = postUpdateContext->StaticAttributesList.AttributesOf(parent);
+
+        attributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled = prioritySchedulingSegmentModuleAssignmentEnabled.value_or(
+            parentAttributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled);
+
+        attributes.EffectiveAggressivePreemptionAllowed = aggressivePreemptionAllowed.value_or(parentAttributes.EffectiveAggressivePreemptionAllowed);
+    }
+
     for (const auto& child : element->EnabledChildren()) {
         UpdateEffectiveRecursiveAttributes(child.Get(), postUpdateContext);
     }
 }
 
 void TFairShareTreeAllocationScheduler::UpdateEffectiveRecursiveAttributesAtOperation(
-    const TSchedulerOperationElement* /*element*/,
-    TAllocationSchedulerPostUpdateContext* /*postUpdateContext*/)
-{ }
+    const TSchedulerOperationElement* element,
+    TAllocationSchedulerPostUpdateContext* postUpdateContext)
+{
+    auto& attributes = postUpdateContext->StaticAttributesList.AttributesOf(element);
+
+    const auto* parent = element->GetParent();
+    YT_VERIFY(parent);
+    const auto& parentAttributes = postUpdateContext->StaticAttributesList.AttributesOf(parent);
+
+    auto aggressivePreemptionAllowed = IsAggressivePreemptionAllowed(element);
+    attributes.EffectiveAggressivePreemptionAllowed = aggressivePreemptionAllowed.value_or(
+        parentAttributes.EffectiveAggressivePreemptionAllowed);
+
+    // These attributes cannot be overwritten in operations.
+    attributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled = parentAttributes.EffectivePrioritySchedulingSegmentModuleAssignmentEnabled;
+}
 
 void TFairShareTreeAllocationScheduler::ProcessUpdatedStarvationStatuses(
     TFairSharePostUpdateContext* fairSharePostUpdateContext,
@@ -3964,11 +4000,12 @@ void TFairShareTreeAllocationScheduler::ApplyNodeSchedulingSegmentsChanges(const
         movedNodes.size());
 
     std::array<TSetNodeSchedulingSegmentOptionsList, MaxNodeShardCount> movedNodesPerNodeShard;
-    for (auto [nodeId, newSegment] : movedNodes) {
+    for (auto [nodeId, oldSegment, newSegment] : movedNodes) {
         auto shardId = StrategyHost_->GetNodeShardId(nodeId);
         movedNodesPerNodeShard[shardId].push_back(TSetNodeSchedulingSegmentOptions{
             .NodeId = nodeId,
-            .Segment = newSegment,
+            .OldSegment = oldSegment,
+            .NewSegment = newSegment,
         });
     }
 
@@ -3979,7 +4016,7 @@ void TFairShareTreeAllocationScheduler::ApplyNodeSchedulingSegmentsChanges(const
             [&, this_ = MakeStrong(this), shardId, movedNodes = std::move(movedNodesPerNodeShard[shardId])] {
                 auto& nodeStates = NodeStateShards_[shardId].NodeIdToState;
                 std::vector<std::pair<TNodeId, ESchedulingSegment>> missingNodeIdsWithSegments;
-                for (auto [nodeId, newSegment] : movedNodes) {
+                for (auto [nodeId, _, newSegment] : movedNodes) {
                     auto it = nodeStates.find(nodeId);
                     if (it == nodeStates.end()) {
                         missingNodeIdsWithSegments.emplace_back(nodeId, newSegment);

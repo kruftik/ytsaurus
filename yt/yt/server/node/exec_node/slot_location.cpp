@@ -67,7 +67,7 @@ TSlotLocation::TSlotLocation(
     IJobDirectoryManagerPtr jobDirectoryManager,
     int slotCount,
     std::function<int(int)> slotIndexToUserId)
-    : TDiskLocation(config, id, ExecNodeLogger)
+    : TDiskLocation(config, id, ExecNodeLogger())
     , Config_(std::move(config))
     , Bootstrap_(bootstrap)
     , SlotManagerStaticConfig_(Bootstrap_->GetConfig()->ExecNode->SlotManager)
@@ -131,8 +131,7 @@ void TSlotLocation::DoInitialize()
 
     MakeDirRecursive(Config_->Path, 0755);
 
-    WaitFor(HealthChecker_->RunCheck())
-        .ThrowOnError();
+    HealthChecker_->RunCheck();
 
     ValidateMinimumSpace();
 
@@ -146,11 +145,11 @@ void TSlotLocation::DoInitialize()
     YT_LOG_INFO("Location initialization complete");
 }
 
-void TSlotLocation::DoRepair(bool force)
+void TSlotLocation::DoRepair()
 {
     auto changeStateResult = ChangeState(NDataNode::ELocationState::Enabling, ELocationState::Disabled);
 
-    if (!changeStateResult && !force) {
+    if (!changeStateResult) {
         YT_LOG_DEBUG("Skipping location repair as it is already enabled (Location: %v)", Id_);
         return;
     }
@@ -207,10 +206,9 @@ std::vector<TString> TSlotLocation::DoPrepareSandboxDirectories(
     auto userId = SlotIndexToUserId_(slotIndex);
     auto sandboxPath = GetSandboxPath(slotIndex, ESandboxKind::User);
 
-    bool shouldApplyQuota = (options.InodeLimit || options.DiskSpaceLimit) &&
-        !sandboxInsideTmpfs &&
-        !options.HasRootFSQuota;
-    if (shouldApplyQuota) {
+    auto shouldApplyQuota = Config_->EnableDiskQuota && options.DiskSpaceLimit;
+
+    if (shouldApplyQuota && !sandboxInsideTmpfs) {
         try {
             auto properties = TJobDirectoryProperties {
                 .DiskSpaceLimit = options.DiskSpaceLimit,
@@ -233,11 +231,14 @@ std::vector<TString> TSlotLocation::DoPrepareSandboxDirectories(
     }
 
     // This tmp sandbox is a temporary workaround for nirvana. We apply the same quota as we do for usual sandbox.
-    if ((options.DiskSpaceLimit || options.InodeLimit) &&
-        !options.HasRootFSQuota) {
+    if (shouldApplyQuota) {
         auto tmpPath = GetSandboxPath(slotIndex, ESandboxKind::Tmp);
         try {
-            auto properties = TJobDirectoryProperties{options.DiskSpaceLimit, options.InodeLimit, userId};
+            auto properties = TJobDirectoryProperties{
+                .DiskSpaceLimit = options.DiskSpaceLimit,
+                .InodeLimit = options.InodeLimit,
+                .UserId = userId
+            };
             WaitFor(JobDirectoryManager_->ApplyQuota(tmpPath, properties))
                 .ThrowOnError();
         } catch (const std::exception& ex) {
@@ -836,9 +837,8 @@ void TSlotLocation::OnArtifactPreparationFailed(
     bool destinationInsideTmpfs = destinationPath && IsInsideTmpfs(*destinationPath);
 
     bool brokenPipe = static_cast<bool>(error.FindMatching(ELinuxErrorCode::PIPE));
-    bool noSpace =
-        static_cast<bool>(error.FindMatching(ELinuxErrorCode::NOSPC)) ||
-        static_cast<bool>(error.FindMatching(ELinuxErrorCode::DQUOT));
+    bool noSpace = static_cast<bool>(error.FindMatching({ELinuxErrorCode::NOSPC, ELinuxErrorCode::DQUOT}));
+    bool isReaderError = static_cast<bool>(error.FindMatching(NExecNode::EErrorCode::ArtifactFetchFailed));
 
     // NB: Broken pipe error usually means that job proxy exited abnormally during artifact preparation.
     // We silently ignore it and wait for the job proxy exit error.
@@ -847,7 +847,7 @@ void TSlotLocation::OnArtifactPreparationFailed(
 
         THROW_ERROR_EXCEPTION(
             EErrorCode::ArtifactCopyingFailed,
-            "Failed to build file %Qv in sandbox %Qv: broken pipe",
+            "Failed to build file %Qv in sandbox %Qlv: broken pipe",
             artifactName,
             sandboxKind)
             << error;
@@ -856,7 +856,7 @@ void TSlotLocation::OnArtifactPreparationFailed(
 
         THROW_ERROR_EXCEPTION(
             EErrorCode::TmpfsOverflow,
-            "Failed to build file %Qv in sandbox %Qv: tmpfs is too small",
+            "Failed to build file %Qv in sandbox %Qlv: tmpfs is too small",
             artifactName,
             sandboxKind)
             << error;
@@ -864,7 +864,15 @@ void TSlotLocation::OnArtifactPreparationFailed(
         YT_LOG_INFO(error, "Failed to build file in sandbox: disk space limit is too small");
 
         THROW_ERROR_EXCEPTION(
-            "Failed to build file %Qv in sandbox %Qv: disk space limit is too small",
+            "Failed to build file %Qv in sandbox %Qlv: disk space limit is too small",
+            artifactName,
+            sandboxKind)
+            << error;
+    } else if (isReaderError) {
+        YT_LOG_INFO(error, "Failed to build file in sandbox: chunk fetching failed");
+
+        THROW_ERROR_EXCEPTION(
+            "Failed to build file %Qv in sandbox %Qlv: chunk fetching failed",
             artifactName,
             sandboxKind)
             << error;
@@ -873,7 +881,7 @@ void TSlotLocation::OnArtifactPreparationFailed(
 
         auto wrappedError = TError(
             EErrorCode::ArtifactCopyingFailed,
-            "Failed to build file %Qv in sandbox %Qv",
+            "Failed to build file %Qv in sandbox %Qlv",
             artifactName,
             sandboxKind)
             << error;
@@ -886,9 +894,9 @@ void TSlotLocation::OnArtifactPreparationFailed(
     }
 }
 
-TFuture<void> TSlotLocation::Repair(bool force)
+TFuture<void> TSlotLocation::Repair()
 {
-    return BIND(&TSlotLocation::DoRepair, MakeStrong(this), force)
+    return BIND(&TSlotLocation::DoRepair, MakeStrong(this))
         .AsyncVia(HeavyInvoker_)
         .Run();
 }
@@ -950,6 +958,8 @@ void TSlotLocation::Disable(const TError& error)
 
         YT_UNUSED_FUTURE(DiskResourcesUpdateExecutor_->Stop());
         YT_UNUSED_FUTURE(SlotLocationStatisticsUpdateExecutor_->Stop());
+
+        YT_UNUSED_FUTURE(WaitFor(HealthChecker_->Stop()));
 
         const auto& dynamicConfigManager = Bootstrap_->GetDynamicConfigManager();
         const auto& dynamicConfig = dynamicConfigManager->GetConfig()->DataNode;

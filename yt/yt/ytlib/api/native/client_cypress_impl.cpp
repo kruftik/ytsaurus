@@ -1075,7 +1075,7 @@ public:
         TConcatenateNodesOptions options)
     {
         Options_ = std::move(options);
-        TransactionId_ = Client_->GetTransactionId(options, /*allowNullTransaction=*/true);
+        TransactionId_ = Client_->GetTransactionId(options, /*allowNullTransaction*/ true);
         Append_ = dstPath.GetAppend();
 
         try {
@@ -1560,7 +1560,7 @@ private:
             auto schemasCompatibility = CheckTableSchemaCompatibility(
                 inputTableSchema,
                 *OutputTableSchema_,
-                /*ignoreSortOrder*/false);
+                /*ignoreSortOrder*/ false);
             if (schemasCompatibility.first != ESchemaCompatibility::FullyCompatible) {
                 YT_LOG_DEBUG(schemasCompatibility.second,
                     "Input table schema and output table schema are incompatible; "
@@ -1950,6 +1950,22 @@ void TClient::DoConcatenateNodes(
 {
     if (options.Retry) {
         THROW_ERROR_EXCEPTION("\"concatenate\" command is not retriable");
+    }
+
+    const auto& user = Options_.GetAuthenticatedUser();
+    for (const auto& srcPath : srcPaths) {
+        if (!DoNodeExists(srcPath.GetPath(), {})) {
+            continue;
+        }
+
+        auto permissionResult = CheckPermissionImpl(srcPath.GetPath(), NYTree::EPermission::FullRead);
+        if (permissionResult.Action == ESecurityAction::Deny) {
+            THROW_ERROR_EXCEPTION(
+                NSecurityClient::EErrorCode::AuthorizationError,
+                 "User has been denied access to do concatenate operation because he has no full-read access to table %v",
+                srcPath.GetPath())
+                << permissionResult.ToError(user, EPermission::FullRead);
+        }
     }
 
     TNodeConcatenator{MakeStrong(this), Logger}

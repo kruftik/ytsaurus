@@ -69,42 +69,57 @@ TLogicalTimeRegistry::TLamportClock* TLogicalTimeRegistry::GetClock()
     return &Clock_;
 }
 
-std::pair<TLogicalTime, i64> TLogicalTimeRegistry::GetConsistentState(std::optional<TLogicalTime> logicalTime)
+std::pair<TLogicalTime, TConsistentState> TLogicalTimeRegistry::GetConsistentState(std::optional<TLogicalTime> logicalTime)
 {
     if (TimeInfoMap_.empty()) {
         THROW_ERROR_EXCEPTION(
-            NHiveClient::EErrorCode::EntryNotFound,
+            NHiveClient::EErrorCode::TimeEntryNotFound,
             "Logical time registry is empty");
     }
 
-    auto currentSequenceNumber = HydraManager_->GetSequenceNumber();
+    auto currentState = TConsistentState{
+        .SequenceNumber = HydraManager_->GetSequenceNumber(),
+        .SegmentId = HydraManager_->GetAutomatonVersion().SegmentId,
+    };
     if (!logicalTime) {
         auto it = TimeInfoMap_.rbegin();
-        return {it->first, currentSequenceNumber};
+        return {it->first, currentState};
     }
 
     auto it = TimeInfoMap_.upper_bound(*logicalTime);
     if (it == TimeInfoMap_.begin()) {
         THROW_ERROR_EXCEPTION(
-            NHiveClient::EErrorCode::EntryNotFound,
+            NHiveClient::EErrorCode::TimeEntryNotFound,
             "Logical time entry has been evicted");
     }
 
-    auto sequenceNumber = it != TimeInfoMap_.end()
-        ? it->second.SequenceNumber - 1
-        : currentSequenceNumber;
-    YT_VERIFY(sequenceNumber >= 0);
+    auto resultState = it != TimeInfoMap_.end()
+        ? it->second.AdjustedState
+        : currentState;
 
-    return {std::prev(it)->first, sequenceNumber};
+    if (resultState.SequenceNumber < 0 || resultState.SegmentId < 0) {
+        THROW_ERROR_EXCEPTION(
+            NHiveClient::EErrorCode::TimeEntryNotFound,
+            "Logical time entry is invalid");
+    }
+
+    return {std::prev(it)->first, resultState};
 }
 
 void TLogicalTimeRegistry::OnTick(TLogicalTime logicalTime)
 {
     auto* mutationContext = GetCurrentMutationContext();
+    auto version = mutationContext->GetVersion();
+
     EmplaceOrCrash(TimeInfoMap_,
         logicalTime,
         TTimeInfo{
-            .SequenceNumber = mutationContext->GetSequenceNumber(),
+            .AdjustedState = TConsistentState{
+                .SequenceNumber = mutationContext->GetSequenceNumber() - 1,
+                .SegmentId = version.RecordId == 0
+                    ? version.SegmentId - 1
+                    : version.SegmentId,
+            },
             .Timestamp = mutationContext->GetTimestamp(),
         });
     ++TimeInfoMapSize_;

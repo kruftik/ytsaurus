@@ -19,6 +19,8 @@
 #include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/helpers.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/hive/cluster_directory.h>
 #include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
 
@@ -61,7 +63,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CypressProxyLogger;
+static constexpr auto& Logger = CypressProxyLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -73,9 +75,9 @@ public:
         : Config_(std::move(config))
     {
         if (Config_->AbortOnUnrecognizedOptions) {
-            AbortOnUnrecognizedOptions(Logger, Config_);
+            AbortOnUnrecognizedOptions(Logger(), Config_);
         } else {
-            WarnForUnrecognizedOptions(Logger, Config_);
+            WarnForUnrecognizedOptions(Logger(), Config_);
         }
     }
 
@@ -150,7 +152,7 @@ public:
         return NativeRootClient_;
     }
 
-    const IYPathServicePtr& GetSequoiaService() const override
+    const ISequoiaServicePtr& GetSequoiaService() const override
     {
         return SequoiaService_;
     }
@@ -167,7 +169,7 @@ private:
 
     ILazySequoiaClientPtr SequoiaClient_;
 
-    IYPathServicePtr SequoiaService_;
+    ISequoiaServicePtr SequoiaService_;
 
     TActionQueuePtr ControlQueue_;
 
@@ -199,7 +201,7 @@ private:
         NativeRootClient_ = NativeConnection_->CreateNativeClient({.User = NSecurityClient::RootUserName});
         NativeAuthenticator_ = NApi::NNative::CreateNativeAuthenticator(NativeConnection_);
 
-        SequoiaClient_ = CreateLazySequoiaClient(NativeRootClient_, Logger);
+        SequoiaClient_ = CreateLazySequoiaClient(NativeRootClient_, Logger());
 
         // If Sequoia is local it's safe to create the client right now.
         const auto& groundClusterName = Config_->ClusterConnection->Dynamic->SequoiaConnection->GroundClusterName;
@@ -208,7 +210,7 @@ private:
         }
 
         DynamicConfigManager_ = New<TDynamicConfigManager>(this);
-        DynamicConfigManager_->SubscribeConfigChanged(BIND(&TBootstrap::OnDynamicConfigChanged, Unretained(this)));
+        DynamicConfigManager_->SubscribeConfigChanged(BIND_NO_PROPAGATE(&TBootstrap::OnDynamicConfigChanged, Unretained(this)));
 
         {
             TCypressRegistrarOptions options{
@@ -231,14 +233,16 @@ private:
             &MonitoringManager_,
             &OrchidRoot_);
 
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/config",
-            CreateVirtualNode(ConvertTo<INodePtr>(Config_)));
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/dynamic_config_manager",
-            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        if (Config_->ExposeConfigInOrchid) {
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/config",
+                CreateVirtualNode(ConvertTo<INodePtr>(Config_)));
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/dynamic_config_manager",
+                CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        }
         SetBuildAttributes(
             OrchidRoot_,
             "cypress_proxy");
@@ -261,7 +265,7 @@ private:
     {
         if (const auto& groundClusterName = Config_->ClusterConnection->Dynamic->SequoiaConnection->GroundClusterName) {
             NativeConnection_->GetClusterDirectory()->SubscribeOnClusterUpdated(
-                BIND([=, this] (const TString& clusterName, const INodePtr& /*configNode*/) {
+                BIND_NO_PROPAGATE([=, this] (const TString& clusterName, const INodePtr& /*configNode*/) {
                     if (clusterName == *groundClusterName) {
                         auto groundConnection = NativeConnection_->GetClusterDirectory()->GetConnection(*groundClusterName);
                         auto groundClient = groundConnection->CreateNativeClient({.User = NSecurityClient::RootUserName});
@@ -270,6 +274,7 @@ private:
                 }));
         }
         NativeConnection_->GetClusterDirectorySynchronizer()->Start();
+        NativeConnection_->GetMasterCellDirectorySynchronizer()->Start();
 
         YT_LOG_INFO("Listening for HTTP requests (Port: %v)", Config_->MonitoringPort);
         HttpServer_->Start();

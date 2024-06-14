@@ -33,6 +33,8 @@
 #include <yt/yt/ytlib/auth/native_authentication_manager.h>
 #include <yt/yt/ytlib/auth/tvm_bridge.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/chunk_client/chunk_reader_host.h>
 #include <yt/yt/ytlib/chunk_client/client_block_cache.h>
 #include <yt/yt/ytlib/chunk_client/config.h>
@@ -176,14 +178,14 @@ TJobProxy::TJobProxy(
     , JobId_(jobId)
     , JobThread_(New<TActionQueue>("JobMain"))
     , ControlThread_(New<TActionQueue>("Control"))
-    , Logger(JobProxyLogger.WithTag("OperationId: %v, JobId: %v",
+    , Logger(JobProxyLogger().WithTag("OperationId: %v, JobId: %v",
         OperationId_,
         JobId_))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 }
 
@@ -453,7 +455,9 @@ void TJobProxy::RetrieveJobSpec()
         Abort(EJobProxyExitCode::InvalidSpecVersion);
     }
 
-    JobSpecHelper_ = MaybePatchDataSourceDirectory(rsp->job_spec());
+    auto jobSpec = rsp->job_spec();
+    ChunkIdToOriginalSpec_ = PatchProxiedChunkSpecs(&jobSpec);
+    JobSpecHelper_ = MaybePatchDataSourceDirectory(std::move(jobSpec));
 
     const auto& resourceUsage = rsp->resource_usage();
 
@@ -518,7 +522,8 @@ void TJobProxy::RetrieveJobSpec()
 
         ReaderBlockCache_ = CreateClientBlockCache(
             GetJobSpecHelper()->GetJobIOConfig()->BlockCache,
-            EBlockType::CompressedData | EBlockType::UncompressedData);
+            EBlockType::CompressedData | EBlockType::UncompressedData,
+            GetNullMemoryUsageTracker());
     }
 }
 
@@ -682,6 +687,7 @@ void TJobProxy::EnableRpcProxyInJobProxy(int rpcProxyWorkerThreadPoolSize)
     connection->GetClusterDirectorySynchronizer()->Start();
     connection->GetNodeDirectorySynchronizer()->Start();
     connection->GetQueueConsumerRegistrationManager()->StartSync();
+    connection->GetMasterCellDirectorySynchronizer()->Start();
     auto rootClient = connection->CreateNativeClient(TClientOptions::FromUser(NSecurityClient::RootUserName));
 
     auto proxyCoordinator = CreateProxyCoordinator();
@@ -779,6 +785,7 @@ TJobResult TJobProxy::RunJob()
         RetrieveJobSpec();
 
         auto clusterConnection = CreateNativeConnection(Config_->ClusterConnection);
+        clusterConnection->GetMasterCellDirectorySynchronizer()->Start();
         Client_ = clusterConnection->CreateNativeClient(TClientOptions::FromUser(GetAuthenticatedUser()));
 
         PackBaggageFromJobSpec(RootSpan_, JobSpecHelper_->GetJobSpec(), OperationId_, JobId_);
@@ -827,6 +834,12 @@ TJobResult TJobProxy::RunJob()
         const auto& jobSpecExt = GetJobSpecHelper()->GetJobSpecExt();
         if (jobSpecExt.is_traced()) {
             RootSpan_->SetSampled();
+        }
+        if (jobSpecExt.has_user_job_spec() && jobSpecExt.user_job_spec().has_monitoring_config()) {
+            TString jobProxyDescriptor = jobSpecExt.user_job_spec().monitoring_config().job_descriptor();
+            NProfiling::TSolomonRegistry::Get()->SetDynamicTags({
+                NProfiling::TTag{"job_descriptor", jobProxyDescriptor},
+                NProfiling::TTag{"slot_index", ToString(Config_->SlotIndex)}});
         }
         if (jobSpecExt.has_user_job_spec() && jobSpecExt.user_job_spec().enable_rpc_proxy_in_job_proxy()) {
             EnableRpcProxyInJobProxy(jobSpecExt.user_job_spec().rpc_proxy_worker_thread_pool_size());
@@ -881,7 +894,17 @@ TJobResult TJobProxy::RunJob()
 
         OnSpawned();
     } catch (const std::exception& ex) {
+        auto isSupervisorProxyTimeoutError = [] (const TError& error) {
+            auto serviceAttribute = error.Attributes().Find<std::optional<TString>>("service");
+            return error.GetCode() == NYT::EErrorCode::Timeout &&
+                serviceAttribute == TSupervisorServiceProxy::GetDescriptor().ServiceName;
+        };
+
         YT_LOG_ERROR(ex, "Failed to prepare job proxy");
+        auto error = TError(ex);
+        if (error.FindMatching(isSupervisorProxyTimeoutError)) {
+            Abort(EJobProxyExitCode::SupervisorCommunicationFailed);
+        }
         Abort(EJobProxyExitCode::JobProxyPrepareFailed);
     }
 
@@ -1035,35 +1058,27 @@ TStatistics TJobProxy::GetEnrichedStatistics() const
             YT_LOG_ERROR(ex, "Unable to get block IO statistics from resource controller");
         }
 
-        try {
-            auto jobCpuStatistics = environment->GetJobCpuStatistics()
-                .ValueOrThrow();
+        // NB(arkady-e1ppa): GetXx methods are noexcept
+        // AddSample methods can only throw if path is incorrect.
+        // This is impossible for a hardcoded path.
+        // If you happen to change path, don't forget to
+        // change it here as well and make it compatible.
+        RunNoExcept([&] {
+            auto jobCpuStatistics = environment->GetJobCpuStatistics();
             if (jobCpuStatistics) {
                 statistics.AddSample("/job/cpu", *jobCpuStatistics);
             }
-        } catch (const std::exception& ex) {
-            YT_LOG_ERROR(ex, "Unable to get job CPU statistics from job proxy environment");
-        }
 
-        try {
-            auto jobMemoryStatistics = environment->GetJobMemoryStatistics()
-                .ValueOrThrow();
+            auto jobMemoryStatistics = environment->GetJobMemoryStatistics();
             if (jobMemoryStatistics) {
                 statistics.AddSample("/job/memory", *jobMemoryStatistics);
             }
-        } catch (const std::exception& ex) {
-            YT_LOG_ERROR(ex, "Unable to get job memory statistics from job proxy environment");
-        }
 
-        try {
-            auto jobBlockIOStatistics = environment->GetJobBlockIOStatistics()
-                .ValueOrThrow();
+            auto jobBlockIOStatistics = environment->GetJobBlockIOStatistics();
             if (jobBlockIOStatistics) {
                 statistics.AddSample("/job/block_io", *jobBlockIOStatistics);
             }
-        } catch (const std::exception& ex) {
-            YT_LOG_ERROR(ex, "Unable to get job block IO statistics from job proxy environment");
-        }
+        });
     }
 
     if (JobProxyMaxMemoryUsage_ > 0) {
@@ -1159,6 +1174,7 @@ IUserJobEnvironmentPtr TJobProxy::CreateUserJobEnvironment(const TJobSpecEnviron
         .NetworkAddresses = Config_->NetworkAddresses,
         .EnableNat64 = Config_->EnableNat64,
         .DisableNetwork = Config_->DisableNetwork,
+        .EnableFuse = Config_->EnableFuse,
         .EnableCudaGpuCoreDump = options.EnableGpuCoreDumps,
         .EnablePortoMemoryTracking = options.EnablePortoMemoryTracking,
         .EnablePorto = options.EnablePorto,
@@ -1479,13 +1495,18 @@ void TJobProxy::FillJobResult(TJobResult* jobResult)
     // For erasure chunks, replace part id with whole chunk id.
     auto* jobResultExt = jobResult->MutableExtension(TJobResultExt::job_result_ext);
     for (auto chunkId : failedChunkIds) {
-        auto actualChunkId = IsErasureChunkPartId(chunkId)
-            ? ErasureChunkIdFromPartId(chunkId)
-            : chunkId;
+        auto originalSpecIt = ChunkIdToOriginalSpec_.find(chunkId);
+        auto originalChunkId = originalSpecIt.IsEnd()
+            ? chunkId
+            : FromProto<TChunkId>(originalSpecIt->second->chunk_id());
+        auto actualChunkId = IsErasureChunkPartId(originalChunkId)
+            ? ErasureChunkIdFromPartId(originalChunkId)
+            : originalChunkId;
         ToProto(jobResultExt->add_failed_chunk_ids(), actualChunkId);
     }
 
     auto interruptDescriptor = job->GetInterruptDescriptor();
+    PatchInterruptDescriptor(ChunkIdToOriginalSpec_, interruptDescriptor);
 
     if (!interruptDescriptor.UnreadDataSliceDescriptors.empty()) {
         auto inputStatistics = job->GetStatistics().TotalInputStatistics.DataStatistics;
@@ -1495,12 +1516,12 @@ void TJobProxy::FillJobResult(TJobResult* jobResult)
             // Still we would like to treat such a job as interrupted, otherwise it may lead to an infinite sequence
             // of jobs being aborted by splitter instead of interrupts.
 
-            ToProto(
+            NChunkClient::ToProto(
                 jobResultExt->mutable_unread_chunk_specs(),
                 jobResultExt->mutable_chunk_spec_count_per_unread_data_slice(),
                 jobResultExt->mutable_virtual_row_index_per_unread_data_slice(),
                 interruptDescriptor.UnreadDataSliceDescriptors);
-            ToProto(
+            NChunkClient::ToProto(
                 jobResultExt->mutable_read_chunk_specs(),
                 jobResultExt->mutable_chunk_spec_count_per_read_data_slice(),
                 jobResultExt->mutable_virtual_row_index_per_read_data_slice(),
@@ -1517,7 +1538,7 @@ void TJobProxy::FillJobResult(TJobResult* jobResult)
             if (jobResult->error().code() == 0) {
                 ToProto(
                     jobResult->mutable_error(),
-                    TError(EErrorCode::JobNotPrepared, "Job did not read anything"));
+                    TError(EErrorCode::InterruptionFailed, "Job did not read anything"));
             }
         }
     }
@@ -1599,20 +1620,29 @@ TDuration TJobProxy::GetSpentCpuTime() const
 {
     auto result = TDuration::Zero();
 
+    auto validCpuStatistics = [] (const auto& cpuStats) {
+        return
+            cpuStats &&
+            cpuStats->SystemUsageTime.has_value() &&
+            cpuStats->UserUsageTime.has_value();
+    };
+
     if (auto job = FindJob()) {
-        if (auto userJobCpu = job->GetUserJobCpuStatistics()) {
-            result += userJobCpu->SystemUsageTime +
-                userJobCpu->UserUsageTime;
+        auto userJobCpu = job->GetUserJobCpuStatistics();
+        if (validCpuStatistics(userJobCpu)) {
+            result += userJobCpu->SystemUsageTime.value() +
+                userJobCpu->UserUsageTime.value();
         }
     }
 
     if (auto environment = FindJobProxyEnvironment()) {
+
         auto jobProxyCpu = environment->GetCpuStatistics()
             .ValueOrThrow();
 
-        if (jobProxyCpu) {
-            result += jobProxyCpu->SystemUsageTime +
-                jobProxyCpu->UserUsageTime;
+        if (validCpuStatistics(jobProxyCpu)) {
+            result += jobProxyCpu->SystemUsageTime.value() +
+                jobProxyCpu->UserUsageTime.value();
         } else {
             YT_LOG_WARNING("Cannot get cpu statistics from job environment");
         }

@@ -21,7 +21,7 @@ using namespace NCellarClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ChaosNodeLogger;
+static constexpr auto& Logger = ChaosNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -83,7 +83,7 @@ private:
             }
 
             asyncResults.push_back(
-                BIND([=, this, this_ = MakeStrong(this)] () {
+                BIND([=, this, this_ = MakeStrong(this)] {
                     ScanSlot_.Fire(occupier);
                 })
                 .AsyncVia(occupier->GetGuardedAutomatonInvoker())

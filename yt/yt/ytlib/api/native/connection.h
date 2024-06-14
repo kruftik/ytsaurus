@@ -60,6 +60,7 @@ struct IConnection
 
     virtual const NQueryClient::IEvaluatorPtr& GetQueryEvaluator() = 0;
     virtual const NQueryClient::IColumnEvaluatorCachePtr& GetColumnEvaluatorCache() = 0;
+    virtual const NQueryClient::IExpressionEvaluatorCachePtr& GetExpressionEvaluatorCache() = 0;
     virtual const NChunkClient::IBlockCachePtr& GetBlockCache() = 0;
     virtual const NChunkClient::IClientChunkMetaCachePtr& GetChunkMetaCache() = 0;
 
@@ -82,6 +83,7 @@ struct IConnection
     virtual const NChunkClient::IChunkReplicaCachePtr& GetChunkReplicaCache() = 0;
 
     virtual std::pair<IClientPtr, NYPath::TYPath> GetQueryTrackerStage(const TString& stage) = 0;
+    virtual NRpc::IChannelPtr GetQueryTrackerChannelOrThrow(const TString& stage) = 0;
 
     virtual const NHiveClient::TCellTrackerPtr& GetDownedCellTracker() = 0;
 
@@ -114,7 +116,7 @@ struct IConnection
         NChaosClient::TReplicationCardId replicationCardId,
         NHydra::EPeerKind peerKind = NHydra::EPeerKind::Leader) = 0;
 
-    virtual NRpc::IChannelPtr GetQueueAgentChannelOrNull(TStringBuf stage) const = 0;
+    virtual NRpc::IChannelPtr FindQueueAgentChannel(TStringBuf stage) const = 0;
     virtual const NQueueClient::TQueueConsumerRegistrationManagerPtr& GetQueueConsumerRegistrationManager() const = 0;
 
     virtual NRpc::IRoamingChannelProviderPtr GetYqlAgentChannelProviderOrThrow(const TString& stage) const = 0;
@@ -136,6 +138,7 @@ struct IConnection
 
     virtual IClientPtr CreateNativeClient(const TClientOptions& options) = 0;
 
+    virtual std::vector<TString> GetDiscoveryServerAddresses() const = 0;
     virtual NDiscoveryClient::IDiscoveryClientPtr CreateDiscoveryClient(
         NDiscoveryClient::TDiscoveryClientConfigPtr config,
         NRpc::IChannelFactoryPtr channelFactory) = 0;

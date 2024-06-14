@@ -109,11 +109,6 @@ using TJoinLookup = google::dense_hash_map<
     NDetail::TGroupHasher,
     NDetail::TRowComparer>;
 
-using TJoinLookupRows = std::unordered_multiset<
-    const TPIValue*,
-    NDetail::TGroupHasher,
-    NDetail::TRowComparer>;
-
 struct TLookupRowInRowsetWebAssemblyContext
 {
     std::unique_ptr<TLookupRows> LookupTable;
@@ -212,8 +207,6 @@ struct TWriteOpClosure
     explicit TWriteOpClosure(IMemoryChunkProviderPtr chunkProvider);
 };
 
-#define CHECK_STACK() (void) 0;
-
 struct TExecutionContext
 {
     ISchemafulUnversionedReaderPtr Reader;
@@ -236,66 +229,6 @@ struct TExecutionContext
     bool IsMerge = false;
 
     IMemoryChunkProviderPtr MemoryChunkProvider;
-
-    TExecutionContext()
-    {
-        auto context = this;
-        Y_UNUSED(context);
-        CHECK_STACK();
-    }
-};
-
-class TTopCollector
-{
-public:
-    TTopCollector(
-        i64 limit,
-        NWebAssembly::TCompartmentFunction<TComparerFunction> comparer,
-        size_t rowSize,
-        IMemoryChunkProviderPtr memoryChunkProvider);
-
-    std::vector<const TPIValue*> GetRows() const;
-
-    void AddRow(const TPIValue* row);
-
-private:
-    // GarbageMemorySize <= AllocatedMemorySize <= TotalMemorySize
-    size_t TotalMemorySize_ = 0;
-    size_t AllocatedMemorySize_ = 0;
-    size_t GarbageMemorySize_ = 0;
-
-    class TComparer
-    {
-    public:
-        explicit TComparer(NWebAssembly::TCompartmentFunction<TComparerFunction> comparer)
-            : Comparer_(comparer)
-        { }
-
-        bool operator() (const std::pair<const TPIValue*, int>& lhs, const std::pair<const TPIValue*, int>& rhs) const
-        {
-            return (*this)(lhs.first, rhs.first);
-        }
-
-        bool operator () (const TPIValue* a, const TPIValue* b) const
-        {
-            return Comparer_(a, b);
-        }
-
-    private:
-        NWebAssembly::TCompartmentFunction<TComparerFunction> const Comparer_;
-    };
-
-    TComparer Comparer_;
-    size_t RowSize_;
-    IMemoryChunkProviderPtr MemoryChunkProvider_;
-
-    std::vector<TExpressionContext> Contexts_;
-    std::vector<int> EmptyContextIds_;
-    std::vector<std::pair<const TPIValue*, int>> Rows_;
-
-    std::pair<const TPIValue*, int> Capture(const TPIValue* row);
-
-    void AccountGarbage(const TPIValue* row);
 };
 
 struct TRowSchemaInformation
@@ -375,7 +308,7 @@ public:
         TRange<TPIValue> literalValues,
         TRange<void*> opaqueData,
         TRange<size_t> opaqueDataSizes,
-        TExecutionContext* context);
+        TExecutionContext* context) const;
 
 private:
     const TCGQueryCallback Callback_;
@@ -412,7 +345,7 @@ public:
         TRange<size_t> opaqueDataSizes,
         TValue* result,
         TRange<TValue> inputRow,
-        const TRowBufferPtr& buffer);
+        const TRowBufferPtr& buffer) const;
 
     operator bool() const;
 
@@ -449,10 +382,10 @@ public:
         TCGAggregateCallbacks callbacks,
         std::unique_ptr<NWebAssembly::IWebAssemblyCompartment> compartment);
 
-    void RunInit(const TRowBufferPtr& buffer, TValue* state);
-    void RunUpdate(const TRowBufferPtr& buffer, TValue* state, TRange<TValue> arguments);
-    void RunMerge(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState);
-    void RunFinalize(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState);
+    void RunInit(const TRowBufferPtr& buffer, TValue* state) const;
+    void RunUpdate(const TRowBufferPtr& buffer, TValue* state, TRange<TValue> arguments) const;
+    void RunMerge(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState) const;
+    void RunFinalize(const TRowBufferPtr& buffer, TValue* firstState, const TValue* secondState) const;
 
 private:
     TCGAggregateCallbacks Callbacks_;

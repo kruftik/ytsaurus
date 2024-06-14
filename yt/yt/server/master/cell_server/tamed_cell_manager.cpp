@@ -133,7 +133,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CellServerLogger;
+static constexpr auto& Logger = CellServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -165,19 +165,19 @@ public:
 
         RegisterLoader(
             "CellManager.Keys",
-            BIND(&TTamedCellManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTamedCellManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "CellManager.Values",
-            BIND(&TTamedCellManager::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTamedCellManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "CellManager.Keys",
-            BIND(&TTamedCellManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTamedCellManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "CellManager.Values",
-            BIND(&TTamedCellManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TTamedCellManager::SaveValues, Unretained(this)));
 
         RegisterMethod(BIND_NO_PROPAGATE(&TTamedCellManager::HydraAssignPeers, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TTamedCellManager::HydraRevokePeers, Unretained(this)));
@@ -866,7 +866,7 @@ public:
                 // Decommission cell on secondary masters.
                 NTabletServer::NProto::TReqDecommissionTabletCellOnMaster req;
                 ToProto(req.mutable_cell_id(), cell->GetId());
-                multicellManager->PostToMasters(req, multicellManager->GetRegisteredMasterCellTags());
+                multicellManager->PostToSecondaryMasters(req);
 
                 // Decommission cell on node.
                 if (force) {
@@ -955,7 +955,7 @@ public:
 
         const auto& multicellManager = Bootstrap_->GetMulticellManager();
         if (multicellManager->IsPrimaryMaster()) {
-            multicellManager->PostToMasters(*request, multicellManager->GetRegisteredMasterCellTags());
+            multicellManager->PostToSecondaryMasters(*request);
         }
     }
 
@@ -1405,27 +1405,6 @@ private:
             cell->GossipStatus().Initialize(Bootstrap_);
         }
 
-        // COMPAT(shakurov)
-        for (auto [id, bundle] : CellBundleMap_) {
-            if (!IsObjectAlive(bundle)) {
-                continue;
-            }
-
-            if (bundle->GetType() != EObjectType::ChaosCellBundle) {
-                continue;
-            }
-
-            auto* chaosCellBundle = bundle->As<TChaosCellBundle>();
-            if (auto nullCellCount = std::erase(chaosCellBundle->MetadataCells(), nullptr);
-                nullCellCount != 0)
-            {
-                YT_LOG_ALERT("Null metadata cells encountered; cleaning them out "
-                    "(CellBundleId: %v, NullMetadataCellCount: %v)",
-                    id,
-                    nullCellCount);
-            }
-        }
-
         AfterSnapshotLoaded_.Fire();
     }
 
@@ -1509,7 +1488,7 @@ private:
 
         const auto& hydraManager = Bootstrap_->GetHydraFacade()->GetHydraManager();
         YT_UNUSED_FUTURE(CreateMutation(hydraManager, TReqUpdateTabletCellHealthStatistics())
-            ->CommitAndLog(Logger));
+            ->CommitAndLog(Logger()));
 
         if (multicellManager->IsPrimaryMaster()) {
             multicellManager->PostToSecondaryMasters(request, false);
@@ -1656,11 +1635,6 @@ private:
         node->UpdateCellarSize(cellarType, newSize);
     }
 
-    void OnNodeRegistered(TNode* node)
-    {
-        node->InitCellars();
-    }
-
     void OnNodeUnregistered(TNode* node)
     {
         YT_LOG_DEBUG("Node unregistered (Address: %v)",
@@ -1707,7 +1681,7 @@ private:
         VERIFY_THREAD_AFFINITY(AutomatonThread);
 
         auto cellarType = FromProto<ECellarType>(request->type());
-        auto Logger = CellServerLogger.WithTag("CellarType: %v", cellarType);
+        auto Logger = CellServerLogger().WithTag("CellarType: %v", cellarType);
 
         // Various request helpers.
         auto requestCreateSlot = [&] (const TCellBase* cell) {
@@ -2109,7 +2083,7 @@ private:
 
         if (multicellManager->IsPrimaryMaster()) {
             RestartPrerequisiteTransactions(cell, assignedPeers);
-            multicellManager->PostToMasters(*request, multicellManager->GetRegisteredMasterCellTags());
+            multicellManager->PostToSecondaryMasters(*request);
         }
 
         ReconfigureCell(cell);
@@ -2158,7 +2132,7 @@ private:
         const auto& multicellManager = Bootstrap_->GetMulticellManager();
         if (multicellManager->IsPrimaryMaster()) {
             AbortCellTransactions(cell, revokedPeers);
-            multicellManager->PostToMasters(*request, multicellManager->GetRegisteredMasterCellTags());
+            multicellManager->PostToSecondaryMasters(*request);
         }
 
         ReconfigureCell(cell);
@@ -2232,7 +2206,7 @@ private:
         if (multicellManager->IsPrimaryMaster()) {
             RestartAllPrerequisiteTransactions(cell);
 
-            multicellManager->PostToMasters(*request, multicellManager->GetRegisteredMasterCellTags());
+            multicellManager->PostToSecondaryMasters(*request);
         }
 
         ReconfigureCell(cell);
@@ -2262,11 +2236,11 @@ private:
 
         CellStatusIncrementalGossipExecutor_ = New<TPeriodicExecutor>(
             Bootstrap_->GetHydraFacade()->GetEpochAutomatonInvoker(NCellMaster::EAutomatonThreadQueue::TabletGossip),
-            BIND(&TTamedCellManager::OnCellStatusGossip, MakeWeak(this), /*incremental*/true));
+            BIND(&TTamedCellManager::OnCellStatusGossip, MakeWeak(this), /*incremental*/ true));
         CellStatusIncrementalGossipExecutor_->Start();
         CellStatusFullGossipExecutor_ = New<TPeriodicExecutor>(
             Bootstrap_->GetHydraFacade()->GetEpochAutomatonInvoker(NCellMaster::EAutomatonThreadQueue::TabletGossip),
-            BIND(&TTamedCellManager::OnCellStatusGossip, MakeWeak(this), /*incremental*/false));
+            BIND(&TTamedCellManager::OnCellStatusGossip, MakeWeak(this), /*incremental*/ false));
         CellStatusFullGossipExecutor_->Start();
     }
 
@@ -2407,15 +2381,9 @@ private:
             : Format("Prerequisite for cell %v", cell->GetId());
 
         const auto& transactionManager = Bootstrap_->GetTransactionManager();
-        auto* transaction = transactionManager->StartTransaction(
-            /*parent*/ nullptr,
-            /*prerequisiteTransactions*/ {},
+        auto* transaction = transactionManager->StartNonMirroredCypressTransaction(
             secondaryCellTags,
-            /*timeout*/ std::nullopt,
-            /*deadline*/ std::nullopt,
-            title,
-            EmptyAttributes(),
-            /*isCypressTransaction*/ true);
+            title);
 
         YT_VERIFY(!cell->GetPrerequisiteTransaction(peerId));
         EmplaceOrCrash(TransactionToCellMap_, transaction, std::pair(cell, peerId));
@@ -2427,7 +2395,7 @@ private:
         if (peerId) {
             request.set_peer_id(*peerId);
         }
-        multicellManager->PostToMasters(request, multicellManager->GetRegisteredMasterCellTags());
+        multicellManager->PostToSecondaryMasters(request);
 
         YT_LOG_DEBUG("Cell prerequisite transaction started (CellId: %v, PeerId: %v, TransactionId: %v)",
             cell->GetId(),
@@ -2496,7 +2464,7 @@ private:
         if (peerId) {
             request.set_peer_id(*peerId);
         }
-        multicellManager->PostToMasters(request, multicellManager->GetRegisteredMasterCellTags());
+        multicellManager->PostToSecondaryMasters(request);
 
         // NB: Make a copy, transaction will die soon.
         auto transactionId = transaction->GetId();

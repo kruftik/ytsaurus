@@ -33,6 +33,8 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
+static constexpr auto& Logger = LeaseManagerLogger;
+
 class TLeaseManager;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -90,6 +92,17 @@ public:
 
         Persist(context, State_);
         Persist(context, PersistentRefCounter_);
+
+        // COMPAT(h0pless): Old snapshots are missing OwnerCellId_ due to a bug.
+        if (context.GetVersion() < static_cast<int>(ELeaseManagerReign::PersistentLeaseOwnerCellId)) {
+            YT_LOG_ALERT("Loaded a lease object from an older snapshot; "
+                "the lease is likely stuck, consider forcing transaction abort "
+                "(LeaseId: %v, ContextVersion: %v)",
+                Id_,
+                context.GetVersion());
+        } else {
+            Persist(context, OwnerCellId_);
+        }
     }
 
 private:
@@ -211,7 +224,7 @@ private:
     ELeaseState State_ = ELeaseState::Unknown;
 };
 
-DECLARE_ENTITY_TYPE(TLease, TLeaseId, NObjectClient::TDirectObjectIdHash);
+DECLARE_ENTITY_TYPE(TLease, TLeaseId, NObjectClient::TObjectIdEntropyHash);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -253,7 +266,7 @@ public:
             hydraManager,
             hydraManager->CreateGuardedAutomatonInvoker(automatonInvoker),
             NLeaseClient::TLeaseServiceProxy::GetDescriptor(),
-            LeaseManagerLogger,
+            LeaseManagerLogger(),
             selfCellId,
             std::move(upstreamSynchronizer),
             std::move(authenticator))
@@ -263,19 +276,19 @@ public:
     {
         RegisterLoader(
             "LeaseManager.Keys",
-            BIND(&TLeaseManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TLeaseManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "LeaseManager.Values",
-            BIND(&TLeaseManager::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TLeaseManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "LeaseManager.Keys",
-            BIND(&TLeaseManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&TLeaseManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "LeaseManager.Values",
-            BIND(&TLeaseManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&TLeaseManager::SaveValues, Unretained(this)));
 
         TCompositeAutomatonPart::RegisterMethod(BIND_NO_PROPAGATE(&TLeaseManager::HydraRegisterLease, Unretained(this)));
         TCompositeAutomatonPart::RegisterMethod(BIND_NO_PROPAGATE(&TLeaseManager::HydraRevokeLease, Unretained(this)));
@@ -287,6 +300,11 @@ public:
         TServiceBase::RegisterMethod(RPC_SERVICE_METHOD_DESC(RevokeLease));
         TServiceBase::RegisterMethod(RPC_SERVICE_METHOD_DESC(ReferenceLease));
         TServiceBase::RegisterMethod(RPC_SERVICE_METHOD_DESC(UnreferenceLease));
+    }
+
+    int GetCurrentSnapshotVersion() override
+    {
+        return GetCurrentReign();
     }
 
     // ILeaseManager implementation.

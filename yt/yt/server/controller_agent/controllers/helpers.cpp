@@ -5,12 +5,18 @@
 
 #include <yt/yt/server/controller_agent/config.h>
 
+#include <yt/yt/ytlib/api/native/client.h>
+
 #include <yt/yt/ytlib/chunk_client/data_source.h>
 #include <yt/yt/ytlib/chunk_client/data_sink.h>
 
 #include <yt/yt/ytlib/object_client/object_service_proxy.h>
 
 #include <yt/yt/ytlib/controller_agent/proto/output_result.pb.h>
+
+#include <yt/yt/ytlib/cypress_client/rpc_helpers.h>
+
+#include <yt/yt/ytlib/table_client/table_ypath_proxy.h>
 
 #include <yt/yt/client/formats/config.h>
 
@@ -24,6 +30,8 @@ using namespace NApi;
 using namespace NChunkClient;
 using namespace NChunkPools;
 using namespace NConcurrency;
+using namespace NCypressClient;
+using namespace NObjectClient;
 using namespace NTableClient;
 using namespace NYPath;
 using namespace NYTree;
@@ -261,9 +269,10 @@ TDockerImageSpec::TDockerImageSpec(const TString& dockerImage, const TDockerRegi
 {
     TStringBuf imageTag;
 
-    // Format: [REGISTRY/]IMAGE[:TAG], where REGISTRY is FQDN[:PORT] - i.e. has at least one dot.
+    // Format: [REGISTRY/]IMAGE[:TAG], where REGISTRY is FQDN[:PORT].
+    // Registry FQDN must has at least one "." or PORT.
     if (!StringSplitter(dockerImage).Split('/').Limit(2).TryCollectInto(&Registry, &imageTag) ||
-        !Registry.Contains('.'))
+        Registry.find_first_of(".:") == TString::npos)
     {
         Registry = "";
         imageTag = dockerImage;
@@ -314,7 +323,9 @@ std::vector<TRichYPath> GetLayerPathsFromDockerImage(
                 rspTags->AsMap()->GetKeys());
         }
 
-        return ConvertTo<std::vector<TRichYPath>>(rspTag);
+        auto layerPaths = ConvertTo<std::vector<TRichYPath>>(rspTag);
+        std::reverse(layerPaths.begin(), layerPaths.end());
+        return layerPaths;
     } catch (const std::exception& ex) {
         THROW_ERROR_EXCEPTION(
             "Failed to load docker image %v:%v",
@@ -363,6 +374,102 @@ bool IsStaticTableWithHunks(TInputTablePtr table)
 
     return false;
 }
+
+////////////////////////////////////////////////////////////////////////////////
+
+bool HasJobUniquenessRequirements(
+    const NScheduler::TOperationSpecBasePtr& operationSpec,
+    const std::vector<NScheduler::TUserJobSpecPtr>& userJobSpecs)
+{
+    return operationSpec->FailOnJobRestart ||
+        std::any_of(userJobSpecs.begin(), userJobSpecs.end(), [] (const auto& userJobSpec) {
+            return userJobSpec->FailOnJobRestart;
+        });
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+template <class TTablePtr>
+void FetchTableSchemas(
+    const NApi::NNative::IClientPtr& client,
+    const std::vector<TTablePtr>& tables,
+    TCallback<TTransactionId(const TTablePtr&)> tableToTransactionId,
+    bool fetchFromExternalCells)
+{
+    // The fetchFromExternalCells parameter allows us to choose whether to fetch the schema from native or external cell.
+    // Ideally, we want to fetch schemas only from external cells, but it is not possible now. For output
+    // tables, lock is acquired after the schema is fetched. This behavior is bad as it may lead to races.
+    // Once locking output tables is fixed, we will always fetch the schemas from external cells, and the
+    // fetchFromExternalCells parameter will be removed. See also YT-15269.
+    // TODO(gepardo): always fetch schemas from external cells.
+    auto tableToCellTag = [&] (const TTablePtr& table) {
+        return fetchFromExternalCells
+            ? table->ExternalCellTag
+            : CellTagFromId(table->ObjectId);
+    };
+
+    THashMap<TGuid, std::vector<TTablePtr>> schemaIdToTables;
+    THashMap<TCellTag, std::vector<TGuid>> cellTagToSchemaIds;
+    for (const auto& table : tables) {
+        const auto& schemaId = table->SchemaId;
+        schemaIdToTables[schemaId].push_back(table);
+    }
+
+    for (const auto& [schemaId, tablesWithIdenticalSchema] : schemaIdToTables) {
+        YT_VERIFY(!tablesWithIdenticalSchema.empty());
+        auto cellTag = tableToCellTag(tablesWithIdenticalSchema.front());
+        cellTagToSchemaIds[cellTag].push_back(schemaId);
+    }
+
+    std::vector<TFuture<TObjectServiceProxy::TRspExecuteBatchPtr>> asyncResults;
+    for (auto& [cellTag, schemaIds] : cellTagToSchemaIds) {
+        auto proxy = CreateObjectServiceReadProxy(client, EMasterChannelKind::Follower, cellTag);
+        auto batchReq = proxy.ExecuteBatch();
+
+        for (const auto& schemaId : schemaIds) {
+            // TODO(gepardo): fetch schema by schema ID directly, without using Get for the corresponding table.
+            auto table = schemaIdToTables[schemaId][0];
+            auto req = TTableYPathProxy::Get(table->GetObjectIdPath() + "/@schema");
+            AddCellTagToSyncWith(req, table->ObjectId);
+            SetTransactionId(req, tableToTransactionId(table));
+            req->Tag() = schemaId;
+            batchReq->AddRequest(req);
+        }
+
+        asyncResults.push_back(batchReq->Invoke());
+    }
+
+    auto checkError = [] (const auto& error) {
+        THROW_ERROR_EXCEPTION_IF_FAILED(error, "Error fetching table schemas");
+    };
+
+    auto result = WaitFor(AllSucceeded(asyncResults));
+    checkError(result);
+
+    for (const auto& batchRsp : result.Value()) {
+        checkError(GetCumulativeError(batchRsp));
+        for (const auto& rspOrError : batchRsp->GetResponses<TTableYPathProxy::TRspGet>()) {
+            const auto& rsp = rspOrError.Value();
+            auto schema = ConvertTo<TTableSchemaPtr>(TYsonString(rsp->value()));
+            auto schemaId = std::any_cast<TGuid>(rsp->Tag());
+            for (const auto& table : schemaIdToTables[schemaId]) {
+                table->Schema = schema;
+            }
+        }
+    }
+}
+
+template void FetchTableSchemas(
+    const NNative::IClientPtr& client,
+    const std::vector<TInputTablePtr>& tables,
+    TCallback<TTransactionId(const TInputTablePtr&)> tableToTransactionId,
+    bool fetchFromExternalCells);
+
+template void FetchTableSchemas(
+    const NNative::IClientPtr& client,
+    const std::vector<TOutputTablePtr>& tables,
+    TCallback<TTransactionId(const TOutputTablePtr&)> tableToTransactionId,
+    bool fetchFromExternalCells);
 
 ////////////////////////////////////////////////////////////////////////////////
 

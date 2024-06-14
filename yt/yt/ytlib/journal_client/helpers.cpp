@@ -339,11 +339,6 @@ void FormatValue(TStringBuilderBase* builder, const TChunkReplicaDescriptor& rep
     }
 }
 
-TString ToString(const TChunkReplicaDescriptor& replica)
-{
-    return ToStringViaBuilder(replica);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 class TQuorumSessionBase
@@ -361,7 +356,7 @@ public:
         , RequestTimeout_(requestTimeout)
         , ReadQuorum_(readQuorum)
         , ChannelFactory_(std::move(channelFactory))
-        , Logger(JournalClientLogger.WithTag("ChunkId: %v", ChunkId_))
+        , Logger(JournalClientLogger().WithTag("ChunkId: %v", ChunkId_))
     { }
 
 protected:

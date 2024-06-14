@@ -23,7 +23,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -55,9 +55,11 @@ struct TResourceLimitsKey
     }
 
     // Formatter.
-    friend TString ToString(const TResourceLimitsKey& key)
+    friend void FormatValue(TStringBuilderBase* builder, const TResourceLimitsKey& key, TStringBuf /*spec*/)
     {
-        return Format("%v:%v:%v:%v",
+        Format(
+            builder,
+            "%v:%v:%v:%v",
             key.Account,
             key.MediumName,
             key.TabletCellBundle,
@@ -78,7 +80,7 @@ public:
         NCellarNode::IBootstrap* bootstrap)
         : TAsyncExpiringCache(
             std::move(config),
-            TabletNodeLogger.WithTag("Cache: ResourceLimits"))
+            TabletNodeLogger().WithTag("Cache: ResourceLimits"))
         , Bootstrap_(bootstrap)
     { }
 

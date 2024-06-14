@@ -16,12 +16,11 @@
 #include <yt/yt/ytlib/chunk_client/chunk_reader_statistics.h>
 
 #include <yt/yt/ytlib/misc/memory_usage_tracker.h>
-#include <yt/yt/ytlib/misc/memory_reference_tracker.h>
 
 #include <yt/yt/client/misc/workload.h>
 
 #include <yt/yt/core/misc/fs.h>
-#include <yt/yt/core/misc/memory_reference_tracker.h>
+#include <yt/yt/core/misc/memory_usage_tracker.h>
 
 #include <yt/yt/core/concurrency/thread_affinity.h>
 
@@ -42,7 +41,7 @@ using namespace NProfiling;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = DataNodeLogger;
+static constexpr auto& Logger = DataNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -187,15 +186,16 @@ void TBlobChunkBase::ReleaseReader(TWriterGuard<TReaderWriterSpinLock>& writerGu
         Location_->GetId());
 }
 
-TSharedRef TBlobChunkBase::WrapBlockWithDelayedReferenceHolder(TSharedRef&& rawReference, TDuration delayBeforeFree)
+TSharedRef TBlobChunkBase::WrapBlockWithDelayedReferenceHolder(TSharedRef rawReference, TDuration delayBeforeFree)
 {
-    YT_LOG_DEBUG("Simulate delay before blob read session block free (BlockSize: %v, Delay: %v)", rawReference.Size(), delayBeforeFree);
-
-    auto underlyingHolder = rawReference.GetHolder();
-    auto underlyingReference = TSharedRef(rawReference, std::move(underlyingHolder));
-    return TSharedRef(
-        rawReference,
-        New<TDelayedReferenceHolder>(std::move(underlyingReference), delayBeforeFree, GetCurrentInvoker()));
+    YT_LOG_DEBUG(
+        "Simulate delay before blob read session block free (BlockSize: %v, Delay: %v)",
+        rawReference.Size(),
+        delayBeforeFree);
+    return WrapWithDelayedReferenceHolder(
+        std::move(rawReference),
+        delayBeforeFree,
+        GetCurrentInvoker());
 }
 
 void TBlobChunkBase::CompleteSession(const TReadBlockSetSessionPtr& session)
@@ -220,13 +220,10 @@ void TBlobChunkBase::CompleteSession(const TReadBlockSetSessionPtr& session)
         }
 
         auto block = std::move(entry.Block);
+        block.Data = TrackMemory(session->Options.MemoryUsageTracker, std::move(block.Data), true);
 
-        if (session->Options.TrackMemoryAfterSessionCompletion) {
-            block.Data = TrackMemory(session->Options.MemoryReferenceTracker, std::move(block.Data), true);
-
-            if (delayBeforeFree) {
-                block.Data = WrapBlockWithDelayedReferenceHolder(std::move(block.Data), *delayBeforeFree);
-            }
+        if (delayBeforeFree) {
+            block.Data = WrapBlockWithDelayedReferenceHolder(std::move(block.Data), *delayBeforeFree);
         }
 
         blocks[originalEntryIndex] = std::move(block);
@@ -234,6 +231,7 @@ void TBlobChunkBase::CompleteSession(const TReadBlockSetSessionPtr& session)
 
     session->SessionPromise.TrySet(std::move(blocks));
     session->PendingIOGuard.Release();
+    session->LocationMemoryGuard.Release();
 }
 
 void TBlobChunkBase::FailSession(const TReadBlockSetSessionPtr& session, const TError& error)
@@ -262,6 +260,7 @@ void TBlobChunkBase::FailSession(const TReadBlockSetSessionPtr& session, const T
     }
 
     session->PendingIOGuard.Release();
+    session->LocationMemoryGuard.Release();
 }
 
 void TBlobChunkBase::DoReadMeta(
@@ -448,6 +447,10 @@ void TBlobChunkBase::DoReadSession(
         return;
     }
 
+    session->LocationMemoryGuard = Location_->AcquireLocationMemory(
+        EIODirection::Read,
+        session->Options.WorkloadDescriptor,
+        pendingDataSize);
     session->PendingIOGuard = Location_->AcquirePendingIO(
         std::move(memoryGuardOrError.Value()),
         EIODirection::Read,
@@ -710,9 +713,8 @@ TFuture<std::vector<TBlock>> TBlobChunkBase::ReadBlockSet(
             entry.BlockIndex = blockIndexes[entryIndex];
             entry.EntryIndex = entryIndex;
         }
-        session->Options.MemoryReferenceTracker = options.MemoryReferenceTracker;
+        session->Options.MemoryUsageTracker = options.MemoryUsageTracker;
         session->Options.UseDedicatedAllocations = true;
-        session->Options.TrackMemoryAfterSessionCompletion = options.TrackMemoryAfterSessionCompletion;
     } catch (const std::exception& ex) {
         return MakeFuture<std::vector<TBlock>>(ex);
     }

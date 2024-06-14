@@ -90,6 +90,7 @@ class TSpytEngineConfig
 public:
     TString DefaultCluster;
     NYPath::TYPath DefaultDiscoveryPath;
+    NYPath::TYPath DefaultDiscoveryGroup;
     NYPath::TYPath SpytHome;
     NHttp::TClientConfigPtr HttpClient;
     TDuration StatusPollPeriod;
@@ -103,6 +104,23 @@ public:
 };
 
 DEFINE_REFCOUNTED_TYPE(TSpytEngineConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TQueryTrackerProxyConfig
+    : public NYTree::TYsonStruct
+{
+public:
+    i64 MaxQueryFileCount;
+    i64 MaxQueryFileNameSizeBytes;
+    i64 MaxQueryFileContentSizeBytes;
+
+    REGISTER_YSON_STRUCT(TQueryTrackerProxyConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TQueryTrackerProxyConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -121,6 +139,8 @@ public:
     TChytEngineConfigPtr ChytEngine;
     TSpytEngineConfigPtr SpytEngine;
 
+    TQueryTrackerProxyConfigPtr ProxyConfig;
+
     REGISTER_YSON_STRUCT(TQueryTrackerDynamicConfig);
 
     static void Register(TRegistrar registrar);
@@ -136,6 +156,8 @@ class TQueryTrackerServerConfig
 public:
     int MinRequiredStateVersion;
     bool AbortOnUnrecognizedOptions;
+
+    int ProxyThreadPoolSize;
 
     TString User;
 

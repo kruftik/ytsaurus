@@ -97,7 +97,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ChunkServerLogger;
+static constexpr auto& Logger = ChunkServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -2723,8 +2723,14 @@ void TChunkReplicator::OnRefresh()
         }
 
         auto replicas = chunkManager->GetChunkReplicas(chunksToRefresh);
+        const auto& incumbentManager = Bootstrap_->GetIncumbentManager();
         for (const auto& chunk : chunksToRefresh) {
             if (!IsObjectAlive(chunk)) {
+                continue;
+            }
+
+            // Incumbency could have been lost during replica fetch.
+            if (!incumbentManager->HasIncumbency(EIncumbentType::ChunkReplicator, chunk->GetShardIndex())) {
                 continue;
             }
 
@@ -2827,13 +2833,9 @@ bool TChunkReplicator::IsDurabilityRequired(
         return false;
     }
 
-    if (chunk->IsErasure()) {
-        return true;
-    }
-
     const auto& chunkManager = Bootstrap_->GetChunkManager();
     auto replication = GetChunkAggregatedReplication(chunk, replicas);
-    return replication.IsDurabilityRequired(chunkManager);
+    return replication.IsDurabilityRequired(chunkManager, chunk->IsErasure());
 }
 
 void TChunkReplicator::OnCheckEnabled()
@@ -3045,15 +3047,27 @@ void TChunkReplicator::OnJobWaiting(const TJobPtr& job, IJobControllerCallbacks*
 
 void TChunkReplicator::OnJobRunning(const TJobPtr& job, IJobControllerCallbacks* callbacks)
 {
-    if (TInstant::Now() - job->GetStartTime() > GetDynamicConfig()->JobTimeout) {
-        YT_LOG_WARNING("Job timed out, aborting (JobId: %v, JobType: %v, Address: %v, Duration: %v, ChunkId: %v)",
-            job->GetJobId(),
-            job->GetType(),
-            job->NodeAddress(),
-            TInstant::Now() - job->GetStartTime(),
-            job->GetChunkIdWithIndexes());
+    if (TInstant::Now() - job->GetStartTime() > GetDynamicConfig()->JobTimeout)
+    {
+        // NB: Aborting removal jobs is potentially dangerous and may lead to inconsitency between
+        // master and data nodes.
+        // COMPAT(babenko): this is a temporary workaround until new epoch management is fully deployed.
+        if (job->GetType() == EJobType::RemoveChunk) {
+            YT_LOG_ALERT("Chunk removal job timed out (JobId: %v, Address: %v, Duration: %v, ChunkId: %v)",
+                job->GetJobId(),
+                job->NodeAddress(),
+                TInstant::Now() - job->GetStartTime(),
+                job->GetChunkIdWithIndexes());
+        } else {
+            YT_LOG_WARNING("Job timed out, aborting (JobId: %v, JobType: %v, Address: %v, Duration: %v, ChunkId: %v)",
+                job->GetJobId(),
+                job->GetType(),
+                job->NodeAddress(),
+                TInstant::Now() - job->GetStartTime(),
+                job->GetChunkIdWithIndexes());
 
-        callbacks->AbortJob(job);
+            callbacks->AbortJob(job);
+        }
     }
 }
 
@@ -3242,7 +3256,7 @@ void TChunkReplicator::OnScheduleChunkRequisitionUpdatesFlush()
         const auto& chunkManager = Bootstrap_->GetChunkManager();
         auto mutation = chunkManager->CreateScheduleChunkRequisitionUpdatesMutation(request);
         mutation->SetAllowLeaderForwarding(true);
-        auto rspOrError = WaitFor(mutation->CommitAndLog(Logger));
+        auto rspOrError = WaitFor(mutation->CommitAndLog(Logger()));
         if (!rspOrError.IsOK()) {
             YT_LOG_WARNING(rspOrError,
                 "Failed to schedule chunk requisition update flush");
@@ -3339,7 +3353,7 @@ void TChunkReplicator::OnRequisitionUpdate()
         const auto& chunkManager = Bootstrap_->GetChunkManager();
         auto mutation = chunkManager->CreateUpdateChunkRequisitionMutation(request);
         mutation->SetAllowLeaderForwarding(true);
-        auto rspOrError = WaitFor(mutation->CommitAndLog(Logger));
+        auto rspOrError = WaitFor(mutation->CommitAndLog(Logger()));
         if (!rspOrError.IsOK()) {
             YT_LOG_WARNING(rspOrError,
                 "Failed to update chunk requisition; Scheduling global scan");
@@ -3525,7 +3539,7 @@ void TChunkReplicator::OnFinishedRequisitionTraverseFlush()
     const auto& chunkManager = Bootstrap_->GetChunkManager();
     auto mutation = chunkManager->CreateConfirmChunkListsRequisitionTraverseFinishedMutation(request);
     mutation->SetAllowLeaderForwarding(true);
-    auto rspOrError = WaitFor(mutation->CommitAndLog(Logger));
+    auto rspOrError = WaitFor(mutation->CommitAndLog(Logger()));
     if (!rspOrError.IsOK()) {
         YT_LOG_WARNING(rspOrError,
             "Failed to flush finished requisition traverse");
@@ -3627,7 +3641,7 @@ void TChunkReplicator::FlushEndorsementQueue()
     // NB: This code can be executed either on leader or follower.
     mutation->SetAllowLeaderForwarding(true);
     auto invoker = Bootstrap_->GetHydraFacade()->GetEpochAutomatonInvoker(EAutomatonThreadQueue::ChunkRefresher);
-    YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger)
+    YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger())
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TErrorOr<TMutationResponse>& error) {
             if (!error.IsOK()) {
                 YT_LOG_WARNING(error,

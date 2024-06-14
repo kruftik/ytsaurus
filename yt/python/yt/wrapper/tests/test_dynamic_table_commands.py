@@ -5,11 +5,6 @@ from .helpers import TEST_DIR, set_config_option, get_tests_sandbox, wait, check
 
 from yt.wrapper.driver import get_api_version
 
-try:
-    from yt.packages.six.moves import xrange
-except ImportError:
-    from six.moves import xrange
-
 from yt.local import start, stop
 
 import yt.wrapper as yt
@@ -296,6 +291,14 @@ class TestDynamicTableCommands(object):
             assert len(attributes["tablets"]) == 1
             assert attributes["tablets"][0]["state"] == "none"
 
+            yt.alter_table_replica(replica_id, enable_replicated_table_tracker=False)
+            attributes = yt.get("#{0}/@".format(replica_id), attributes=["enable_replicated_table_tracker"])
+            assert not attributes["enable_replicated_table_tracker"]
+
+            yt.alter_table_replica(replica_id, enable_replicated_table_tracker=True)
+            attributes = yt.get("#{0}/@".format(replica_id), attributes=["enable_replicated_table_tracker"])
+            assert attributes["enable_replicated_table_tracker"]
+
         finally:
             if instance is not None:
                 stop(instance.id, path=dir, remove_runtime_data=True)
@@ -316,7 +319,7 @@ class TestDynamicTableCommands(object):
     @authors("ifsmirnov")
     @pytest.mark.parametrize("tables", [None, [TEST_DIR + "/table_balance_cells"]])
     def test_balance_tablet_cells(self, tables):
-        cells = [self._sync_create_tablet_cell() for i in xrange(2)]
+        cells = [self._sync_create_tablet_cell() for i in range(2)]
         table = TEST_DIR + "/table_balance_cells"
         yt.remove(table, force=True)
         self._create_dynamic_table(table, external=False)

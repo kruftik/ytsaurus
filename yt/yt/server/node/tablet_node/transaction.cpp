@@ -6,6 +6,7 @@
 #include "tablet_manager.h"
 #include "tablet_slot.h"
 #include "hunks_serialization.h"
+#include "serialize.h"
 
 #include <yt/yt/server/lib/lease_server/lease_manager.h>
 
@@ -136,11 +137,8 @@ void TTransaction::Load(TLoadContext& context)
     Load(context, CommitTimestamp_);
     Load(context, PrepareRevision_);
 
-    // COMPAT(gritukan)
-    if (context.GetVersion() >= ETabletReign::TabletWriteManager) {
-        Load(context, PersistentAffectedTabletIds_);
-        Load(context, SerializingTabletIds_);
-    }
+    Load(context, PersistentAffectedTabletIds_);
+    Load(context, SerializingTabletIds_);
 
     Load(context, PersistentPrepareSignature_);
     TransientPrepareSignature_ = PersistentPrepareSignature_;
@@ -151,17 +149,9 @@ void TTransaction::Load(TLoadContext& context)
     Load(context, CommitSignature_);
     Load(context, CommitOptions_);
 
-    // COMPAT(gritukan)
-    if (context.GetVersion() < ETabletReign::TabletWriteManager) {
-        Load(context, CompatRowsPrepared_);
-    }
     Load(context, AuthenticationIdentity_.User);
     Load(context, AuthenticationIdentity_.UserTag);
     Load(context, CommitTimestampClusterTag_);
-    // COMPAT(gritukan)
-    if (context.GetVersion() < ETabletReign::TabletWriteManager) {
-        Load(context, CompatSerializationForced_);
-    }
     Load(context, TabletsToUpdateReplicationProgress_);
 
     // COMPAT(gritukan)
@@ -179,17 +169,6 @@ void TTransaction::Load(TLoadContext& context)
     // COMPAT(ifsmirnov)
     if (context.GetVersion() >= ETabletReign::SmoothTabletMovement) {
         Load(context, ExternalizerTabletId_);
-    }
-}
-
-void TTransaction::AsyncLoad(TLoadContext& context)
-{
-    using NYT::Load;
-    // COMPAT(gritukan)
-    if (context.GetVersion() <= ETabletReign::TabletWriteManager) {
-        Load(context, CompatImmediateLockedWriteLog_);
-        Load(context, CompatImmediateLocklessWriteLog_);
-        Load(context, CompatDelayedLocklessWriteLog_);
     }
 }
 

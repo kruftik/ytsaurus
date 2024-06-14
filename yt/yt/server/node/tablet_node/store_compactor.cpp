@@ -44,7 +44,7 @@
 #include <yt/yt/ytlib/chunk_client/helpers.h>
 #include <yt/yt/ytlib/chunk_client/chunk_replica_cache.h>
 
-#include <yt/yt/ytlib/misc/memory_reference_tracker.h>
+#include <yt/yt/ytlib/misc/memory_usage_tracker.h>
 
 #include <yt/yt/client/object_client/helpers.h>
 
@@ -270,9 +270,9 @@ protected:
 
     IVersionedMultiChunkWriterPtr CreateWriter()
     {
-        auto chunkWriterFactory = [weakThis = MakeWeak(this)] (IChunkWriterPtr underlyingWriter) {
+        auto chunkWriterFactory = [this, weakThis = MakeWeak(this)] (IChunkWriterPtr underlyingWriter) {
             if (auto this_ = weakThis.Lock()) {
-                return this_->CreateUnderlyingWriterAdapter(std::move(underlyingWriter));
+                return CreateUnderlyingWriterAdapter(std::move(underlyingWriter));
             } else {
                 THROW_ERROR_EXCEPTION(NYT::EErrorCode::Canceled, "Store compactor session destroyed");
             }
@@ -314,8 +314,7 @@ private:
         StoreWriterOptions_->ChunksEden = ResultsInEden_;
         StoreWriterOptions_->ValidateResourceUsageIncrease = false;
         StoreWriterOptions_->ConsistentChunkReplicaPlacementHash = TabletSnapshot_->ConsistentChunkReplicaPlacementHash;
-        StoreWriterOptions_->MemoryTracker = Bootstrap_->GetMemoryUsageTracker()->WithCategory(EMemoryCategory::TabletBackground);
-        StoreWriterOptions_->MemoryReferenceTracker = Bootstrap_->GetNodeMemoryReferenceTracker()->WithCategory(EMemoryCategory::TabletBackground);
+        StoreWriterOptions_->MemoryUsageTracker = Bootstrap_->GetNodeMemoryUsageTracker()->WithCategory(EMemoryCategory::TabletBackground);
 
         HunkWriterConfig_ = CloneYsonStruct(TabletSnapshot_->Settings.HunkWriterConfig);
         HunkWriterConfig_->WorkloadDescriptor = TWorkloadDescriptor(ChunkReadOptions_.WorkloadDescriptor.Category);
@@ -714,9 +713,6 @@ public:
         , PartitioningOrchid_(New<TCompactionOrchid>(
             Bootstrap_->GetDynamicConfigManager()->GetConfig()->TabletNode->StoreCompactor->Orchid))
         , OrchidService_(CreateOrchidService())
-    { }
-
-    void Start() override
     {
         const auto& dynamicConfigManager = Bootstrap_->GetDynamicConfigManager();
         dynamicConfigManager->SubscribeConfigChanged(BIND_NO_PROPAGATE(&TStoreCompactor::OnDynamicConfigChanged, MakeWeak(this)));
@@ -756,7 +752,7 @@ public:
             slot->GetCellId());
 
         if (ScanForCompactions_) {
-            const auto& Logger = TabletNodeLogger
+            const auto& Logger = TabletNodeLogger()
                 .WithTag("CellId: %v, TaskKind: Compaction", slot->GetCellId());
 
             std::vector<std::unique_ptr<TTask>> tasks;
@@ -783,7 +779,7 @@ public:
         }
 
         if (ScanForPartitioning_) {
-            const auto& Logger = TabletNodeLogger
+            const auto& Logger = TabletNodeLogger()
                 .WithTag("CellId: %v, TaskKind: Partitioning", slot->GetCellId());
 
             std::vector<std::unique_ptr<TTask>> tasks;
@@ -1060,7 +1056,7 @@ private:
         }
 
         if (request.DiscardStores && tablet->GetTableSchema()->HasTtlColumn()) {
-            YT_LOG_DEBUG("Compaction task declined: tablet has ttl column and has been compacted "
+            YT_LOG_DEBUG("Compaction task declined: tablet has TTL column and has been compacted "
                 "by discard stores (%v)",
                 tablet->GetLoggingTag());
             return nullptr;
@@ -1374,10 +1370,10 @@ private:
         TClientChunkReadOptions chunkReadOptions{
             .WorkloadDescriptor = TWorkloadDescriptor(EWorkloadCategory::SystemTabletPartitioning),
             .ReadSessionId = TReadSessionId::Create(),
-            .MemoryReferenceTracker = Bootstrap_->GetNodeMemoryReferenceTracker()->WithCategory(EMemoryCategory::TabletBackground)
+            .MemoryUsageTracker = Bootstrap_->GetNodeMemoryUsageTracker()->WithCategory(EMemoryCategory::TabletBackground)
         };
 
-        auto Logger = TabletNodeLogger
+        auto Logger = TabletNodeLogger()
             .WithTag("%v, ReadSessionId: %v",
                 task->TabletLoggingTag,
                 chunkReadOptions.ReadSessionId);
@@ -1754,10 +1750,10 @@ private:
         TClientChunkReadOptions chunkReadOptions{
             .WorkloadDescriptor = TWorkloadDescriptor(EWorkloadCategory::SystemTabletCompaction),
             .ReadSessionId = TReadSessionId::Create(),
-            .MemoryReferenceTracker = Bootstrap_->GetNodeMemoryReferenceTracker()->WithCategory(EMemoryCategory::TabletBackground)
+            .MemoryUsageTracker = Bootstrap_->GetNodeMemoryUsageTracker()->WithCategory(EMemoryCategory::TabletBackground)
         };
 
-        auto Logger = TabletNodeLogger
+        auto Logger = TabletNodeLogger()
             .WithTag("%v, ReadSessionId: %v",
                 task->TabletLoggingTag,
                 chunkReadOptions.ReadSessionId);

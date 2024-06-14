@@ -52,9 +52,6 @@ public:
     NScheduler::TMemoryDistribution GetExecNodeMemoryDistribution(
         const NScheduler::TSchedulingTagFilter& filter) const override;
 
-    NScheduler::TRefCountedExecNodeDescriptorMapPtr CalculateExecNodeDescriptors(
-        const NScheduler::TSchedulingTagFilter& filter) const override;
-
     const std::vector<IInvokerPtr>& GetNodeShardInvokers() const override;
     int GetNodeShardId(NNodeTrackerClient::TNodeId nodeId) const override;
     void AbortAllocationsAtNode(NNodeTrackerClient::TNodeId nodeId, NScheduler::EAbortReason reason) override;
@@ -108,6 +105,8 @@ public:
     void CloseEventLogger();
 
     const THashMap<TString, TString>& GetUserDefaultParentPoolMap() const override;
+
+    bool IsFairSharePreUpdateOffloadingEnabled() const override;
 
 private:
     const std::vector<NScheduler::TExecNodePtr>* ExecNodes_;

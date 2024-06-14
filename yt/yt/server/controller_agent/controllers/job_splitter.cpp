@@ -187,7 +187,7 @@ public:
             summary.TimeStatistics.ArtifactsDownloadDuration.value_or(TDuration()).SecondsFloat();
         double expectedExecDuration = execDuration / processedRowCount * unreadRowCount;
 
-        auto getMedianCompletionDuration = [&] () {
+        auto getMedianCompletionDuration = [&] {
             auto medianCompletionTime = JobTimeTracker_.GetMedianCompletionTime();
             if (!IsResidual() && medianCompletionTime) {
                 return medianCompletionTime.SecondsFloat() - GetInstant().SecondsFloat();
@@ -209,7 +209,8 @@ public:
             1,
             Config_->MaxJobsPerSplit);
 
-        YT_LOG_DEBUG("Estimated optimal job count for unread data slices "
+        YT_LOG_DEBUG(
+            "Estimated optimal job count for unread data slices "
             "(JobCount: %v, JobId: %v, PrepareDuration: %.6g, ExecDuration: %.6g, "
             "ProcessedRowCount: %v, MedianCompletionDuration: %.6g, MinJobTime: %v, "
             "ExecToPrepareTimeRatio: %v, UnreadRowCount: %v, ExpectedExecDuration: %.6g)",

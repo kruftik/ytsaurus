@@ -262,8 +262,7 @@ struct TAllocationWithPreemptionInfo
     bool operator ==(const TAllocationWithPreemptionInfo& other) const = default;
 };
 
-void FormatValue(TStringBuilderBase* builder, const TAllocationWithPreemptionInfo& allocationInfo, TStringBuf /*format*/);
-TString ToString(const TAllocationWithPreemptionInfo& allocationInfo);
+void FormatValue(TStringBuilderBase* builder, const TAllocationWithPreemptionInfo& allocationInfo, TStringBuf /*spec*/);
 
 using TAllocationWithPreemptionInfoSet = THashSet<TAllocationWithPreemptionInfo>;
 using TAllocationWithPreemptionInfoSetMap = THashMap<int, TAllocationWithPreemptionInfoSet>;
@@ -692,6 +691,8 @@ public:
     void InitPersistentState(NYTree::INodePtr persistentState);
     NYTree::INodePtr BuildPersistentState() const;
 
+    bool IsGpuTree() const;
+
     //! Testing.
     void OnAllocationStartedInTest(
         TSchedulerOperationElement* element,
@@ -800,13 +801,13 @@ private:
         TFairSharePostUpdateContext* fairSharePostUpdateContext,
         TAllocationSchedulerPostUpdateContext* postUpdateContext) const;
 
-    void PublishFairShareAndUpdatePreemptionAttributes(
+    void PublishFairShare(
         TSchedulerElement* element,
         TAllocationSchedulerPostUpdateContext* postUpdateContext) const;
-    void PublishFairShareAndUpdatePreemptionAttributesAtCompositeElement(
+    void PublishFairShareAtCompositeElement(
         TSchedulerCompositeElement* element,
         TAllocationSchedulerPostUpdateContext* postUpdateContext) const;
-    void PublishFairShareAndUpdatePreemptionAttributesAtOperation(
+    void PublishFairShareAtOperation(
         TSchedulerOperationElement* element,
         TAllocationSchedulerPostUpdateContext* postUpdateContext) const;
 

@@ -576,7 +576,7 @@ private:
 
         i64 totalTeleportChunkSize = 0;
         for (const auto& teleportChunk : TeleportChunks_) {
-            ChunkTeleported_.Fire(teleportChunk, /*tag=*/std::any{});
+            ChunkTeleported_.Fire(teleportChunk, /*tag*/ std::any{});
             totalTeleportChunkSize += teleportChunk->GetUncompressedDataSize();
         }
 
@@ -701,6 +701,7 @@ private:
             JobSizeConstraints_->GetMaxPrimaryDataWeightPerJob(),
             JobSizeConstraints_->GetInputSliceDataWeight(),
             JobSizeConstraints_->GetInputSliceRowCount(),
+            JobSizeConstraints_->GetBatchRowCount(),
             JobSizeConstraints_->GetForeignSliceDataWeight(),
             std::nullopt /*samplingRate*/);
 

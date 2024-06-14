@@ -13,13 +13,13 @@
 
 #include <yt/yt/server/lib/transaction_server/helpers.h>
 
-#include <yt/yt/server/lib/rpc/memory_tracking_service_base.h>
-
 #include <yt/yt/ytlib/api/native/client.h>
 #include <yt/yt/ytlib/api/native/client_cache.h>
 #include <yt/yt/ytlib/api/native/connection.h>
 
 #include <yt/yt/ytlib/misc/memory_usage_tracker.h>
+
+#include <yt/yt/ytlib/query_tracker_client/query_tracker_service_proxy.h>
 
 #include <yt/yt/client/api/config.h>
 #include <yt/yt/client/api/client.h>
@@ -33,6 +33,7 @@
 #include <yt/yt/client/api/table_reader.h>
 #include <yt/yt/client/api/table_writer.h>
 #include <yt/yt/client/api/transaction.h>
+#include <yt/yt/client/api/query_tracker_client.h>
 
 #include <yt/yt/client/api/rpc_proxy/helpers.h>
 #include <yt/yt/client/api/rpc_proxy/protocol_version.h>
@@ -105,6 +106,7 @@ using namespace NTransactionClient;
 using namespace NYPath;
 using namespace NYTree;
 using namespace NYson;
+using namespace NQueryTrackerClient;
 
 using NYT::FromProto;
 using NYT::ToProto;
@@ -511,7 +513,7 @@ private:
         std::vector<TErrorCode> errorCodes(errorCodeSet.begin(), errorCodeSet.end());
         std::sort(errorCodes.begin(), errorCodes.end());
 
-        LogStructuredEventFluently(RpcProxyStructuredLoggerMain, ELogLevel::Info)
+        LogStructuredEventFluently(RpcProxyStructuredLoggerMain(), ELogLevel::Info)
             .Item("request_id").Value(this->GetRequestId())
             .Item("endpoint").Value(this->GetEndpointAttributes())
             .Item("method").Value(this->GetMethod())
@@ -565,7 +567,7 @@ private:
         std::vector<TErrorCode> errorCodes(errorCodeSet.begin(), errorCodeSet.end());
         std::sort(errorCodes.begin(), errorCodes.end());
 
-        LogStructuredEventFluently(RpcProxyStructuredLoggerError, ELogLevel::Info)
+        LogStructuredEventFluently(RpcProxyStructuredLoggerError(), ELogLevel::Info)
             .Item("request_id").Value(this->GetRequestId())
             .Item("endpoint").Value(this->GetEndpointAttributes())
             .Item("method").Value(this->GetMethod())
@@ -587,7 +589,7 @@ private:
 DECLARE_REFCOUNTED_CLASS(TApiService)
 
 class TApiService
-    : public TMemoryTrackingServiceBase<TServiceBase>
+    : public TServiceBase
     , public IApiService
 {
 public:
@@ -607,13 +609,11 @@ public:
         NLogging::TLogger logger,
         TProfiler profiler,
         INodeMemoryTrackerPtr memoryTracker,
-        INodeMemoryReferenceTrackerPtr nodeMemoryReferenceTracker,
         IStickyTransactionPoolPtr stickyTransactionPool)
-        : TMemoryTrackingServiceBase(
-            WithCategory(memoryTracker, EMemoryCategory::Rpc),
-            WithCategory(nodeMemoryReferenceTracker, EMemoryCategory::Rpc),
+        : TServiceBase(
             std::move(workerInvoker),
             GetServiceDescriptor(),
+            WithCategory(memoryTracker, EMemoryCategory::Rpc),
             std::move(logger),
             NullRealmId,
             std::move(authenticator))
@@ -718,9 +718,13 @@ public:
         RegisterMethod(RPC_SERVICE_METHOD_DESC(AdvanceConsumer));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(PullQueue));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(PullConsumer));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(PullQueueConsumer));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(RegisterQueueConsumer));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(UnregisterQueueConsumer));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(ListQueueConsumerRegistrations));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(CreateQueueProducerSession));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(RemoveQueueProducerSession));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(PushQueueProducer));
 
         RegisterMethod(RPC_SERVICE_METHOD_DESC(ModifyRows));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(BatchModifyRows));
@@ -735,6 +739,8 @@ public:
         RegisterMethod(RPC_SERVICE_METHOD_DESC(MigrateReplicationCards));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(SuspendChaosCells));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(ResumeChaosCells));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(SuspendTabletCells));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(ResumeTabletCells));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(AddMaintenance));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(RemoveMaintenance));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(DisableChunkLocations));
@@ -786,7 +792,8 @@ public:
         RegisterMethod(RPC_SERVICE_METHOD_DESC(StartPipeline));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(StopPipeline));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(PausePipeline));
-        RegisterMethod(RPC_SERVICE_METHOD_DESC(GetPipelineStatus));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(GetPipelineState));
+        RegisterMethod(RPC_SERVICE_METHOD_DESC(GetFlowView));
 
         RegisterMethod(RPC_SERVICE_METHOD_DESC(StartQuery));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(AbortQuery));
@@ -800,6 +807,7 @@ public:
         RegisterMethod(RPC_SERVICE_METHOD_DESC(CheckClusterLiveness));
 
         DeclareServerFeature(ERpcProxyFeature::GetInSyncWithoutKeys);
+        DeclareServerFeature(ERpcProxyFeature::WideLocks);
     }
 
     void OnDynamicConfigChanged(const TApiServiceDynamicConfigPtr& config) override
@@ -847,7 +855,7 @@ private:
     TCounter SelectOutputDataWeight_;
     TCounter SelectOutputRowCount_;
 
-    const ITypedNodeMemoryTrackerPtr LookupMemoryTracker_;
+    const IMemoryUsageTrackerPtr LookupMemoryTracker_;
 
     struct TDetailedProfilingCountersKey
     {
@@ -965,11 +973,11 @@ private:
 
         // Finally, setup structured logging messages to be emitted.
 
-        auto shouldEmit = [method = context->GetMethod()](const TStructuredLoggingTopicDynamicConfigPtr& config) {
-                return config->Enable &&
-                        !config->SuppressedMethods.contains(method) &&
-                        config->Methods.Value(method, DefaultMethodConfig)->Enable;
-            };
+        auto shouldEmit = [method = context->GetMethod()] (const TStructuredLoggingTopicDynamicConfigPtr& config) {
+            return config->Enable &&
+                !config->SuppressedMethods.contains(method) &&
+                config->Methods.Value(method, DefaultMethodConfig)->Enable;
+        };
 
         const auto& config = Config_.Acquire();
 
@@ -1222,17 +1230,21 @@ private:
             context,
             [=, Logger = Logger, connection = Connection_] {
                 return timestampProvider->GenerateTimestamps(count, clockClusterTag).ApplyUnique(
-                    BIND([connection, clockClusterTag, count, Logger](TErrorOr<TTimestamp>&& providerResult) {
+                    BIND([connection, clockClusterTag, count, Logger] (TErrorOr<TTimestamp>&& providerResult) {
                         if (providerResult.IsOK() ||
-                            !providerResult.FindMatching(NTransactionServer::EErrorCode::UnknownClockClusterTag))
+                            !(providerResult.FindMatching(NTransactionClient::EErrorCode::UnknownClockClusterTag) ||
+                                providerResult.FindMatching(NTransactionClient::EErrorCode::ClockClusterTagMismatch)))
                         {
                             return MakeFuture(std::move(providerResult));
                         }
-                        YT_LOG_DEBUG("Unknown clock cluster tag %v, trying to generate timestamps via direct call",
+
+                        YT_LOG_DEBUG(
+                            providerResult,
+                            "Wrong clock cluster tag %v, trying to generate timestamps via direct call",
                             clockClusterTag);
 
                         auto alienClient = connection->GetClockManager()->GetTimestampProviderOrThrow(clockClusterTag);
-                        return alienClient->GenerateTimestamps(count);
+                        return alienClient->GenerateTimestamps(count, clockClusterTag);
                     }));
             },
             [clockClusterTag] (const auto& context, const TTimestamp& timestamp) {
@@ -1268,6 +1280,10 @@ private:
         }
         if (request->has_parent_id()) {
             FromProto(&options.ParentId, request->parent_id());
+        }
+        if (request->has_replicate_to_master_cell_tags()) {
+            options.ReplicateToMasterCellTags =
+                FromProto<TCellTagList>(request->replicate_to_master_cell_tags().cell_tags());
         }
         options.AutoAbort = false;
         options.Sticky = request->sticky();
@@ -1563,6 +1579,9 @@ private:
                     auto* protoIndexInfo = response->add_indices();
                     ToProto(protoIndexInfo->mutable_index_table_id(), indexInfo.TableId);
                     protoIndexInfo->set_index_kind(ToProto<i32>(indexInfo.Kind));
+                    if (const auto& predicate = indexInfo.Predicate) {
+                        ToProto(protoIndexInfo->mutable_predicate(), *predicate);
+                    }
                 }
 
                 context->SetResponseInfo("Dynamic: %v, TabletCount: %v, ReplicaCount: %v",
@@ -3890,6 +3909,10 @@ private:
             options.NewRangeInference = request->new_range_inference();
         }
 
+        if (request->has_syntax_version()) {
+            options.SyntaxVersion = request->syntax_version();
+        }
+
         context->SetRequestInfo("Query: %v, Timestamp: %v",
             query,
             options.Timestamp);
@@ -4043,6 +4066,70 @@ private:
             });
     }
 
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, PushQueueProducer)
+    {
+        auto transactionId = FromProto<TTransactionId>(request->transaction_id());
+
+        auto producerPath = FromProto<TRichYPath>(request->producer_path());
+        auto queuePath = FromProto<TRichYPath>(request->queue_path());
+
+        auto sessionId = FromProto<TString>(request->session_id());
+
+        TPushQueueProducerOptions options;
+        SetTimeoutOptions(&options, context.Get());
+        options.SequenceNumber = YT_PROTO_OPTIONAL(*request, sequence_number);
+        if (request->has_user_meta()) {
+            options.UserMeta = ConvertToNode(TYsonStringBuf(request->user_meta()));
+        }
+
+        context->SetRequestInfo(
+            "ProducerPath: %v, QueuePath: %v, SessionId: %v, "
+            "Epoch: %v, TransactionId: %v",
+            producerPath,
+            queuePath,
+            sessionId,
+            request->epoch(),
+            transactionId);
+
+        auto transaction = GetTransactionOrThrow(
+            context,
+            request,
+            transactionId,
+            /*options*/ std::nullopt,
+            /*searchInPool*/ true);
+
+        auto rowset = NApi::NRpcProxy::DeserializeRowset<TUnversionedRow>(
+            request->rowset_descriptor(),
+            MergeRefsToRef<TApiServiceBufferTag>(request->Attachments()));
+
+        ExecuteCall(
+            context,
+            [
+                =,
+                producerPath = std::move(producerPath),
+                queuePath = std::move(queuePath),
+                sessionId = std::move(sessionId),
+                rowset = std::move(rowset),
+                options = std::move(options)
+            ] {
+                auto rowsetRows = rowset->GetRows();
+
+                return transaction->PushQueueProducer(
+                    producerPath,
+                    queuePath,
+                    sessionId,
+                    request->epoch(),
+                    rowset->GetNameTable(),
+                    rowsetRows,
+                    options);
+            },
+            [] (const auto& context, const auto& pushQueueProducerResult) {
+                auto* response = &context->Response();
+                response->set_last_sequence_number(pushQueueProducerResult.LastSequenceNumber);
+                response->set_skipped_row_count(pushQueueProducerResult.SkippedRowCount);
+            });
+    }
+
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, AdvanceConsumer)
     {
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
@@ -4133,14 +4220,30 @@ private:
             });
     }
 
-    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, PullConsumer)
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, PullQueueConsumer)
+    {
+        PullQueueConsumerImpl(request, response, context);
+    }
+
+    DECLARE_RPC_SERVICE_METHOD_VIA_MESSAGES(
+        NApi::NRpcProxy::NProto::TReqPullQueueConsumer,
+        NApi::NRpcProxy::NProto::TRspPullQueueConsumer,
+        PullConsumer)
+    {
+        PullQueueConsumerImpl(request, response, context);
+    }
+
+    void PullQueueConsumerImpl(
+        NApi::NRpcProxy::NProto::TReqPullQueueConsumer* request,
+        NApi::NRpcProxy::NProto::TRspPullQueueConsumer* /*response*/,
+        const TCtxPullQueueConsumerPtr& context)
     {
         auto client = GetAuthenticatedClientOrThrow(context, request);
 
         auto consumerPath = FromProto<TRichYPath>(request->consumer_path());
         auto queuePath = FromProto<TRichYPath>(request->queue_path());
 
-        TPullConsumerOptions options;
+        TPullQueueConsumerOptions options;
         SetTimeoutOptions(&options, context.Get());
 
         auto rowBatchReadOptions = FromProto<NQueueClient::TQueueRowBatchReadOptions>(request->row_batch_read_options());
@@ -4166,7 +4269,7 @@ private:
         ExecuteCall(
             context,
             [=] {
-                return client->PullConsumer(
+                return client->PullQueueConsumer(
                     consumerPath,
                     queuePath,
                     offset,
@@ -4286,6 +4389,75 @@ private:
             });
     }
 
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, CreateQueueProducerSession)
+    {
+        auto client = GetAuthenticatedClientOrThrow(context, request);
+
+        auto producerPath = FromProto<TRichYPath>(request->producer_path());
+        auto queuePath = FromProto<TRichYPath>(request->queue_path());
+        auto sessionId = FromProto<TString>(request->session_id());
+        std::optional<TYsonString> userMeta;
+        if (request->has_user_meta()) {
+            userMeta = TYsonString(request->user_meta());
+        }
+
+        TCreateQueueProducerSessionOptions options;
+        SetTimeoutOptions(&options, context.Get());
+
+        context->SetRequestInfo("ProducerPath: %v", producerPath);
+        context->SetRequestInfo("QueuePath: %v", queuePath);
+        context->SetRequestInfo("SessionId: %v", sessionId);
+
+        ExecuteCall(
+            context,
+            [=] {
+                return client->CreateQueueProducerSession(
+                    producerPath,
+                    queuePath,
+                    sessionId,
+                    userMeta,
+                    options);
+            },
+            [=] (const auto& context, const TCreateQueueProducerSessionResult& result) {
+                auto* response = &context->Response();
+
+                response->set_sequence_number(result.SequenceNumber);
+                response->set_epoch(result.Epoch);
+                if (result.UserMeta) {
+                    ToProto(response->mutable_user_meta(), result.UserMeta->AsStringBuf());
+                }
+
+                context->SetResponseInfo("SequenceNumber: %v", result.SequenceNumber);
+                context->SetResponseInfo("Epoch: %v", result.Epoch);
+            });
+    }
+
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, RemoveQueueProducerSession)
+    {
+        auto client = GetAuthenticatedClientOrThrow(context, request);
+
+        auto producerPath = FromProto<TRichYPath>(request->producer_path());
+        auto queuePath = FromProto<TRichYPath>(request->queue_path());
+        auto sessionId = FromProto<TString>(request->session_id());
+
+        TRemoveQueueProducerSessionOptions options;
+        SetTimeoutOptions(&options, context.Get());
+
+        context->SetRequestInfo("ProducerPath: %v", producerPath);
+        context->SetRequestInfo("QueuePath: %v", queuePath);
+        context->SetRequestInfo("SessionId: %v", sessionId);
+
+        ExecuteCall(
+            context,
+            [=] {
+                return client->RemoveQueueProducerSession(
+                    producerPath,
+                    queuePath,
+                    sessionId,
+                    options);
+            });
+    }
+
     void DoModifyRows(
         const NApi::NRpcProxy::NProto::TReqModifyRows& request,
         const std::vector<TSharedRef>& attachments,
@@ -4310,18 +4482,20 @@ private:
         modifications.reserve(rowsetSize);
         for (ssize_t index = 0; index < rowsetSize; ++index) {
             TLockMask lockMask;
-            if (index < request.row_read_locks_size()) {
-                TLegacyLockBitmap readLockMask = request.row_read_locks(index);
+            if (index < request.row_legacy_read_locks_size()) {
+                TLegacyLockBitmap readLockMask = request.row_legacy_read_locks(index);
                 for (int index = 0; index < TLegacyLockMask::MaxCount; ++index) {
                     if (readLockMask & (1u << index)) {
                         lockMask.Set(index, ELockType::SharedWeak);
                     }
                 }
-            } else if (index < request.row_locks_size()) {
-                auto legacyLocks = TLegacyLockMask(request.row_locks(index));
+            } else if (index < request.row_legacy_locks_size()) {
+                auto legacyLocks = TLegacyLockMask(request.row_legacy_locks(index));
                 for (int index = 0; index < TLegacyLockMask::MaxCount; ++index) {
                     lockMask.Set(index, legacyLocks.Get(index));
                 }
+            } else if (index < request.row_locks_size()) {
+                FromProto(&lockMask, request.row_locks(index));
             }
 
             modifications.push_back({
@@ -4614,6 +4788,40 @@ private:
             context,
             [=] {
                 return client->ResumeChaosCells(cellIds, options);
+            });
+    }
+
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, SuspendTabletCells)
+    {
+        TSuspendTabletCellsOptions options;
+        SetTimeoutOptions(&options, context.Get());
+
+        auto cellIds = FromProto<std::vector<TCellId>>(request->cell_ids());
+
+        context->SetRequestInfo("TabletCellIds: %v", cellIds);
+
+        auto client = GetAuthenticatedClientOrThrow(context, request);
+        ExecuteCall(
+            context,
+            [=] {
+                return client->SuspendTabletCells(cellIds, options);
+            });
+    }
+
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, ResumeTabletCells)
+    {
+        TResumeTabletCellsOptions options;
+        SetTimeoutOptions(&options, context.Get());
+
+        auto cellIds = FromProto<std::vector<TCellId>>(request->cell_ids());
+
+        context->SetRequestInfo("TabletCellIds: %v", cellIds);
+
+        auto client = GetAuthenticatedClientOrThrow(context, request);
+        ExecuteCall(
+            context,
+            [=] {
+                return client->ResumeTabletCells(cellIds, options);
             });
     }
 
@@ -5870,11 +6078,11 @@ private:
             });
     }
 
-    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, GetPipelineStatus)
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, GetPipelineState)
     {
         auto client = GetAuthenticatedClientOrThrow(context, request);
 
-        TGetPipelineStatusOptions options;
+        TGetPipelineStateOptions options;
         SetTimeoutOptions(&options, context.Get());
 
         auto pipelinePath = FromProto<TYPath>(request->pipeline_path());
@@ -5883,7 +6091,7 @@ private:
         ExecuteCall(
             context,
             [=] {
-                return client->GetPipelineStatus(pipelinePath, options);
+                return client->GetPipelineState(pipelinePath, options);
             },
             [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
@@ -5894,356 +6102,242 @@ private:
             });
     }
 
-    ////////////////////////////////////////////////////////////////////////////////
-    // QUERY TRACKER
-    ////////////////////////////////////////////////////////////////////////////////
-
-    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, StartQuery)
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, GetFlowView)
     {
         auto client = GetAuthenticatedClientOrThrow(context, request);
 
-        TStartQueryOptions options;
+        TGetFlowViewOptions options;
         SetTimeoutOptions(&options, context.Get());
 
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        if (request->has_settings()) {
-            options.Settings = ConvertToNode(TYsonStringBuf(request->settings()));
-        }
-
-        options.Draft = request->draft();
-
-        if (request->has_annotations()) {
-            options.Annotations = ConvertToNode(TYsonStringBuf(request->annotations()))->AsMap();
-        }
-
-        for (const auto& requestFile : request->files()) {
-            auto file = New<TQueryFile>();
-            file->Name = requestFile.name();
-            file->Content = requestFile.content();
-            file->Type = FromProto<EContentType>(requestFile.type());
-            options.Files.emplace_back(file);
-        }
-
-        if (request->has_access_control_object()) {
-            options.AccessControlObject = request->access_control_object();
-        }
-
-        auto engine = FromProto<NQueryTrackerClient::EQueryEngine>(request->engine());
-
-        context->SetRequestInfo("QueryTrackerStage: %v, Engine: %v, Draft: %v, AccessControlObject: %v",
-            options.QueryTrackerStage,
-            engine,
-            options.Draft,
-            options.AccessControlObject);
+        auto pipelinePath = FromProto<TYPath>(request->pipeline_path());
+        auto viewPath = FromProto<TYPath>(request->view_path());
+        context->SetRequestInfo("PipelinePath: %v, ViewPath: %v",
+            pipelinePath,
+            viewPath);
 
         ExecuteCall(
             context,
             [=] {
-                return client->StartQuery(engine, request->query(), options);
+                return client->GetFlowView(pipelinePath, viewPath, options);
             },
             [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
-                ToProto(response->mutable_query_id(), result);
+                response->set_flow_view_part(result.FlowViewPart.ToString());
+            });
+    }
 
-                context->SetResponseInfo("QueryId: %v", result);
+    ////////////////////////////////////////////////////////////////////////////////
+    // QUERY TRACKER
+    ////////////////////////////////////////////////////////////////////////////////
+
+    template <class TRequest>
+    TQueryTrackerServiceProxy GetQueryTrackerProxy(
+        const IServiceContextPtr& context,
+        const TRequest* request)
+    {
+        auto client = GetAuthenticatedClientOrThrow(context, request);
+        return TQueryTrackerServiceProxy(
+            client->GetNativeConnection()->GetQueryTrackerChannelOrThrow(request->query_tracker_stage()));
+    }
+
+    template <class TProxyRequest, class TQTRequestPtr>
+    void FillQueryTrackerRequest(
+        const IServiceContextPtr& context,
+        const TProxyRequest* proxyRequest,
+        const TQTRequestPtr qtRequest)
+    {
+        qtRequest->SetTimeout(context->GetTimeout());
+        qtRequest->SetUser(context->GetAuthenticationIdentity().User);
+        qtRequest->mutable_rpc_proxy_request()->MergeFrom(*proxyRequest);
+    }
+
+    DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, StartQuery)
+    {
+        auto proxy = GetQueryTrackerProxy(context, request);
+
+        auto req = proxy.StartQuery();
+        FillQueryTrackerRequest(context, request, req);
+
+        context->SetRequestInfo("QueryTrackerStage: %v, Engine: %v",
+            request->query_tracker_stage(),
+            ConvertQueryEngineFromProto(request->engine()));
+
+        ExecuteCall(
+            context,
+            [=] {
+                return req->Invoke();
+            },
+            [] (const auto& context, const auto& result) {
+                auto* response = &context->Response();
+                response->MergeFrom(result->rpc_proxy_response());
+
+                context->SetResponseInfo("QueryId: %v", response->query_id());
             });
     }
 
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, AbortQuery)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TAbortQueryOptions options;
-        SetTimeoutOptions(&options, context.Get());
+        auto req = proxy.AbortQuery();
+        FillQueryTrackerRequest(context, request, req);
 
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        if (request->has_abort_message()) {
-            options.AbortMessage = request->abort_message();
-        }
-
-        auto queryId = FromProto<NQueryTrackerClient::TQueryId>(request->query_id());
-
-        context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v, AbortMessage: %v",
-            options.QueryTrackerStage,
-            queryId,
-            options.AbortMessage);
+        context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v",
+            request->query_tracker_stage(),
+            FromProto<NQueryTrackerClient::TQueryId>(request->query_id()));
 
         ExecuteCall(
             context,
             [=] {
-                return client->AbortQuery(queryId, options);
+                return req->Invoke();
+            },
+            [] (const auto& /*context*/, const auto& /*result*/) {
+                // do nothing.
             });
     }
 
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, GetQueryResult)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TGetQueryResultOptions options;
-        SetTimeoutOptions(&options, context.Get());
-
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        auto queryId = FromProto<NQueryTrackerClient::TQueryId>(request->query_id());
+        auto req = proxy.GetQueryResult();
+        FillQueryTrackerRequest(context, request, req);
 
         context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v, ResultIndex: %v",
-            options.QueryTrackerStage,
-            queryId,
+            request->query_tracker_stage(),
+            FromProto<NQueryTrackerClient::TQueryId>(request->query_id()),
             request->result_index());
 
         ExecuteCall(
             context,
             [=] {
-                return client->GetQueryResult(queryId, request->result_index(), options);
+                return req->Invoke();
             },
             [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
+                response->MergeFrom(result->rpc_proxy_response());
 
-                ToProto(response->mutable_query_id(), result.Id);
-                response->set_result_index(result.ResultIndex);
-                ToProto(response->mutable_error(), result.Error);
-
-                if (result.Schema) {
-                    ToProto(response->mutable_schema(), result.Schema);
-                }
-
-                ToProto(response->mutable_data_statistics(), result.DataStatistics);
-                response->set_is_truncated(result.IsTruncated);
-
-                context->SetResponseInfo("QueryId: %v, ResultIndex: %v, Error: %v, IsTruncated: %v",
-                    result.Id,
-                    result.ResultIndex,
-                    result.Error,
-                    result.IsTruncated);
+                context->SetResponseInfo("QueryId: %v", response->query_id());
             });
     }
 
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, ReadQueryResult)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TReadQueryResultOptions options;
-        SetTimeoutOptions(&options, context.Get());
-
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        auto queryId = FromProto<NQueryTrackerClient::TQueryId>(request->query_id());
-
-        if (request->has_columns()) {
-            options.Columns = FromProto<std::vector<TString>>(request->columns().items());
-        }
-
-        if (request->has_lower_row_index()) {
-            options.LowerRowIndex = request->lower_row_index();
-        }
-
-        if (request->has_upper_row_index()) {
-            options.UpperRowIndex = request->upper_row_index();
-        }
+        auto req = proxy.ReadQueryResult();
+        FillQueryTrackerRequest(context, request, req);
 
         context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v, ResultIndex: %v",
-            options.QueryTrackerStage,
-            queryId,
+            request->query_tracker_stage(),
+            FromProto<NQueryTrackerClient::TQueryId>(request->query_id()),
             request->result_index());
 
         ExecuteCall(
             context,
             [=] {
-                return client->ReadQueryResult(queryId, request->result_index(), options);
+                return req->Invoke();
             },
-            [] (const auto& context, const auto& rowset) {
+            [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
-
-                response->Attachments() = NApi::NRpcProxy::SerializeRowset(
-                    *rowset->GetSchema(),
-                    rowset->GetRows(),
-                    response->mutable_rowset_descriptor());
-
-                context->SetResponseInfo("RowCount: %v", rowset->GetRows().Size());
+                response->MergeFrom(result->rpc_proxy_response());
+                response->Attachments() = result->Attachments();
             });
     }
 
-
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, GetQuery)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TGetQueryOptions options;
-        SetTimeoutOptions(&options, context.Get());
-
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        if (request->has_attributes()) {
-            options.Attributes = FromProto<NYTree::TAttributeFilter>(request->attributes());
-        }
-
-        auto queryId = FromProto<NQueryTrackerClient::TQueryId>(request->query_id());
-
-        if (request->has_timestamp()) {
-            options.Timestamp = request->timestamp();
-        }
+        auto req = proxy.GetQuery();
+        FillQueryTrackerRequest(context, request, req);
 
         context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v, StartTimestamp: %v",
-            options.QueryTrackerStage,
-            queryId,
-            options.Timestamp);
+            request->query_tracker_stage(),
+            FromProto<NQueryTrackerClient::TQueryId>(request->query_id()),
+            request->timestamp());
 
         ExecuteCall(
             context,
             [=] {
-                return client->GetQuery(queryId, options);
+                return req->Invoke();
             },
-            [] (const auto& context, const auto& query) {
+            [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
+                response->MergeFrom(result->rpc_proxy_response());
 
-                ToProto(response->mutable_query(), query);
-
-                context->SetResponseInfo("QueryId: %v, Engine: %v, State: %v",
-                    query.Id,
-                    query.Engine,
-                    query.State);
+                context->SetResponseInfo("QueryId: %v", response->query().id());
             });
     }
 
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, ListQueries)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TListQueriesOptions options;
-        SetTimeoutOptions(&options, context.Get());
-
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        if (request->has_from_time()) {
-            options.FromTime = TInstant::FromValue(request->from_time());
-        }
-        if (request->has_to_time()) {
-            options.ToTime = TInstant::FromValue(request->to_time());
-        }
-        if (request->has_cursor_time()) {
-            options.CursorTime = TInstant::FromValue(request->cursor_time());
-        }
-        options.CursorDirection = FromProto<EOperationSortDirection>(request->cursor_direction());
-
-        if (request->has_user_filter()) {
-            options.UserFilter = request->user_filter();
-        }
-        if (request->has_state_filter()) {
-            options.StateFilter = FromProto<NQueryTrackerClient::EQueryState>(request->state_filter());
-        }
-        if (request->has_engine_filter()) {
-            options.EngineFilter = FromProto<NQueryTrackerClient::EQueryEngine>(request->engine_filter());
-        }
-        if (request->has_substr_filter()) {
-            options.SubstrFilter = request->substr_filter();
-        }
-
-        options.Limit = request->limit();
-
-        if (request->has_attributes()) {
-            options.Attributes = FromProto<NYTree::TAttributeFilter>(request->attributes());
-        }
+        auto req = proxy.ListQueries();
+        FillQueryTrackerRequest(context, request, req);
 
         context->SetRequestInfo(
-            "QueryTrackerStage: %v, FromTime: %v, ToTime: %v, CursorTime: %v, CursorDirection: %v, "
-            "UserFilter: %v, StateFilter: %v, EngineFilter: %v, SubstrFilter: %v, Limit: %v",
-            options.QueryTrackerStage,
-            options.FromTime,
-            options.ToTime,
-            options.CursorTime,
-            options.CursorDirection,
-            options.UserFilter,
-            options.StateFilter,
-            options.EngineFilter,
-            options.SubstrFilter,
-            options.Limit);
+            "QueryTrackerStage: %v, Limit: %v",
+            request->query_tracker_stage(),
+            request->limit());
 
         ExecuteCall(
             context,
             [=] {
-                return client->ListQueries(options);
+                return req->Invoke();
             },
             [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
-
-                for (const auto& query : result.Queries) {
-                    ToProto(response->add_queries(), query);
-                }
-
-                response->set_incomplete(result.Incomplete);
-                response->set_timestamp(result.Timestamp);
+                response->MergeFrom(result->rpc_proxy_response());
 
                 context->SetResponseInfo("QueryCount: %v, Incomplete: %v, Timestamp: %v",
-                    result.Queries.size(),
-                    result.Incomplete,
-                    result.Timestamp);
+                    response->queries_size(),
+                    response->incomplete(),
+                    response->timestamp());
             });
     }
 
-
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, AlterQuery)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TAlterQueryOptions options;
-        SetTimeoutOptions(&options, context.Get());
+        auto req = proxy.AlterQuery();
+        FillQueryTrackerRequest(context, request, req);
 
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        if (request->has_annotations()) {
-            options.Annotations = ConvertToNode(TYsonStringBuf(request->annotations()))->AsMap();
-        }
-
-        if (request->has_access_control_object()) {
-            options.AccessControlObject = request->access_control_object();
-        }
-
-        auto queryId = FromProto<NQueryTrackerClient::TQueryId>(request->query_id());
-
-        context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v, AccessControlObject: %v",
-            options.QueryTrackerStage,
-            queryId,
-            options.AccessControlObject);
+        context->SetRequestInfo("QueryTrackerStage: %v, QueryId: %v",
+            request->query_tracker_stage(),
+            FromProto<NQueryTrackerClient::TQueryId>(request->query_id()));
 
         ExecuteCall(
             context,
             [=] {
-                return client->AlterQuery(queryId, options);
+                return req->Invoke();
+            },
+            [] (const auto& /*context*/, const auto& /*result*/) {
+                // do nothing.
             });
     }
 
     DECLARE_RPC_SERVICE_METHOD(NApi::NRpcProxy::NProto, GetQueryTrackerInfo)
     {
-        auto client = GetAuthenticatedClientOrThrow(context, request);
+        auto proxy = GetQueryTrackerProxy(context, request);
 
-        TGetQueryTrackerInfoOptions options;
-        SetTimeoutOptions(&options, context.Get());
+        auto req = proxy.GetQueryTrackerInfo();
+        FillQueryTrackerRequest(context, request, req);
 
-        options.QueryTrackerStage = request->query_tracker_stage();
-
-        if (request->has_attributes()) {
-            options.Attributes = FromProto<NYTree::TAttributeFilter>(request->attributes());
-        }
-
-        context->SetRequestInfo("QueryTrackerStage: %v", options.QueryTrackerStage);
+        context->SetRequestInfo("QueryTrackerStage: %v", request->query_tracker_stage());
 
         ExecuteCall(
             context,
             [=] {
-                return client->GetQueryTrackerInfo(options);
+                return req->Invoke();
             },
             [] (const auto& context, const auto& result) {
                 auto* response = &context->Response();
+                response->MergeFrom(result->rpc_proxy_response());
 
-                response->set_cluster_name(result.ClusterName);
-                response->set_supported_features(result.SupportedFeatures.ToString());
-                for (const auto& accessControlObject : result.AccessControlObjects) {
-                    *response->add_access_control_objects() = accessControlObject;
-                }
-
-                context->SetResponseInfo("ClusterName: %v", result.ClusterName);
+                context->SetResponseInfo("ClusterName: %v", response->cluster_name());
             });
     }
 
@@ -6305,7 +6399,6 @@ IApiServicePtr CreateApiService(
     NLogging::TLogger logger,
     TProfiler profiler,
     INodeMemoryTrackerPtr memoryUsageTracker,
-    INodeMemoryReferenceTrackerPtr memoryReferenceTracker,
     IStickyTransactionPoolPtr stickyTransactionPool)
 {
     return New<TApiService>(
@@ -6321,7 +6414,6 @@ IApiServicePtr CreateApiService(
         std::move(logger),
         std::move(profiler),
         std::move(memoryUsageTracker),
-        std::move(memoryReferenceTracker),
         std::move(stickyTransactionPool));
 }
 

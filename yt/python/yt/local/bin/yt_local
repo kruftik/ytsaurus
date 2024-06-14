@@ -17,7 +17,7 @@ import errno
 
 DESCRIPTION = """Command-line utility to work with local YT instances."""
 
-SERVICE_LIST = ("master", "node", "scheduler", "controller-agent", "proxy", "rpc-proxy", "watcher", "queue-agent")
+SERVICE_LIST = ("master", "node", "scheduler", "controller-agent", "proxy", "rpc-proxy", "watcher", "queue-agent", "kafka-proxy")
 
 logger = logging.getLogger("YtLocal")
 
@@ -154,6 +154,8 @@ def add_start_subparser(subparsers):
     parser.add_argument("--tablet-balancer-count", type=int, default=0, help="number of tablet balancers")
     parser.add_argument("--master-cache-count", type=int, default=0, help="number of master caches")
     parser.add_argument("--queue-agent-count", type=int, default=0, help="number of queue agents")
+    parser.add_argument("--kafka-proxy-count", type=int, default=0, help="number of kafka proxies")
+    parser.add_argument("--discovery-server-count", type=int, default=0, help="number of discovery servers")
 
     for service in SERVICE_LIST:
         config_parser = parser.add_mutually_exclusive_group(required=False)
@@ -177,6 +179,8 @@ def add_start_subparser(subparsers):
                         help="proxy ports for https proxy; number of values should be equal to http-proxy-count.")
     parser.add_argument("--rpc-proxy-port", type=int, nargs="+", dest="rpc_proxy_ports",
                         help="ports for rpc proxies; number of values should be equal to rpc-proxy-count.")
+    parser.add_argument("--discovery-server-port", type=int, nargs="+", dest="discovery_server_ports",
+                        help="ports for discovery servers; number of values should be equal to discovery-server-count.")
     parser.add_argument("--enable-debug-logging", action="store_true", default=False,
                         help="set logging level threshold to DEBUG")
     parser.add_argument("--enable-structured-logging", action="store_true", default=False,
@@ -189,6 +193,7 @@ def add_start_subparser(subparsers):
                                              "Will be used to store performance critical parts.")
     parser.add_argument("--port-range-start", type=int,
                         help="assign ports from continuous range starting from this port number.")
+    parser.add_argument("--node-port-set-size", type=int, help="assign node port set size")
     parser.add_argument("--listen-port-pool", nargs="+", type=int,
                         help="assign ports from the list of ports specified by this argument")
     parser.add_argument("--fqdn", help="FQDN to use in all addresses. Detected automatically if not specified.")
@@ -224,6 +229,9 @@ def add_start_subparser(subparsers):
                              "(applies only to sync mode)")
     parser.add_argument("--cell-tag", type=int, default=1,
                         help="cluster cell tag")
+
+    parser.add_argument("--job-proxy-logging-mode", choices=["simple", "per_job_directory"], default="simple",
+                        help="job proxy logging mode")
 
     parser.add_argument("--ytserver-all-path",
                         help="Use specified ytserver_all binary instead of per-service binaries in PATH")

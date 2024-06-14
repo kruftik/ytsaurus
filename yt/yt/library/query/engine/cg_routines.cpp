@@ -19,6 +19,7 @@
 
 #include <yt/yt/client/query_client/query_statistics.h>
 
+#include <yt/yt/client/table_client/composite_compare.h>
 #include <yt/yt/client/table_client/logical_type.h>
 #include <yt/yt/client/table_client/row_buffer.h>
 #include <yt/yt/client/table_client/unversioned_reader.h>
@@ -80,7 +81,7 @@ using namespace NWebAssembly;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = QueryClientLogger;
+static constexpr auto& Logger = QueryClientLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -149,8 +150,6 @@ using TUnversionedRowsConsumer = bool (*)(void** closure, TExpressionContext*, c
 
 bool WriteRow(TExecutionContext* context, TWriteOpClosure* closure, TPIValue* values)
 {
-    CHECK_STACK();
-
     auto* statistics = context->Statistics;
 
     if (statistics->RowsWritten >= context->OutputRowLimit) {
@@ -215,7 +214,7 @@ void ScanOpHelper(
 {
     auto consumeRows = PrepareFunction(consumeRowsFunction);
 
-    auto finalLogger = Finally([&] () {
+    auto finalLogger = Finally([&] {
         YT_LOG_DEBUG("Finalizing scan helper");
     });
     if (context->Limit == 0) {
@@ -311,6 +310,13 @@ void ScanOpHelper(
             auto** valuesOffset = std::bit_cast<const TValue**>(copiedRangesPointersGuard.GetCopiedOffset());
             interrupt |= consumeRows(consumeRowsClosure, &scanContext, valuesOffset, values.size());
         } else {
+            // TODO(dtorilov): This is a fix of YT-21907. Should use consumer with PI conversion here.
+            for (auto row : rows) {
+                for (int index : rowSchemaInformation->StringLikeIndices) {
+                    MakePositionIndependentFromUnversioned(std::bit_cast<TPIValue*>(&row[index]), row[index]);
+                }
+            }
+
             interrupt |= consumeRows(consumeRowsClosure, &scanContext, values.data(), values.size());
         }
 
@@ -493,7 +499,7 @@ void MultiJoinOpHelper(
     auto collectRows = PrepareFunction(collectRowsFunction);
     auto consumeRows = PrepareFunction(consumeRowsFunction);
 
-    auto finalLogger = Finally([&] () {
+    auto finalLogger = Finally([&] {
         YT_LOG_DEBUG("Finalizing multijoin helper");
     });
 
@@ -525,7 +531,7 @@ void MultiJoinOpHelper(
 
     bool finished = false;
 
-    closure.ProcessJoinBatch = [&] () {
+    closure.ProcessJoinBatch = [&] {
         if (finished) {
             return true;
         }
@@ -607,7 +613,7 @@ void MultiJoinOpHelper(
             // Sort-merge join
             auto currentKey = orderedKeys.begin();
 
-            auto processSortedForeignSequence = [&] () {
+            auto processSortedForeignSequence = [&] {
                 size_t index = 0;
                 while (index != sortedForeignSequence.size() && currentKey != orderedKeys.end()) {
                     int cmpResult = fullTernaryComparer(*currentKey, sortedForeignSequence[index]);
@@ -1039,14 +1045,15 @@ public:
         NWebAssembly::TCompartmentFunction<THasherFunction> groupHasher,
         NWebAssembly::TCompartmentFunction<TComparerFunction> groupComparer,
         int keySize,
+        int rowSize,
         bool shouldCheckForNullGroupKey,
         bool allAggregatesAreFirst,
         void** consumeIntermediateClosure,
         TWebAssemblyRowsConsumer consumeIntermediate,
-        void** consumeFinalClosure,
-        TWebAssemblyRowsConsumer consumeFinal,
-        void** consumeDeltaFinalClosure,
-        TWebAssemblyRowsConsumer consumeDeltaFinal,
+        void** consumeAggregatedClosure,
+        TWebAssemblyRowsConsumer consumeAggregated,
+        void** consumeDeltaClosure,
+        TWebAssemblyRowsConsumer consumeDelta,
         void** consumeTotalsClosure,
         TWebAssemblyRowsConsumer consumeTotals);
 
@@ -1079,7 +1086,7 @@ public:
     Y_FORCE_INLINE const TPIValue* InsertIntermediate(const TExecutionContext* context, TPIValue* row);
 
     // Returns row itself.
-    Y_FORCE_INLINE const TPIValue* InsertFinal(const TExecutionContext* context, TPIValue* row);
+    Y_FORCE_INLINE const TPIValue* InsertAggregated(const TExecutionContext* context, TPIValue* row);
 
     // Returns row itself.
     Y_FORCE_INLINE const TPIValue* InsertTotals(const TExecutionContext* context, TPIValue* row);
@@ -1101,7 +1108,7 @@ public:
 
 private:
     TExpressionContext Context_;
-    TExpressionContext FinalContext_;
+    TExpressionContext AggregatedContext_;
     TExpressionContext TotalsContext_;
 
     // The grouping key and the primary key may have a common prefix of length P.
@@ -1110,6 +1117,7 @@ private:
 
     TLookupRows GroupedIntermediateRows_;
     const int KeySize_;
+    const int RowSize_;
 
     // When executing a query with `with totals`, we store data for `totals` using the null grouping key.
     // Thus, rows with a null grouping key should lead to an execution error.
@@ -1121,18 +1129,18 @@ private:
     void** const ConsumeIntermediateClosure_;
     const TWebAssemblyRowsConsumer ConsumeIntermediate_;
 
-    void** const ConsumeFinalClosure_;
-    const TWebAssemblyRowsConsumer ConsumeFinal_;
+    void** const ConsumeAggregatedClosure_;
+    const TWebAssemblyRowsConsumer ConsumeAggregated_;
 
-    void** const ConsumeDeltaFinalClosure_;
-    const TWebAssemblyRowsConsumer ConsumeDeltaFinal_;
+    void** const ConsumeDeltaClosure_;
+    const TWebAssemblyRowsConsumer ConsumeDelta_;
 
     void** const ConsumeTotalsClosure_;
     const TWebAssemblyRowsConsumer ConsumeTotals_;
 
     const TPIValue* LastKey_ = nullptr;
     std::vector<const TPIValue*> Intermediate_;
-    std::vector<const TPIValue*> Final_;
+    std::vector<const TPIValue*> Aggregated_;
     std::vector<const TPIValue*> Totals_;
 
     // Defines the stage of the stream processing.
@@ -1157,8 +1165,8 @@ private:
         const TFlushFunction& flush);
 
     Y_FORCE_INLINE void FlushIntermediate(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end);
-    Y_FORCE_INLINE void FlushFinal(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end);
-    Y_FORCE_INLINE void FlushDeltaFinal(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end);
+    Y_FORCE_INLINE void FlushAggregated(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end);
+    Y_FORCE_INLINE void FlushDelta(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end);
     Y_FORCE_INLINE void FlushTotals(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end);
 };
 
@@ -1168,18 +1176,19 @@ TGroupByClosure::TGroupByClosure(
     NWebAssembly::TCompartmentFunction<THasherFunction> groupHasher,
     NWebAssembly::TCompartmentFunction<TComparerFunction> groupComparer,
     int keySize,
+    int rowSize,
     bool shouldCheckForNullGroupKey,
     bool allAggregatesAreFirst,
     void** consumeIntermediateClosure,
     TWebAssemblyRowsConsumer consumeIntermediate,
-    void** consumeFinalClosure,
-    TWebAssemblyRowsConsumer consumeFinal,
-    void** consumeDeltaFinalClosure,
-    TWebAssemblyRowsConsumer consumeDeltaFinal,
+    void** consumeAggregatedClosure,
+    TWebAssemblyRowsConsumer consumeAggregated,
+    void** consumeDeltaClosure,
+    TWebAssemblyRowsConsumer consumeDelta,
     void** consumeTotalsClosure,
     TWebAssemblyRowsConsumer consumeTotals)
     : Context_(MakeExpressionContext(TPermanentBufferTag(), chunkProvider))
-    , FinalContext_(MakeExpressionContext(TPermanentBufferTag(), chunkProvider))
+    , AggregatedContext_(MakeExpressionContext(TPermanentBufferTag(), chunkProvider))
     , TotalsContext_(MakeExpressionContext(TPermanentBufferTag(), chunkProvider))
     , PrefixEqComparer_(prefixEqComparer)
     , GroupedIntermediateRows_(
@@ -1187,14 +1196,15 @@ TGroupByClosure::TGroupByClosure(
         groupHasher,
         groupComparer)
     , KeySize_(keySize)
+    , RowSize_(rowSize)
     , ShouldCheckForNullGroupKey_(shouldCheckForNullGroupKey)
     , AllAggregatesAreFirst_(allAggregatesAreFirst)
     , ConsumeIntermediateClosure_(consumeIntermediateClosure)
     , ConsumeIntermediate_(consumeIntermediate)
-    , ConsumeFinalClosure_(consumeFinalClosure)
-    , ConsumeFinal_(consumeFinal)
-    , ConsumeDeltaFinalClosure_(consumeDeltaFinalClosure)
-    , ConsumeDeltaFinal_(consumeDeltaFinal)
+    , ConsumeAggregatedClosure_(consumeAggregatedClosure)
+    , ConsumeAggregated_(consumeAggregated)
+    , ConsumeDeltaClosure_(consumeDeltaClosure)
+    , ConsumeDelta_(consumeDelta)
     , ConsumeTotalsClosure_(consumeTotalsClosure)
     , ConsumeTotals_(consumeTotals)
     , FlushContext_(MakeExpressionContext(TIntermediateBufferTag(), chunkProvider))
@@ -1293,15 +1303,15 @@ const TPIValue* TGroupByClosure::InsertIntermediate(const TExecutionContext* con
     return *it;
 }
 
-const TPIValue* TGroupByClosure::InsertFinal(const TExecutionContext* /*context*/, TPIValue* row)
+const TPIValue* TGroupByClosure::InsertAggregated(const TExecutionContext* /*context*/, TPIValue* row)
 {
     LastKey_ = row;
 
-    Final_.push_back(row);
+    Aggregated_.push_back(row);
     ++GroupedRowCount_;
 
-    for (int index = 0; index < KeySize_; ++index) {
-        CapturePIValue(&FinalContext_, &row[index], EAddressSpace::WebAssembly, EAddressSpace::WebAssembly);
+    for (int index = 0; index < RowSize_; ++index) {
+        CapturePIValue(&AggregatedContext_, &row[index], EAddressSpace::WebAssembly, EAddressSpace::WebAssembly);
     }
 
     return row;
@@ -1323,16 +1333,16 @@ const TPIValue* TGroupByClosure::InsertTotals(const TExecutionContext* /*context
 void TGroupByClosure::Flush(const TExecutionContext* context, EStreamTag incomingTag)
 {
     if (Y_UNLIKELY(CurrentSegment_ == EGroupOpProcessingStage::RightBorder)) {
-        if (!Final_.empty()) {
-            FlushFinal(context, Final_.data(), Final_.data() + Final_.size());
-            Final_.clear();
+        if (!Aggregated_.empty()) {
+            FlushAggregated(context, Aggregated_.data(), Aggregated_.data() + Aggregated_.size());
+            Aggregated_.clear();
         }
 
         if (!Intermediate_.empty()) {
             // Can be non-null in last call.
             i64 innerCount = Intermediate_.size() - GroupedIntermediateRows_.size();
 
-            FlushDeltaFinal(context, Intermediate_.data(), Intermediate_.data() + innerCount);
+            FlushDelta(context, Intermediate_.data(), Intermediate_.data() + innerCount);
             FlushIntermediate(context, Intermediate_.data() + innerCount, Intermediate_.data() + Intermediate_.size());
 
             Intermediate_.clear();
@@ -1348,9 +1358,9 @@ void TGroupByClosure::Flush(const TExecutionContext* context, EStreamTag incomin
     }
 
     switch (LastTag_) {
-        case EStreamTag::Final: {
-            FlushFinal(context, Final_.data(), Final_.data() + Final_.size());
-            Final_.clear();
+        case EStreamTag::Aggregated: {
+            FlushAggregated(context, Aggregated_.data(), Aggregated_.data() + Aggregated_.size());
+            Aggregated_.clear();
             break;
         }
 
@@ -1366,10 +1376,10 @@ void TGroupByClosure::Flush(const TExecutionContext* context, EStreamTag incomin
             } else if (Y_UNLIKELY(Intermediate_.size() >= RowsetProcessingBatchSize)) {
                 // When group key contains full primary key (used with joins), flush will be called on each grouped row.
                 // Thus, we batch calls to Flusher.
-                FlushDeltaFinal(context, Intermediate_.data(), Intermediate_.data() + Intermediate_.size());
+                FlushDelta(context, Intermediate_.data(), Intermediate_.data() + Intermediate_.size());
                 Intermediate_.clear();
-            } else if (Y_UNLIKELY(incomingTag == EStreamTag::Final)) {
-                FlushDeltaFinal(context, Intermediate_.data(), Intermediate_.data() + Intermediate_.size());
+            } else if (Y_UNLIKELY(incomingTag == EStreamTag::Aggregated)) {
+                FlushDelta(context, Intermediate_.data(), Intermediate_.data() + Intermediate_.size());
                 Intermediate_.clear();
             }
 
@@ -1409,7 +1419,7 @@ void TGroupByClosure::SetClosingSegment()
 
 bool TGroupByClosure::IsFlushed() const
 {
-    return Intermediate_.empty() && Final_.empty() && Totals_.empty();
+    return Intermediate_.empty() && Aggregated_.empty() && Totals_.empty();
 }
 
 template <typename TFlushFunction>
@@ -1459,19 +1469,19 @@ void TGroupByClosure::FlushIntermediate(const TExecutionContext* context, const 
     FlushWithBatching(context, begin, end, flush);
 }
 
-void TGroupByClosure::FlushFinal(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end)
+void TGroupByClosure::FlushAggregated(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end)
 {
     auto flush = [this] (TExpressionContext* context, const TPIValue** begin, i64 size) {
-        return ConsumeFinal_(ConsumeFinalClosure_, context, begin, size);
+        return ConsumeAggregated_(ConsumeAggregatedClosure_, context, begin, size);
     };
 
     FlushWithBatching(context, begin, end, flush);
 }
 
-void TGroupByClosure::FlushDeltaFinal(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end)
+void TGroupByClosure::FlushDelta(const TExecutionContext* context, const TPIValue** begin, const TPIValue** end)
 {
     auto flush = [this] (TExpressionContext* context, const TPIValue** begin, i64 size) {
-        return ConsumeDeltaFinal_(ConsumeDeltaFinalClosure_, context, begin, size);
+        return ConsumeDelta_(ConsumeDeltaClosure_, context, begin, size);
     };
 
     FlushWithBatching(context, begin, end, flush);
@@ -1505,12 +1515,12 @@ const TPIValue* InsertGroupRow(
     closure->UpdateTagAndFlushIfNeeded(context, rowTag);
 
     switch (rowTag) {
-        case EStreamTag::Final: {
+        case EStreamTag::Aggregated: {
             if (closure->IsUserRowLimitReached(context)) {
                 return nullptr;
             }
 
-            closure->InsertFinal(context, row);
+            closure->InsertAggregated(context, row);
             return row;
         }
 
@@ -1551,17 +1561,17 @@ void GroupOpHelper(
     THasherFunction* groupHasherFunction,
     TComparerFunction* groupComparerFunction,
     int keySize,
-    int /*valuesCount*/,
+    int valuesCount,
     bool shouldCheckForNullGroupKey,
     bool allAggregatesAreFirst,
     void** collectRowsClosure,
     TGroupCollector collectRowsFunction,
     void** consumeIntermediateClosure,
     TRowsConsumer consumeIntermediateFunction,
-    void** consumeFinalClosure,
-    TRowsConsumer consumeFinalFunction,
-    void** consumeDeltaFinalClosure,
-    TRowsConsumer consumeDeltaFinalFunction,
+    void** consumeAggregatedClosure,
+    TRowsConsumer consumeAggregatedFunction,
+    void** consumeDeltaClosure,
+    TRowsConsumer consumeDeltaFunction,
     void** consumeTotalsClosure,
     TRowsConsumer consumeTotalsFunction)
 {
@@ -1570,8 +1580,8 @@ void GroupOpHelper(
     auto groupHasher = PrepareFunction(groupHasherFunction);
     auto groupComparer = PrepareFunction(groupComparerFunction);
     auto consumeIntermediate = PrepareFunction(consumeIntermediateFunction);
-    auto consumeFinal = PrepareFunction(consumeFinalFunction);
-    auto consumeDeltaFinal = PrepareFunction(consumeDeltaFinalFunction);
+    auto consumeAggregated = PrepareFunction(consumeAggregatedFunction);
+    auto consumeDelta = PrepareFunction(consumeDeltaFunction);
     auto consumeTotals = PrepareFunction(consumeTotalsFunction);
 
     TGroupByClosure closure(
@@ -1580,18 +1590,19 @@ void GroupOpHelper(
         groupHasher,
         groupComparer,
         keySize,
+        keySize + valuesCount,
         shouldCheckForNullGroupKey,
         allAggregatesAreFirst,
         consumeIntermediateClosure,
         consumeIntermediate,
-        consumeFinalClosure,
-        consumeFinal,
-        consumeDeltaFinalClosure,
-        consumeDeltaFinal,
+        consumeAggregatedClosure,
+        consumeAggregated,
+        consumeDeltaClosure,
+        consumeDelta,
         consumeTotalsClosure,
         consumeTotals);
 
-    auto finalLogger = Finally([&] () {
+    auto finalLogger = Finally([&] {
         YT_LOG_DEBUG("Finalizing group helper (ProcessedRows: %v)", closure.GetProcessedRowCount());
     });
 
@@ -1631,14 +1642,12 @@ void AllocatePermanentRow(
     int valueCount,
     TValue** row)
 {
-    CHECK_STACK();
-
     // TODO(dtorilov): Use AllocateUnversioned.
     auto* offset = expressionContext->AllocateAligned(valueCount * sizeof(TPIValue), EAddressSpace::WebAssembly);
     *ConvertPointerFromWasmToHost(row) = std::bit_cast<TValue*>(offset);
 }
 
-void AddRowToCollector(TTopCollector* topCollector, TPIValue* row)
+void AddRowToCollector(TTopCollectorBase* topCollector, TPIValue* row)
 {
     topCollector->AddRow(row);
 }
@@ -1647,7 +1656,7 @@ void OrderOpHelper(
     TExecutionContext* context,
     TComparerFunction* comparerFunction,
     void** collectRowsClosure,
-    void (*collectRowsFunction)(void** closure, TTopCollector* topCollector),
+    void (*collectRowsFunction)(void** closure, TTopCollectorBase* topCollector),
     void** consumeRowsClosure,
     TRowsConsumer consumeRowsFunction,
     size_t rowSize)
@@ -1656,13 +1665,15 @@ void OrderOpHelper(
     auto collectRows = PrepareFunction(collectRowsFunction);
     auto consumeRows = PrepareFunction(consumeRowsFunction);
 
-    auto finalLogger = Finally([&] () {
+    auto finalLogger = Finally([&] {
         YT_LOG_DEBUG("Finalizing order helper");
     });
 
-    auto limit = context->Offset + context->Limit;
-
-    TTopCollector topCollector(limit, comparer, rowSize, context->MemoryChunkProvider);
+    auto topCollector = TTopCollector(
+        context->Offset + context->Limit,
+        comparer,
+        rowSize,
+        context->MemoryChunkProvider);
     collectRows(collectRowsClosure, &topCollector);
     auto rows = topCollector.GetRows();
 
@@ -2359,97 +2370,6 @@ void ThrowCannotCompareTypes(NYson::ETokenType lhsType, NYson::ETokenType rhsTyp
         rhsType);
 }
 
-int CompareAny(char* lhsData, i32 lhsLength, char* rhsData, i32 rhsLength)
-{
-    lhsData = ConvertPointerFromWasmToHost(lhsData);
-    rhsData = ConvertPointerFromWasmToHost(rhsData);
-
-    TStringBuf lhsInput(lhsData, lhsLength);
-    TStringBuf rhsInput(rhsData, rhsLength);
-
-    NYson::TStatelessLexer lexer;
-
-    NYson::TToken lhsToken;
-    NYson::TToken rhsToken;
-    lexer.ParseToken(lhsInput, &lhsToken);
-    lexer.ParseToken(rhsInput, &rhsToken);
-
-    if (lhsToken.GetType() != rhsToken.GetType()) {
-        ThrowCannotCompareTypes(lhsToken.GetType(), rhsToken.GetType());
-    }
-
-    auto tokenType = lhsToken.GetType();
-
-    switch (tokenType) {
-        case NYson::ETokenType::Boolean: {
-            auto lhsValue = lhsToken.GetBooleanValue();
-            auto rhsValue = rhsToken.GetBooleanValue();
-            if (lhsValue < rhsValue) {
-                return -1;
-            } else if (lhsValue > rhsValue) {
-                return +1;
-            } else {
-                return 0;
-            }
-            break;
-        }
-        case NYson::ETokenType::Int64: {
-            auto lhsValue = lhsToken.GetInt64Value();
-            auto rhsValue = rhsToken.GetInt64Value();
-            if (lhsValue < rhsValue) {
-                return -1;
-            } else if (lhsValue > rhsValue) {
-                return +1;
-            } else {
-                return 0;
-            }
-            break;
-        }
-        case NYson::ETokenType::Uint64: {
-            auto lhsValue = lhsToken.GetUint64Value();
-            auto rhsValue = rhsToken.GetUint64Value();
-            if (lhsValue < rhsValue) {
-                return -1;
-            } else if (lhsValue > rhsValue) {
-                return +1;
-            } else {
-                return 0;
-            }
-            break;
-        }
-        case NYson::ETokenType::Double: {
-            auto lhsValue = lhsToken.GetDoubleValue();
-            auto rhsValue = rhsToken.GetDoubleValue();
-            if (lhsValue < rhsValue) {
-                return -1;
-            } else if (lhsValue > rhsValue) {
-                return +1;
-            } else {
-                return 0;
-            }
-            break;
-        }
-        case NYson::ETokenType::String: {
-            auto lhsValue = lhsToken.GetStringValue();
-            auto rhsValue = rhsToken.GetStringValue();
-            if (lhsValue < rhsValue) {
-                return -1;
-            } else if (lhsValue > rhsValue) {
-                return +1;
-            } else {
-                return 0;
-            }
-            break;
-        }
-        default:
-            THROW_ERROR_EXCEPTION("Values of type %Qlv are not comparable",
-                tokenType);
-    }
-
-    YT_ABORT();
-}
-
-
 #define DEFINE_COMPARE_ANY(TYPE, TOKEN_TYPE) \
 int CompareAny##TOKEN_TYPE(char* lhsData, i32 lhsLength, TYPE rhsValue) \
 { \
@@ -2782,8 +2702,12 @@ void ListHasIntersection(
 
     bool found = false;
     const auto rhsNodeList = rhsNode->AsList()->GetChildren();
-    if (!rhsNodeList.empty()) {
-        auto element= rhsNodeList[0];
+    size_t i = 0;
+    while (i < rhsNodeList.size() && rhsNodeList[i]->GetType() == ENodeType::Entity) {
+        ++i;
+    }
+    if (i < rhsNodeList.size()) {
+        auto element = rhsNodeList[i];
         switch (element->GetType()) {
             case ENodeType::String:
                 found = ListHasIntersectionImpl<ENodeType::String, TString>(lhsNode, rhsNode);
@@ -3215,6 +3139,109 @@ void LastSeenReplicaSetMerge(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void NodeToWasmUnversionedValue(TExpressionContext* context, TUnversionedValue& unversionedValue, const INodePtr& value)
+{
+    if (!value) {
+        unversionedValue.Type = EValueType::Null;
+        return;
+    }
+    auto ysonString = NYson::ConvertToYsonString(value);
+    unversionedValue.Type = EValueType::Any;
+    unversionedValue.Length = ysonString.AsStringBuf().size();
+    char* data = AllocateBytes(context, unversionedValue.Length);
+    std::memcpy(data, ysonString.AsStringBuf().data(), unversionedValue.Length);
+    unversionedValue.Data.String = ConvertPointerFromHostToWasm(data, unversionedValue.Length);
+}
+
+INodePtr NodeFromWasmUnversionedValue(const TUnversionedValue& unversionedValue)
+{
+    if (unversionedValue.Type == EValueType::Null) {
+        return nullptr;
+    }
+    auto data = ConvertPointerFromWasmToHost(unversionedValue.Data.String, unversionedValue.Length);
+    auto stringBuf = TStringBuf(data, unversionedValue.Length);
+    auto ysonString = NYson::TYsonString(stringBuf);
+    return ConvertToNode(ysonString);
+}
+
+void RemoveRecursively(INodePtr node)
+{
+    auto parent = node->GetParent();
+    while (parent) {
+        if (parent->GetType() != ENodeType::Map) {
+            break;
+        }
+
+        auto parentMap = parent->AsMap();
+        parentMap->RemoveChild(node);
+        if (parentMap->GetChildCount() == 0) {
+            node = parent;
+            parent = parentMap->GetParent();
+        } else {
+            parent = nullptr;
+        }
+    }
+}
+
+INodePtr DictSum(const INodePtr& stateRoot, const INodePtr& deltaRoot)
+{
+    if (!deltaRoot || deltaRoot->GetType() != ENodeType::Map) {
+        return stateRoot;
+    }
+
+    if (!stateRoot) {
+        return deltaRoot;
+    }
+
+    if (stateRoot->GetType() != ENodeType::Map) {
+        return nullptr;
+    }
+
+    auto oldStateRoot = ConvertToNode(stateRoot);
+    std::vector<std::pair<IMapNodePtr, IMapNodePtr>> traversal;
+    traversal.push_back({stateRoot->AsMap(), deltaRoot->AsMap()});
+    while (!traversal.empty()) {
+        auto [state, delta] = traversal.back();
+        traversal.pop_back();
+        for (auto& [key, deltaChild] : delta->GetChildren()) {
+            auto stateChild = state->FindChild(key);
+            if (!stateChild) {
+                delta->RemoveChild(deltaChild);
+                state->AddChild(key, deltaChild);
+                continue;
+            }
+
+            if (stateChild->GetType() == ENodeType::Int64 && deltaChild->GetType() == ENodeType::Int64) {
+                auto intNode = stateChild->AsInt64();
+                intNode->SetValue(intNode->GetValue() + deltaChild->AsInt64()->GetValue());
+                if (intNode->GetValue() == 0) {
+                    RemoveRecursively(intNode);
+                }
+            } else if (stateChild->GetType() == ENodeType::Map && deltaChild->GetType() == ENodeType::Map) {
+                traversal.push_back({stateChild->AsMap(), deltaChild->AsMap()});
+            } else {
+                return oldStateRoot;
+            }
+        }
+    }
+
+    return stateRoot;
+}
+
+void DictSumIteration(
+    TExpressionContext* context,
+    TUnversionedValue* result,
+    TUnversionedValue* state,
+    TUnversionedValue* delta)
+{
+    auto stateNode = NodeFromWasmUnversionedValue(*state);
+    auto deltaNode = NodeFromWasmUnversionedValue(*delta);
+    auto resultNode = DictSum(stateNode, deltaNode);
+    NodeToWasmUnversionedValue(context, *result, resultNode);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 // TODO(dtorilov): Add unit-test.
 void HasPermissions(
     TExpressionContext* /*context*/,
@@ -3562,6 +3589,34 @@ void CompositeMemberAccessorHelper(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+int CompareYsonValuesHelper(const char* lhsOffset, ui32 lhsLength, const char* rhsOffset, ui32 rhsLength)
+{
+    auto* lhs = ConvertPointerFromWasmToHost(lhsOffset, lhsLength);
+    auto* rhs = ConvertPointerFromWasmToHost(rhsOffset, rhsLength);
+    return NYT::NTableClient::CompareYsonValues(
+        TYsonStringBuf(TStringBuf(lhs, lhsLength)),
+        TYsonStringBuf(TStringBuf(rhs, rhsLength)));
+}
+
+ui64 HashYsonValueHelper(const char* dataOffset, ui32 length)
+{
+    auto* data = ConvertPointerFromWasmToHost(dataOffset, length);
+    return NYT::NTableClient::CompositeFarmHash(TYsonStringBuf(TStringBuf(data, length)));
+}
+
+int CompareAny(char* lhsData, i32 lhsLength, char* rhsData, i32 rhsLength)
+{
+    return CompareYsonValuesHelper(lhsData, lhsLength, rhsData, rhsLength);
+}
+
+void ValidateYsonHelper(const char* offset, ui32 length)
+{
+    auto* data = ConvertPointerFromWasmToHost(offset, length);
+    ValidateYson(TYsonStringBuf(TStringBuf(data, length)), /*nestingLevelLimit*/ 256);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 int memcmp(const void* firstOffset, const void* secondOffset, std::size_t count) // NOLINT
 {
     auto* first = ConvertPointerFromWasmToHost(std::bit_cast<char*>(firstOffset), count);
@@ -3594,7 +3649,7 @@ uint64_t BigBHashImpl(char* s, int len)
 
 void AddRegexToFunctionContext(TFunctionContext* context, re2::RE2* regex) // NOLINT
 {
-    auto* ptr = context->CreateUntypedObject(regex, [](void* re) {
+    auto* ptr = context->CreateUntypedObject(regex, [] (void* re) {
         delete static_cast<re2::RE2*>(re);
     });
     context->SetPrivateData(ptr);
@@ -3647,8 +3702,7 @@ struct TMakeWebAssemblyIntrinsic<TResult(TArgs...)>
         (void*)Intrinsic##intrinsic, \
         WAVM::IR::FunctionType(WAVM::IR::FunctionType::Encoding{ \
             std::bit_cast<WAVM::Uptr>(NWebAssembly::TFunctionTypeBuilder<true, decltype(NRoutines::intrinsic) >::Get()) \
-        }) \
-    );
+        }));
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -3717,7 +3771,6 @@ REGISTER_ROUTINE(RegexEscape);
 REGISTER_ROUTINE(XdeltaMerge);
 REGISTER_ROUTINE(ToLowerUTF8);
 REGISTER_ROUTINE(GetFarmFingerprint);
-REGISTER_ROUTINE(CompareAny);
 REGISTER_ROUTINE(CompareAnyBoolean);
 REGISTER_ROUTINE(CompareAnyInt64);
 REGISTER_ROUTINE(CompareAnyUint64);
@@ -3755,6 +3808,11 @@ REGISTER_ROUTINE(HasPermissions);
 REGISTER_ROUTINE(YsonLength);
 REGISTER_ROUTINE(LikeOpHelper);
 REGISTER_ROUTINE(CompositeMemberAccessorHelper);
+REGISTER_ROUTINE(DictSumIteration);
+REGISTER_ROUTINE(CompareYsonValuesHelper);
+REGISTER_ROUTINE(HashYsonValueHelper);
+REGISTER_ROUTINE(CompareAny);
+REGISTER_ROUTINE(ValidateYsonHelper);
 
 REGISTER_ROUTINE(memcmp);
 REGISTER_ROUTINE(gmtime_r);

@@ -123,6 +123,25 @@ def raises_yt_error(code=None, required=True):
         result_list.append(e)
 
 
+@contextlib.contextmanager
+def retry_yt_error(codes=[]):
+    """
+    Context manager that helps to retry yt errors with the given codes.
+    If error raised doesn't contain one of the given codes it will be raised again.
+
+    Examples:
+        with retry_yt_error(codes=[yt_error_codes.SyncReplicaNotInSync]):
+            ...
+    """
+    while True:
+        try:
+            yield
+            return
+        except YtError as e:
+            if not any(e.contains_code(code) for code in codes):
+                raise e
+
+
 def assert_yt_error(error, *args, **kwargs):
     with raises_yt_error(*args, **kwargs):
         raise error
@@ -933,6 +952,33 @@ def advance_consumer(consumer_path, queue_path, partition_index, old_offset, new
     return execute_command("advance_consumer", kwargs)
 
 
+def create_queue_producer_session(producer_path, queue_path, session_id, user_meta=None, **kwargs):
+    kwargs["producer_path"] = producer_path
+    kwargs["queue_path"] = queue_path
+    kwargs["session_id"] = session_id
+    if user_meta is not None:
+        kwargs["user_meta"] = user_meta
+    return execute_command("create_queue_producer_session", kwargs, parse_yson=True)
+
+
+def remove_queue_producer_session(producer_path, queue_path, session_id, **kwargs):
+    kwargs["producer_path"] = producer_path
+    kwargs["queue_path"] = queue_path
+    kwargs["session_id"] = session_id
+    execute_command("remove_queue_producer_session", kwargs)
+
+
+def push_queue_producer(producer_path, queue_path, session_id, epoch, data, user_meta=None, **kwargs):
+    kwargs["producer_path"] = producer_path
+    kwargs["queue_path"] = queue_path
+    kwargs["session_id"] = session_id
+    kwargs["epoch"] = epoch
+    if user_meta is not None:
+        kwargs["user_meta"] = user_meta
+
+    return execute_command("push_queue_producer", kwargs, input_stream=_prepare_rows_stream(data), parse_yson=True)
+
+
 def start_transaction(**kwargs):
     return execute_command("start_tx", kwargs, parse_yson=True)
 
@@ -1253,9 +1299,11 @@ def get_scheduler_version():
 ##################################################################
 
 
-# Allocation id is currently equal to job id
 def get_allocation_id_from_job_id(job_id):
-    return job_id
+    parts = [int(x, 16) for x in job_id.split('-')]
+    parts[-1] &= (1 << 24) - 1
+    allocation_id = "-".join(["{:x}".format(x) for x in parts])
+    return allocation_id
 
 
 ##################################################################
@@ -1834,11 +1882,13 @@ def set_user_password(user, new_password, current_password=None, **kwargs):
     return execute_command("set_user_password", kwargs)
 
 
-def issue_token(user, password=None, **kwargs):
+def issue_token(user, password=None, description=None, **kwargs):
     kwargs["user"] = user
     if password:
         password = hashlib.sha256(password.encode("utf-8")).hexdigest()
         kwargs["password_sha256"] = password
+    if description:
+        kwargs["description"] = description
     token = execute_command("issue_token", kwargs, parse_yson=True)
     token_sha256 = hashlib.sha256(token.encode("utf-8")).hexdigest()
     return token, token_sha256
@@ -1853,12 +1903,13 @@ def revoke_token(user, token_sha256, password=None, **kwargs):
     return execute_command("revoke_token", kwargs)
 
 
-def list_user_tokens(user, password=None, **kwargs):
+def list_user_tokens(user, password=None, with_metadata=False, **kwargs):
     kwargs["user"] = user
+    kwargs["with_metadata"] = with_metadata
     if password:
         password = hashlib.sha256(password.encode("utf-8")).hexdigest()
         kwargs["password_sha256"] = password
-    return execute_command("list_user_tokens", kwargs, parse_yson=True)
+    return execute_command("list_user_tokens", kwargs, parse_yson=True, unwrap_v4_result=False)
 
 
 def migrate_replication_cards(chaos_cell_id, replication_card_ids=None, **kwargs):
@@ -2188,7 +2239,7 @@ def create_table_collocation(table_ids=None, table_paths=None, **kwargs):
     return execute_command("create", kwargs, parse_yson=True)
 
 
-def create_secondary_index(table_path, index_table_path, kind=None, **kwargs):
+def create_secondary_index(table_path, index_table_path, kind=None, predicate=None, **kwargs):
     kwargs["type"] = "secondary_index"
     if "attributes" not in kwargs:
         kwargs["attributes"] = dict()
@@ -2196,6 +2247,8 @@ def create_secondary_index(table_path, index_table_path, kind=None, **kwargs):
     kwargs["attributes"]["index_table_path"] = index_table_path
     if kind is not None:
         kwargs["attributes"]["kind"] = kind
+    if predicate is not None:
+        kwargs["attributes"]["predicate"] = predicate
     return execute_command("create", kwargs, parse_yson=True)
 
 
@@ -2782,6 +2835,68 @@ def get_cluster_drivers(primary_driver=None):
     raise "Failed to get cluster drivers"
 
 
+class AsyncGet:
+    def __init__(self, path, driver):
+        self.output_stream = OutputType()
+        self.response = self.send_request(path, driver=driver, return_response=True, output_stream=self.output_stream)
+
+    def send_request(self, path, **kwargs):
+        kwargs["path"] = path
+        return execute_command_with_output_format("get", kwargs)
+
+    def get(self):
+        self.response.wait()
+        if not self.response.is_ok():
+            error = YtResponseError(self.response.error())
+            raise error
+        result = yson.loads(self.output_stream.getvalue())
+        return result["value"]
+
+
+def get_cell_peers_info_from_orchid(cells, driver):
+    peers_to_results = {}
+    for cell in cells:
+        cell_id = str(cell)
+        peers = cell.attributes["peers"]
+        for peer in peers:
+            address = peer.get("address", None)
+            if address is None:
+                continue
+            if cell_id not in peers_to_results:
+                peers_to_results[cell_id] = {}
+            peers_to_results[cell_id][address] = {
+                "actual_config_version" : AsyncGet(
+                    "//sys/cluster_nodes/{0}/orchid/tablet_cells/{1}/config_version".format(address, cell_id),
+                    driver=driver),
+                "active" : AsyncGet(
+                    "//sys/cluster_nodes/{0}/orchid/tablet_cells/{1}/hydra/active".format(address, cell_id),
+                    driver=driver)
+            }
+    return peers_to_results
+
+
+def check_cells_state_orchid(cells, driver, decommissioned_addresses):
+    peers_to_results = get_cell_peers_info_from_orchid(cells, driver)
+    for cell in cells:
+        cell_id = str(cell)
+        expected_config_version = cell.attributes["config_version"]
+        peers = cell.attributes["peers"]
+        for peer in peers:
+            address = peer.get("address", None)
+            if address is None or address in decommissioned_addresses:
+                return False
+            try:
+                actual_config_version = peers_to_results[cell_id][address]["actual_config_version"].get()
+                if actual_config_version != expected_config_version:
+                    return False
+                active = peers_to_results[cell_id][address]["active"].get()
+                if not active:
+                    return False
+            except YtError:
+                return False
+    return True
+
+
 # TODO(babenko): rename to wait_for_tablet_cells
 def wait_for_cells(cell_ids=None, decommissioned_addresses=[], driver=None):
     print_debug("Waiting for tablet cells to become healthy...")
@@ -2796,35 +2911,7 @@ def wait_for_cells(cell_ids=None, decommissioned_addresses=[], driver=None):
             return cells
         return [cell for cell in cells if cell.attributes["id"] in cell_ids]
 
-    def check_orchid():
-        cells = get_cells(driver=driver)
-        for cell in cells:
-            cell_id = str(cell)
-            expected_config_version = cell.attributes["config_version"]
-            peers = cell.attributes["peers"]
-            for peer in peers:
-                address = peer.get("address", None)
-                if address is None or address in decommissioned_addresses:
-                    return False
-                try:
-                    actual_config_version = get(
-                        "//sys/cluster_nodes/{0}/orchid/tablet_cells/{1}/config_version".format(address, cell_id),
-                        driver=driver,
-                    )
-                    if actual_config_version != expected_config_version:
-                        return False
-
-                    active = get(
-                        "//sys/cluster_nodes/{0}/orchid/tablet_cells/{1}/hydra/active".format(address, cell_id),
-                        driver=driver,
-                    )
-                    if not active:
-                        return False
-                except YtError:
-                    return False
-        return True
-
-    wait(check_orchid)
+    wait(lambda: check_cells_state_orchid(get_cells(driver), driver, decommissioned_addresses))
 
     def check_cells(driver):
         cells = get_cells(driver=driver)
@@ -2847,7 +2934,14 @@ def sync_create_cells(cell_count, driver=None, **attributes):
     return cell_ids
 
 
-def create_chaos_cell(cell_bundle, cell_id, peer_cluster_names, meta_cluster_names=[], area="default"):
+def create_chaos_cell(
+    cell_bundle,
+    cell_id,
+    peer_cluster_names,
+    meta_cluster_names=[],
+    area="default",
+    node_tag_filter=None
+):
     params_pattern = {
         "type": "chaos_cell",
         "attributes": {
@@ -2856,6 +2950,9 @@ def create_chaos_cell(cell_bundle, cell_id, peer_cluster_names, meta_cluster_nam
             "area": area,
         }
     }
+
+    if node_tag_filter is not None:
+        params_pattern["attributes"]["node_tag_filter"] = node_tag_filter
 
     for cluster_name in peer_cluster_names + meta_cluster_names:
         params = pycopy.deepcopy(params_pattern)
@@ -2874,8 +2971,22 @@ def wait_for_chaos_cell(cell_id, peer_cluster_names):
     wait(check)
 
 
-def sync_create_chaos_cell(cell_bundle, cell_id, peer_cluster_names, meta_cluster_names=[], area="default"):
-    create_chaos_cell(cell_bundle, cell_id, peer_cluster_names, meta_cluster_names, area)
+def sync_create_chaos_cell(
+    cell_bundle,
+    cell_id,
+    peer_cluster_names,
+    meta_cluster_names=[],
+    area="default",
+    node_tag_filter=None
+):
+    create_chaos_cell(
+        cell_bundle,
+        cell_id,
+        peer_cluster_names,
+        meta_cluster_names,
+        area,
+        node_tag_filter=node_tag_filter
+    )
     wait_for_chaos_cell(cell_id, peer_cluster_names)
 
 
@@ -2920,7 +3031,14 @@ def create_chaos_area(name, bundle, peer_cluster_names, meta_cluster_names=[]):
     return create_chaos_objects(params_pattern, peer_cluster_names, meta_cluster_names)
 
 
-def create_chaos_cell_bundle(name, peer_cluster_names, meta_cluster_names=[], clock_cluster_tag=None, independent_peers=True):
+def create_chaos_cell_bundle(
+    name,
+    peer_cluster_names,
+    meta_cluster_names=[],
+    clock_cluster_tag=None,
+    independent_peers=True,
+    node_tag_filter=None
+):
     if not clock_cluster_tag:
         clock_cluster_tag = get("//sys/@primary_cell_tag")
     params_pattern = {
@@ -2939,6 +3057,10 @@ def create_chaos_cell_bundle(name, peer_cluster_names, meta_cluster_names=[], cl
             }
         }
     }
+
+    if node_tag_filter:
+        params_pattern["attributes"]["node_tag_filter"] = node_tag_filter
+
     return create_chaos_objects(params_pattern, peer_cluster_names, meta_cluster_names)
 
 
@@ -3374,6 +3496,14 @@ def get_active_primary_master_follower_address(env_setup):
                 return rpc_address
 
 
+def get_currently_active_pirmary_master_follower_addresses(env_setup):
+    followers = []
+    for rpc_address in env_setup.Env.configs["master"][0]["primary_master"]["addresses"]:
+        if is_active_primary_master_follower(rpc_address):
+            followers.append(rpc_address)
+    return followers
+
+
 def get_node_alive_object_counts(address, types):
     result = {type: 0 for type in types}
     for item in get("//sys/cluster_nodes/{}/orchid/monitoring/ref_counted/statistics".format(address), verbose=False, default=[]):
@@ -3477,3 +3607,19 @@ def stop_pipeline(pipeline_path, **kwargs):
 def pause_pipeline(pipeline_path, **kwargs):
     kwargs["pipeline_path"] = pipeline_path
     return execute_command("pause_pipeline", kwargs)
+
+
+def get_pipeline_state(pipeline_path, **kwargs):
+    kwargs["pipeline_path"] = pipeline_path
+    try:
+        return execute_command("get_pipeline_state", kwargs, parse_yson=True).lower()
+    except YtResponseError:
+        return "unknown"
+
+
+def get_flow_view(pipeline_path, view_path=None, **kwargs):
+    kwargs["pipeline_path"] = pipeline_path
+    if view_path is not None:
+        kwargs["view_path"] = view_path
+
+    return execute_command("get_flow_view", kwargs, parse_yson=True)

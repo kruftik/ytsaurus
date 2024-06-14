@@ -255,8 +255,10 @@ private:
 
     //! Contains native trunk nodes for which IsQueue() is true.
     THashSet<TChaosReplicatedTableNode*> Queues_;
-    //! Contains native trunk nodes for which IsConsumer() is true.
+    //! Contains native trunk nodes for which IsQueueConsumer() is true.
     THashSet<TChaosReplicatedTableNode*> Consumers_;
+    //! Contains native trunk nodes for which IsQueueProducer() is true.
+    THashSet<TChaosReplicatedTableNode*> Producers_;
 
     // COMPAT(cherepashka, achulkov2)
     bool NeedToAddChaosReplicatedQueues_ = false;
@@ -271,11 +273,18 @@ private:
         return Queues_;
     }
 
-    const THashSet<TChaosReplicatedTableNode*>& GetConsumers() const override
+    const THashSet<TChaosReplicatedTableNode*>& GetQueueConsumers() const override
     {
         Bootstrap_->VerifyPersistentStateRead();
 
         return Consumers_;
+    }
+
+    const THashSet<TChaosReplicatedTableNode*>& GetQueueProducers() const override
+    {
+        Bootstrap_->VerifyPersistentStateRead();
+
+        return Producers_;
     }
 
     void RegisterQueue(TChaosReplicatedTableNode* node) override
@@ -302,7 +311,7 @@ private:
         }
     }
 
-    void RegisterConsumer(TChaosReplicatedTableNode* node) override
+    void RegisterQueueConsumer(TChaosReplicatedTableNode* node) override
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
         YT_VERIFY(HasHydraContext());
@@ -314,13 +323,37 @@ private:
         }
     }
 
-    void UnregisterConsumer(TChaosReplicatedTableNode* node) override
+    void UnregisterQueueConsumer(TChaosReplicatedTableNode* node) override
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
         YT_VERIFY(HasHydraContext());
 
         if (!Consumers_.erase(node)) {
             YT_LOG_ALERT("Attempting to unregister an unknown consumer (Node: %v, Path: %v)",
+                node->GetId(),
+                Bootstrap_->GetCypressManager()->GetNodePath(node, /*transaction*/ nullptr));
+        }
+    }
+
+    void RegisterQueueProducer(TChaosReplicatedTableNode* node) override
+    {
+        VERIFY_THREAD_AFFINITY(AutomatonThread);
+        YT_VERIFY(HasHydraContext());
+
+        if (!Producers_.insert(node).second) {
+            YT_LOG_ALERT("Attempting to register a producer twice (Node: %v, Path: %v)",
+                node->GetId(),
+                Bootstrap_->GetCypressManager()->GetNodePath(node, /*transaction*/ nullptr));
+        }
+    }
+
+    void UnregisterQueueProducer(TChaosReplicatedTableNode* node) override
+    {
+        VERIFY_THREAD_AFFINITY(AutomatonThread);
+        YT_VERIFY(HasHydraContext());
+
+        if (!Producers_.erase(node)) {
+            YT_LOG_ALERT("Attempting to unregister an unknown producer (Node: %v, Path: %v)",
                 node->GetId(),
                 Bootstrap_->GetCypressManager()->GetNodePath(node, /*transaction*/ nullptr));
         }
@@ -458,7 +491,7 @@ private:
 
         const auto& multicellManager = Bootstrap_->GetMulticellManager();
         if (multicellManager->IsPrimaryMaster()) {
-            multicellManager->PostToMasters(*request, multicellManager->GetRegisteredMasterCellTags());
+            multicellManager->PostToSecondaryMasters(*request);
         }
     }
 
@@ -530,6 +563,7 @@ private:
 
         Save(context, Queues_);
         Save(context, Consumers_);
+        Save(context, Producers_);
     }
 
     void LoadKeys(NCellMaster::TLoadContext& context)
@@ -539,11 +573,7 @@ private:
         // COMPAT(cherepashka)
         if (context.GetVersion() < EMasterReign::ChaosManagerSnapshotSaveAndLoadMovement) {
             Load(context, *AlienClusterRegistry_);
-
-            // COMPAT(ponasenko-rs)
-            if (context.GetVersion() >= EMasterReign::UseMetadataCellIds) {
-                Load(context, EnabledMetadataClusters_);
-            }
+            Load(context, EnabledMetadataClusters_);
         }
 
         // COMPAT(cherepashka, achulkov2)
@@ -569,6 +599,14 @@ private:
         if (context.GetVersion() >= EMasterReign::ChaosReplicatedQueuesAndConsumersList) {
             Load(context, Queues_);
             Load(context, Consumers_);
+        }
+
+        // COMPAT(apachee)
+        // DropLegacyClusterNodeMap is the start of 24.2 reigns.
+        if ((context.GetVersion() >= EMasterReign::QueueProducers_24_1 && context.GetVersion() < EMasterReign::DropLegacyClusterNodeMap) ||
+            context.GetVersion() >= EMasterReign::QueueProducers)
+        {
+            Load(context, Producers_);
         }
     }
 
@@ -612,6 +650,7 @@ private:
 
         Queues_.clear();
         Consumers_.clear();
+        Producers_.clear();
         NeedToAddChaosReplicatedQueues_ = false;
         NeedSetStrongSchemaMode_ = false;
     }

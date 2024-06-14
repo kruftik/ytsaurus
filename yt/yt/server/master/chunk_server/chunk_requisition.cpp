@@ -24,7 +24,7 @@ using namespace NYTree;
 using NYT::ToProto;
 using NYT::FromProto;
 
-static const auto& Logger = ChunkServerLogger;
+static constexpr auto& Logger = ChunkServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -59,11 +59,6 @@ void FormatValue(TStringBuilderBase* builder, TReplicationPolicy policy, TString
     builder->AppendFormat("{ReplicationFactor: %v, DataPartsOnly: %v}",
         policy.GetReplicationFactor(),
         policy.GetDataPartsOnly());
-}
-
-TString ToString(TReplicationPolicy policy)
-{
-    return ToStringViaBuilder(policy);
 }
 
 void Serialize(TReplicationPolicy policy, NYson::IYsonConsumer* consumer)
@@ -155,12 +150,8 @@ int TChunkReplication::GetSize() const
     return std::ssize(Entries_);
 }
 
-bool TChunkReplication::IsDurabilityRequired(const IChunkManagerPtr& chunkManager) const
+bool TChunkReplication::IsDurable(const IChunkManagerPtr& chunkManager, bool isErasureChunk) const
 {
-    if (!GetVital()) {
-        return false;
-    }
-
     for (auto entry : Entries_) {
         auto* medium = chunkManager->GetMediumByIndex(entry.GetMediumIndex());
         if (medium->IsOffshore()) {
@@ -168,12 +159,17 @@ bool TChunkReplication::IsDurabilityRequired(const IChunkManagerPtr& chunkManage
         }
 
         YT_VERIFY(medium->IsDomestic());
-        if (!medium->AsDomestic()->GetTransient() && entry.Policy().GetReplicationFactor() > 1) {
+        if (!medium->AsDomestic()->GetTransient() && (entry.Policy().GetReplicationFactor() > 1 || isErasureChunk)) {
             return true;
         }
     }
 
     return false;
+}
+
+bool TChunkReplication::IsDurabilityRequired(const IChunkManagerPtr& chunkManager, bool isErasureChunk) const
+{
+    return GetVital() && IsDurable(chunkManager, isErasureChunk);
 }
 
 void FormatValue(TStringBuilderBase* builder, const TChunkReplication& replication, TStringBuf /*spec*/)
@@ -186,11 +182,6 @@ void FormatValue(TStringBuilderBase* builder, const TChunkReplication& replicati
             [&] (TStringBuilderBase* aBuilder, const TChunkReplication::TEntry& entry) {
                 aBuilder->AppendFormat("%v: %v", entry.GetMediumIndex(), entry.Policy());
             }));
-}
-
-TString ToString(const TChunkReplication& replication)
-{
-    return ToStringViaBuilder(replication);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -210,7 +201,7 @@ TSerializableChunkReplication::TSerializableChunkReplication(
 
 void TSerializableChunkReplication::ToChunkReplication(
     TChunkReplication* replication,
-    const IChunkManagerPtr& chunkManager)
+    const IChunkManagerPtr& chunkManager) const
 {
     replication->ClearEntries();
 
@@ -301,11 +292,6 @@ void FormatValue(TStringBuilderBase* builder, const TRequisitionEntry& entry, TS
         entry.MediumIndex,
         entry.ReplicationPolicy,
         entry.Committed);
-}
-
-TString ToString(const TRequisitionEntry& entry)
-{
-    return ToStringViaBuilder(entry);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -516,11 +502,6 @@ void FormatValue(TStringBuilderBase* builder, const TChunkRequisition& requisiti
             }));
 }
 
-TString ToString(const TChunkRequisition& requisition)
-{
-    return ToStringViaBuilder(requisition);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 
@@ -653,7 +634,8 @@ void TChunkRequisitionRegistry::EnsureBuiltinRequisitionsInitialized(
     FakeRefBuiltinRequisitions();
 }
 
-void TChunkRequisitionRegistry::FakeRefBuiltinRequisitions() {
+void TChunkRequisitionRegistry::FakeRefBuiltinRequisitions()
+{
     // Fake reference - always keep builtin requisitions.
     Ref(EmptyChunkRequisitionIndex);
     Ref(MigrationChunkRequisitionIndex);

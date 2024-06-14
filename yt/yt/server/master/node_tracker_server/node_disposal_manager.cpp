@@ -39,7 +39,7 @@ using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = NodeTrackerServerLogger;
+static constexpr auto& Logger = NodeTrackerServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -54,11 +54,11 @@ public:
     {
         RegisterLoader(
             "NodeDisposalManager",
-            BIND(&TNodeDisposalManager::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TNodeDisposalManager::Load, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "NodeDisposalManager",
-            BIND(&TNodeDisposalManager::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TNodeDisposalManager::Save, Unretained(this)));
 
         RegisterMethod(BIND_NO_PROPAGATE(&TNodeDisposalManager::HydraStartNodeDisposal, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&TNodeDisposalManager::HydraFinishNodeDisposal, Unretained(this)));
@@ -91,7 +91,7 @@ public:
                 // Even if acquiring semaphore failed, we still have to commit mutation.
                 YT_LOG_ALERT_UNLESS(guardOrError.IsOK(), guardOrError, "Failed to acquire node disposal semaphore");
 
-                Y_UNUSED(WaitFor(mutation->CommitAndLog(Logger)));
+                Y_UNUSED(WaitFor(mutation->CommitAndLog(Logger())));
             })
             .Via(EpochAutomatonInvoker_));
     }
@@ -230,7 +230,7 @@ private:
             request,
             &TNodeDisposalManager::HydraFinishNodeDisposal,
             this);
-        YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger));
+        YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger()));
     }
 
     void NodeDisposalTick()
@@ -294,9 +294,9 @@ private:
             locationIndex,
             location->GetUuid());
 
-        TReqModifyReplicas sequoiaRequest;
+        auto sequoiaRequest = std::make_unique<TReqModifyReplicas>();
         TChunkLocationDirectory locationDirectory;
-        sequoiaRequest.set_node_id(ToProto<ui32>(node->GetId()));
+        sequoiaRequest->set_node_id(ToProto<ui32>(node->GetId()));
         for (const auto& replica : sequoiaReplicas) {
             TChunkRemoveInfo chunkRemoveInfo;
 
@@ -307,10 +307,10 @@ private:
             ToProto(chunkRemoveInfo.mutable_chunk_id(), EncodeChunkId(idWithIndex));
             chunkRemoveInfo.set_location_index(locationDirectory.GetOrCreateIndex(location->GetUuid()));
 
-            *sequoiaRequest.add_removed_chunks() = chunkRemoveInfo;
+            *sequoiaRequest->add_removed_chunks() = chunkRemoveInfo;
         }
 
-        ToProto(sequoiaRequest.mutable_location_directory(), locationDirectory);
+        ToProto(sequoiaRequest->mutable_location_directory(), locationDirectory);
 
         TReqDisposeLocation request;
         request.set_node_id(ToProto<ui32>(node->GetId()));
@@ -321,27 +321,28 @@ private:
             &TNodeDisposalManager::HydraDisposeLocation,
             this);
 
-        if (sequoiaRequest.removed_chunks_size() == 0) {
-            YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger));
+        if (sequoiaRequest->removed_chunks_size() == 0) {
+            YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger()));
             return;
         }
 
-        auto future = chunkManager->ModifySequoiaReplicas(sequoiaRequest);
-        YT_UNUSED_FUTURE(future.Apply(BIND([=, mutation = std::move(mutation), nodeId = node->GetId(), this, this_ = MakeStrong(this)] (const TErrorOr<TRspModifyReplicas>& rspOrError) {
-            if (!rspOrError.IsOK()) {
-                const auto& nodeTracker = Bootstrap_->GetNodeTracker();
-                auto* node = nodeTracker->FindNode(nodeId);
-                if (!IsObjectAlive(node)) {
+        chunkManager
+            ->ModifySequoiaReplicas(std::move(sequoiaRequest))
+            .Subscribe(BIND([=, mutation = std::move(mutation), nodeId = node->GetId(), this, this_ = MakeStrong(this)] (const TErrorOr<TRspModifyReplicas>& rspOrError) {
+                if (!rspOrError.IsOK()) {
+                    const auto& nodeTracker = Bootstrap_->GetNodeTracker();
+                    auto* node = nodeTracker->FindNode(nodeId);
+                    if (!IsObjectAlive(node)) {
+                        return;
+                    }
+
+                    auto* location = node->RealChunkLocations()[locationIndex];
+                    location->SetBeingDisposed(false);
                     return;
                 }
 
-                auto* location = node->RealChunkLocations()[locationIndex];
-                location->SetBeingDisposed(false);
-                return;
-            }
-
-            YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger));
-        }).AsyncVia(Bootstrap_->GetHydraFacade()->GetEpochAutomatonInvoker(EAutomatonThreadQueue::NodeTracker))));
+                YT_UNUSED_FUTURE(mutation->CommitAndLog(Logger()));
+            }).Via(Bootstrap_->GetHydraFacade()->GetEpochAutomatonInvoker(EAutomatonThreadQueue::NodeTracker)));
     }
 
     void DoStartNodeDisposal(TNode* node)
@@ -349,6 +350,7 @@ private:
         YT_VERIFY(HasMutationContext());
 
         YT_VERIFY(node->GetLocalState() == ENodeState::Unregistered);
+
         YT_LOG_INFO("Starting node disposal (NodeId: %v, Address: %v)",
             node->GetId(),
             node->GetDefaultAddress());
@@ -465,7 +467,7 @@ private:
     void HydraFinishNodeDisposal(TReqFinishNodeDisposal* request)
     {
         auto nodeId = FromProto<NNodeTrackerClient::TNodeId>(request->node_id());
-        auto finalyGuard = Finally([&]() {
+        auto finalyGuard = Finally([&] {
             if (NodesBeingDisposed_.contains(nodeId)) {
                 EraseFromDisposalQueue(nodeId);
             }

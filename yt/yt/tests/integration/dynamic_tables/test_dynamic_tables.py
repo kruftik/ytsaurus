@@ -41,7 +41,7 @@ from flaky import flaky
 from collections import Counter
 import time
 import builtins
-from random import shuffle
+from random import shuffle, randrange
 
 ##################################################################
 
@@ -1366,24 +1366,19 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
         custom_area = create_area("custom", cell_bundle="custom", cellar_type="tablet", node_tag_filter="b")
 
         nodes = list(get("//sys/cluster_nodes"))
-        set("//sys/cluster_nodes/{0}/@user_tags".format(nodes[0]), ["a"])
-        set("//sys/cluster_nodes/{0}/@user_tags".format(nodes[1]), ["b"])
+        set(f"//sys/cluster_nodes/{nodes[0]}/@user_tags", ["a"])
+        set(f"//sys/cluster_nodes/{nodes[1]}/@user_tags", ["b"])
 
         cell = sync_create_cells(1, tablet_cell_bundle="custom")[0]
-        assert get("#{0}/@area".format(cell)) == "default"
-        assert get("#{0}/@area_id".format(cell)) == default_area
-        assert get("#{0}/@peers/0/address".format(cell)) == nodes[0]
+        assert get(f"#{cell}/@area") == "default"
+        assert get(f"#{cell}/@area_id") == default_area
+        assert get(f"#{cell}/@peers/0/address") == nodes[0]
 
-        set("#{0}/@area".format(cell), "custom")
-        assert get("#{0}/@area".format(cell)) == "custom"
-        assert get("#{0}/@area_id".format(cell)) == custom_area
+        set(f"#{cell}/@area", "custom")
+        assert get(f"#{cell}/@area") == "custom"
+        assert get(f"#{cell}/@area_id") == custom_area
 
-        def _check():
-            try:
-                return get("#{0}/@peers/0/address".format(cell)) == nodes[1]
-            except YtError:
-                return False
-        wait(_check)
+        wait(lambda: get(f"#{cell}/@peers/0/address") == nodes[1], ignore_exceptions=True)
 
     def _test_cell_bundle_distribution(self, test_decommission=False):
         set("//sys/@config/tablet_manager/tablet_cell_balancer/rebalance_wait_time", 500)
@@ -1391,7 +1386,11 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
             "//sys/@config/tablet_manager/decommission_through_extra_peers",
             test_decommission,
         )
-        set("//sys/@config/tablet_manager/extra_peer_drop_delay", 2000)
+        set(
+            "//sys/@config/tablet_manager/decommissioned_leader_reassignment_timeout",
+            100,
+        )
+        set("//sys/@config/tablet_manager/extra_peer_drop_delay", 100)
 
         create_tablet_cell_bundle("custom")
         nodes = ls("//sys/cluster_nodes")
@@ -1419,14 +1418,15 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
             wait_for_cells(list(cell_ids.keys()))
 
         if test_decommission:
-            for idx, node in enumerate(nodes):
+            for iteration in range(2):
+                idx = randrange(node_count)
+                node = nodes[idx]
                 set_node_decommissioned(node, True)
                 _check([node], 0, 0)
                 _check(nodes[:idx], 1, 2)
                 _check(nodes[idx + 1:], 1, 2)
                 set_node_decommissioned(node, False)
                 _check(nodes, 1, 1)
-
         _check(nodes, 1, 1)
 
         nodes = ls("//sys/cluster_nodes")
@@ -2486,12 +2486,13 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
     ])
     @authors("akozhikhov", "sabdenovch")
     def test_max_key_column_count(self, optimize_for, chunk_format):
+        MAX_KEY_COLUMN_COUNT = 128
         cell_id = sync_create_cells(1)[0]
 
         def _create_key_schema(key_count):
             return [{"name": f"key{i}", "type": "int64", "sort_order": "ascending"} for i in range(key_count)]
 
-        key_schema = _create_key_schema(64)
+        key_schema = _create_key_schema(MAX_KEY_COLUMN_COUNT)
         value_schema = [{"name": "value", "type": "int64"}]
         self._create_sorted_table(
             "//tmp/t1",
@@ -2500,7 +2501,7 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
             chunk_format=chunk_format)
         sync_mount_table("//tmp/t1")
 
-        rows = [{f"key{i}": None if i % 5 == 3 else i + j for i in range(64)} | {"value": 123} for j in range(100)]
+        rows = [{f"key{i}": None if i % 5 == 3 else i + j for i in range(MAX_KEY_COLUMN_COUNT)} | {"value": 123} for j in range(100)]
 
         insert_rows("//tmp/t1", rows)
         assert_items_equal(select_rows("* FROM [//tmp/t1] limit 100"), rows)
@@ -2520,7 +2521,7 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
 
         sync_unmount_table("//tmp/t1")
 
-        key_schema = _create_key_schema(65)
+        key_schema = _create_key_schema(MAX_KEY_COLUMN_COUNT + 1)
         with pytest.raises(YtError):
             alter_table("//tmp/t1", schema=key_schema + value_schema)
         with pytest.raises(YtError):
@@ -3220,7 +3221,7 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
 
     @authors("dave11ar")
     def test_statistics_reporter(self):
-        statistics_path = "//sys/statistics_reporter_table"
+        statistics_path = "//tmp/statistics_reporter_table"
 
         update_nodes_dynamic_config({
             "tablet_node" : {
@@ -3301,6 +3302,49 @@ class TestDynamicTablesSingleCell(DynamicTablesSingleCellBase):
         })
 
         wait(lambda: not bool(_get_errors()))
+
+    @authors("gryzlov-ad")
+    def test_custom_runtime_data(self):
+        sync_create_cells(1)
+        self._create_sorted_table("//tmp/t")
+        sync_mount_table("//tmp/t")
+
+        tablet_id = get("//tmp/t/@tablets/0/tablet_id")
+        assert not exists("//tmp/t/@custom_runtime_data")
+
+        def get_tablet_custom_runtime_data():
+            return get(f"//sys/tablets/{tablet_id}/orchid/custom_runtime_data", default=None)
+
+        def set_custom_runtime_data(table, value):
+            set(f"{table}/@custom_runtime_data", value)
+            assert get(f"{table}/@custom_runtime_data") == value
+
+        def check_custom_runtime_data_delivery(value):
+            set_custom_runtime_data("//tmp/t", value)
+            wait(lambda: get_tablet_custom_runtime_data() == value)
+
+        check_custom_runtime_data_delivery(yson.YsonEntity())
+        check_custom_runtime_data_delivery({"hello" : "world"})
+
+        latest_data = {"goodbye": "world"}
+        check_custom_runtime_data_delivery(latest_data)
+
+        sync_unmount_table("//tmp/t")
+        sync_mount_table("//tmp/t")
+
+        assert get_tablet_custom_runtime_data() == latest_data
+
+        with self.CellsDisabled(clusters=["primary"], tablet_bundles=["default"]):
+            pass
+
+        assert get_tablet_custom_runtime_data() == latest_data
+
+        remove("//tmp/t/@custom_runtime_data")
+        wait(lambda: get_tablet_custom_runtime_data() is None)
+
+        create("table", "//tmp/t_static")
+        set_custom_runtime_data("//tmp/t_static", {"salut": "le monde"})
+
 
 ##################################################################
 
@@ -3568,6 +3612,30 @@ class TestDynamicTablesShardedTx(TestDynamicTablesPortal):
     }
 
 
+class TestDynamicTablesMirroredTx(TestDynamicTablesShardedTx):
+    DRIVER_BACKEND = "rpc"
+    ENABLE_RPC_PROXY = True
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+
+    DELTA_RPC_PROXY_CONFIG = {
+        "cluster_connection": {
+            "transaction_manager": {
+                "use_cypress_transaction_service": True,
+            }
+        }
+    }
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    def setup_method(self, method):
+        super(TestDynamicTablesShardedTx, self).setup_method(method)
+        set("//sys/@config/transaction_manager/forbid_transaction_actions_for_cypress_transactions", True)
+
+
 class TestDynamicTablesCypressProxy(TestDynamicTablesShardedTx):
     NUM_CYPRESS_PROXIES = 1
 
@@ -3672,12 +3740,17 @@ class TestTabletOrchid(DynamicTablesBase):
         actual = lookup_rows("//tmp/t", [{"key": i} for i in range(100, 200, 2)], use_lookup_cache=True)
         assert_items_equal(actual, expected)
 
+        def check_zero_passive():
+            memory_stats = get_stats()
+            return memory_stats["total"]["tablet_dynamic"]["passive"] == 0
+
+        wait(check_zero_passive)
+
         memory_stats = get_stats()
         total = memory_stats["total"]
         assert total["tablet_dynamic"]["usage"] > 0
         assert total["tablet_dynamic"]["active"] == 0
         assert total["tablet_dynamic"]["backing"] > 0
-        assert total["tablet_dynamic"]["passive"] == 0
         assert total["tablet_dynamic"]["limit"] > 0
         assert total["tablet_static"]["usage"] > 0
         assert total["tablet_static"]["limit"] > 0
@@ -3787,3 +3860,25 @@ class TestDynamicTablesHydraPersistenceMigrationPortal(TestDynamicTablesMulticel
 
         # Should not fail.
         sync_remove_tablet_cells([cell_id])
+
+
+class TestHydraPersistenceSynchronizer(DynamicTablesSingleCellBase):
+    DELTA_MASTER_CONFIG = {
+        "logging": {
+            "abort_on_alert": False,
+        },
+    }
+
+    @authors("danilalexeev")
+    def test_list_request_size_limit(self):
+        cell_ids = sync_create_cells(5)
+
+        set("//sys/@config/tablet_manager/cell_hydra_persistence_synchronizer/list_alive_cells_request_size_limit", 1)
+        sync_remove_tablet_cells(cell_ids[:3])
+
+        assert len(ls("//sys/tablet_cells")) == 2
+        time.sleep(0.5)
+        assert len(ls("//sys/hydra_persistence/tablet_cells")) == 5
+
+        set("//sys/@config/tablet_manager/cell_hydra_persistence_synchronizer/list_alive_cells_request_size_limit", 50000)
+        wait(lambda: len(ls("//sys/hydra_persistence/tablet_cells")) == 2)

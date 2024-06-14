@@ -76,7 +76,7 @@ using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = JobProxyLogger;
+static constexpr auto& Logger = JobProxyLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -115,6 +115,14 @@ public:
 
         // We are not ready for reordering here.
         WriterConfig_->EnableBlockReordering = false;
+
+        // TODO(alexelex): For the future, now it is always empty: YT-20044
+        for (auto mapping : RemoteCopyJobSpecExt_.hunk_chunk_id_mapping()) {
+            EmplaceOrCrash(
+                HunkChunkIdMapping_,
+                FromProto<TChunkId>(mapping.input_hunk_chunk_id()),
+                FromProto<TChunkId>(mapping.output_hunk_chunk_id()));
+        }
     }
 
     void PopulateInputNodeDirectory() const override
@@ -324,6 +332,8 @@ private:
     // For dynamic tables only.
     std::vector<TChunkSpec> WrittenChunks_;
 
+    THashMap<TChunkId, TChunkId> HunkChunkIdMapping_;
+
     TTraceContextPtr InputTraceContext_;
     TTraceContextFinishGuard InputFinishGuard_;
     TTraceContextPtr OutputTraceContext_;
@@ -342,7 +352,7 @@ private:
             writerOptions,
             transactionId,
             NullChunkListId,
-            Logger);
+            Logger());
     }
 
     void CopyChunk(const TChunkSpec& inputChunkSpec, NChunkClient::TSessionId outputSessionId)
@@ -404,6 +414,8 @@ private:
             ? EUnavailablePartPolicy::CreateNullReader
             : EUnavailablePartPolicy::Crash;
 
+        YT_VERIFY(!inputChunkSpec.use_proxying_data_node_service());
+
         auto readers = CreateAllErasurePartReaders(
             ReaderConfig_,
             New<TRemoteReaderOptions>(),
@@ -414,6 +426,7 @@ private:
             unavailablePartPolicy);
 
         auto chunkMeta = GetChunkMeta(inputChunkId, readers);
+        ReplaceHunkChunkIds(chunkMeta);
 
         // We do not support node reallocation for erasure chunks.
         auto options = New<TRemoteWriterOptions>();
@@ -428,7 +441,7 @@ private:
             /*preferredHostName*/ std::nullopt,
             /*forbiddenAddresses*/ {},
             /*allocatedAddresses*/ {},
-            Logger);
+            Logger());
 
         auto writers = CreateAllErasurePartWriters(
             WriterConfig_,
@@ -564,6 +577,8 @@ private:
         }
 
         if (!erasedPartIndices.empty()) {
+            YT_VERIFY(!inputChunkSpec.use_proxying_data_node_service());
+
             RepairErasureChunk(
                 outputSessionId,
                 erasureCodec,
@@ -605,7 +620,7 @@ private:
             callbackContext->ErasedPartSet.set(partIndex);
 
             auto& copyFuture = (*copyFutures)[partIndex];
-            copyFuture.Subscribe(BIND([callbackContext, erasureCodec, partIndex, Logger = Logger] (const TError& error) {
+            copyFuture.Subscribe(BIND([callbackContext, erasureCodec, partIndex] (const TError& error) {
                 if (error.IsOK()) {
                     callbackContext->ErasedPartSet.reset(partIndex);
                     if (erasureCodec->CanRepair(callbackContext->ErasedPartSet)) {
@@ -725,6 +740,8 @@ private:
 
         TDeferredChunkMetaPtr chunkMeta;
 
+        YT_VERIFY(!inputChunkSpec.use_proxying_data_node_service());
+
         auto reader = CreateReplicationReader(
             ReaderConfig_,
             New<TRemoteReaderOptions>(),
@@ -733,6 +750,7 @@ private:
             inputReplicas);
 
         chunkMeta = GetChunkMeta(inputChunkId, {reader});
+        ReplaceHunkChunkIds(chunkMeta);
 
         auto writer = CreateReplicationWriter(
             WriterConfig_,
@@ -974,6 +992,29 @@ private:
             Host_->GetOutRpsThrottler(),
             /*mediumThrottler*/ GetUnlimitedThrottler(),
             Host_->GetTrafficMeter());
+    }
+
+    // TODO(alexelex): For the future, does nothing for now: YT-20044
+    void ReplaceHunkChunkIds(const TDeferredChunkMetaPtr& chunkMeta)
+    {
+        if (HunkChunkIdMapping_.empty()) {
+            return;
+        }
+
+        auto optionalHunkChunkRefsExt = FindProtoExtension<NTableClient::NProto::THunkChunkRefsExt>(
+            chunkMeta->extensions());
+        if (!optionalHunkChunkRefsExt) {
+            return;
+        }
+
+        for (auto& ref : *optionalHunkChunkRefsExt->mutable_refs()) {
+            auto chunkId = FromProto<TChunkId>(ref.chunk_id());
+            ToProto(ref.mutable_chunk_id(), GetOrCrash(HunkChunkIdMapping_, chunkId));
+        }
+
+        SetProtoExtension<NTableClient::NProto::THunkChunkRefsExt>(
+            chunkMeta->mutable_extensions(),
+            *optionalHunkChunkRefsExt);
     }
 };
 

@@ -13,6 +13,8 @@
 
 #include <yt/yt/core/yson/null_consumer.h>
 
+#include <yt/yt/library/vector_hdrf/resource_helpers.h>
+
 #include <library/cpp/testing/gtest/gtest.h>
 
 namespace NYT::NScheduler {
@@ -144,12 +146,6 @@ public:
         return result;
     }
 
-    TRefCountedExecNodeDescriptorMapPtr CalculateExecNodeDescriptors(
-        const TSchedulingTagFilter& /*filter*/) const override
-    {
-        YT_UNIMPLEMENTED();
-    }
-
     void AbortAllocationsAtNode(NNodeTrackerClient::TNodeId /*nodeId*/, EAbortReason /*reason*/) override
     {
         YT_UNIMPLEMENTED();
@@ -241,6 +237,11 @@ public:
     {
         static THashMap<TString, TString> stub;
         return stub;
+    }
+
+    bool IsFairSharePreUpdateOffloadingEnabled() const override
+    {
+        return true;
     }
 
 private:
@@ -496,7 +497,7 @@ protected:
             FairShareTreeElementHostMock_.Get(),
             TreeConfig_,
             "default",
-            SchedulerLogger);
+            SchedulerLogger());
     }
 
     TSchedulerPoolElementPtr CreateTestPool(ISchedulerStrategyHost* strategyHost, const TString& name, TPoolConfigPtr config = New<TPoolConfig>())
@@ -510,7 +511,7 @@ protected:
             /*defaultConfigured*/ true,
             TreeConfig_,
             "default",
-            SchedulerLogger);
+            SchedulerLogger());
     }
 
     TPoolConfigPtr CreateSimplePoolConfig(double strongGuaranteeCpu = 0.0, double weight = 1.0)
@@ -569,7 +570,7 @@ protected:
             FairShareTreeElementHostMock_.Get(),
             operation,
             "default",
-            SchedulerLogger);
+            SchedulerLogger());
         operationElement->AttachParent(parent, SlotIndex_++);
         parent->EnableChild(operationElement);
         return operationElement;
@@ -635,7 +636,7 @@ protected:
 
     void IncreaseOperationResourceUsage(const TSchedulerOperationElementPtr& operationElement, TJobResources resourceUsageDelta)
     {
-        operationElement->CommitHierarchicalResourceUsage(resourceUsageDelta, /*precommitedResources*/ {});
+        operationElement->CommitHierarchicalResourceUsage(resourceUsageDelta, /*precommittedResources*/ {});
     }
 
     void DoFairShareUpdate(
@@ -646,8 +647,14 @@ protected:
     {
         ResetFairShareFunctionsRecursively(rootElement.Get());
 
+        auto totalResourceLimits = strategyHost->GetResourceLimits(TreeConfig_->NodesFilter);
+        TFairSharePreUpdateContext preUpdateContext{
+            .Now = now,
+            .TotalResourceLimits = totalResourceLimits,
+        };
+
         NVectorHdrf::TFairShareUpdateContext context(
-            /*totalResourceLimits*/ strategyHost->GetResourceLimits(TreeConfig_->NodesFilter),
+            totalResourceLimits,
             TreeConfig_->MainResource,
             TreeConfig_->IntegralGuarantees->PoolCapacitySaturationPeriod,
             TreeConfig_->IntegralGuarantees->SmoothPeriod,
@@ -658,7 +665,11 @@ protected:
             .TreeConfig = TreeConfig_,
         };
 
-        rootElement->PreUpdate(&context);
+        rootElement->InitializeFairShareUpdate(now, context);
+
+        if (strategyHost->IsFairSharePreUpdateOffloadingEnabled()) {
+            rootElement->PreUpdate(&preUpdateContext);
+        }
 
         NVectorHdrf::TFairShareUpdateExecutor updateExecutor(rootElement, &context);
         updateExecutor.Run();

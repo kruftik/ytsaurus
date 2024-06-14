@@ -61,6 +61,8 @@ using TReadSessionId = NObjectClient::TObjectId;
 
 struct TSessionId;
 
+constexpr NRpc::TRealmId ProxyingDataNodeServiceRealmId = TGuid(0xd452d72f, 0x3142caa3);
+
 constexpr int DefaultPartIndex = -1;
 
 //! Estimated memory overhead per chunk reader.
@@ -84,7 +86,7 @@ constexpr TConsistentReplicaPlacementHash NullConsistentReplicaPlacementHash = 0
 // BEWARE: Changing this value requires reign promotion since rolling update
 // is not possible.
 constexpr int ChunkShardCount = 60;
-static_assert(ChunkShardCount < std::numeric_limits<i8>::max(), "|ChunkShardCount| must fit into i8");
+static_assert(ChunkShardCount < std::numeric_limits<i8>::max(), "ChunkShardCount must fit into i8");
 
 //! Typical chunk location count per data node.
 constexpr int TypicalChunkLocationCount = 20;

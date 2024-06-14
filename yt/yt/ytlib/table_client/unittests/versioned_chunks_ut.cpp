@@ -74,9 +74,11 @@ struct TTestOptions
     bool CacheBased = false;
 };
 
-TString ToString(const TTestOptions& options)
+void FormatValue(TStringBuilderBase* builder, const TTestOptions& options, TStringBuf /*spec*/)
 {
-    return Format("%v%v%v%v%v%v",
+    Format(
+        builder,
+        "%v%v%v%v%v%v",
         options.OptimizeFor,
         options.ChunkFormat ? ToString(*options.ChunkFormat) : "",
         options.UseNewReader ? "New" : "",
@@ -342,7 +344,8 @@ protected:
         systemBlockCacheConfig->HashTableChunkIndex->Capacity = 10_MB;
         SystemBlockCache = CreateClientBlockCache(
             systemBlockCacheConfig,
-            EBlockType::HashTableChunkIndex);
+            EBlockType::HashTableChunkIndex,
+            GetNullMemoryUsageTracker());
         YT_VERIFY(SystemBlockCache->IsBlockTypeActive(EBlockType::HashTableChunkIndex));
     }
 
@@ -748,7 +751,8 @@ protected:
         systemBlockCacheConfig->HashTableChunkIndex->Capacity = 10_MB;
         SystemBlockCache_ = CreateClientBlockCache(
             systemBlockCacheConfig,
-            EBlockType::HashTableChunkIndex);
+            EBlockType::HashTableChunkIndex,
+            GetNullMemoryUsageTracker());
         YT_VERIFY(SystemBlockCache_->IsBlockTypeActive(EBlockType::HashTableChunkIndex));
     }
 
@@ -1670,7 +1674,7 @@ INSTANTIATE_TEST_SUITE_P(
             std::pair(EValueType::Null, EValueType::Max),
             std::pair(EValueType::Max, EValueType::Max))),
     [] (const auto& info) {
-        return Format("%v_%kv_%kv",
+        return Format("%v_%v_%v",
             std::get<0>(info.param),
             std::get<0>(std::get<1>(info.param)), std::get<1>(std::get<1>(info.param)));
     });

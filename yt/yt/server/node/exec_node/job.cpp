@@ -7,6 +7,7 @@
 #include "job_controller.h"
 #include "job_gpu_checker.h"
 #include "job_workspace_builder.h"
+#include "job_input_cache.h"
 #include "gpu_manager.h"
 #include "private.h"
 #include "slot.h"
@@ -49,6 +50,7 @@
 #include <yt/yt/ytlib/chunk_client/data_slice_descriptor.h>
 #include <yt/yt/ytlib/chunk_client/data_source.h>
 #include <yt/yt/ytlib/chunk_client/traffic_meter.h>
+#include <yt/yt/ytlib/chunk_client/job_spec_extensions.h>
 
 #include <yt/yt/ytlib/controller_agent/proto/job.pb.h>
 
@@ -83,9 +85,12 @@
 
 #include <yt/yt/core/net/address.h>
 
+#include <yt/yt/core/misc/error_helpers.h>
 #include <yt/yt/core/misc/statistics.h>
 
 #include <yt/yt/core/rpc/dispatcher.h>
+
+#include <yt/yt_proto/yt/client/chunk_client/proto/chunk_spec.pb.h>
 
 #include <library/cpp/yt/system/handle_eintr.h>
 
@@ -122,11 +127,12 @@ using namespace NProfiling;
 using namespace NContainers;
 using namespace NTracing;
 using namespace NTransactionClient;
+using namespace NObjectClient;
 
 using NNodeTrackerClient::TNodeDirectory;
 using NChunkClient::TDataSliceDescriptor;
 
-using NObjectClient::TypeFromId;
+using NObjectClient::TObjectId;
 using NCypressClient::EObjectType;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -160,19 +166,16 @@ TJob::TJob(
     TControllerAgentDescriptor agentDescriptor,
     IBootstrap* bootstrap,
     const TJobCommonConfigPtr& commonConfig)
-    : TResourceHolder(
-        bootstrap->GetJobResourceManager().Get(),
-        EResourcesConsumerType::SchedulerAllocation,
-        ExecNodeLogger.WithTag(
-            "JobId: %v, OperationId: %v, JobType: %v",
-            jobId,
-            operationId,
-            CheckedEnumCast<EJobType>(jobSpec.type())),
-        allocation)
-    , Id_(jobId)
+    : Id_(jobId)
     , OperationId_(operationId)
     , Bootstrap_(bootstrap)
+    , Logger(ExecNodeLogger().WithTag(
+        "JobId: %v, OperationId: %v, JobType: %v",
+        jobId,
+        operationId,
+        CheckedEnumCast<EJobType>(jobSpec.type())))
     , Allocation_(std::move(allocation))
+    , ResourceHolder_(Allocation_->GetResourceHolder())
     , ControllerAgentDescriptor_(std::move(agentDescriptor))
     , ControllerAgentConnector_(
         Bootstrap_->GetControllerAgentConnectorPool()->GetControllerAgentConnector(ControllerAgentDescriptor_))
@@ -190,10 +193,12 @@ TJob::TJob(
     , Interruptible_(JobSpecExt_->interruptible())
     , AbortJobIfAccountLimitExceeded_(JobSpecExt_->abort_job_if_account_limit_exceeded())
     , IsGpuRequested_(Allocation_->GetRequestedGpu() > 0)
-    , TraceContext_(CreateTraceContextFromCurrent("Job"))
+    , TraceContext_(TTraceContext::NewRoot("Job"))
     , FinishGuard_(TraceContext_)
+    , JobInputCache_(Bootstrap_->GetExecNodeBootstrap()->GetJobInputCache())
 {
     VERIFY_THREAD_AFFINITY(JobThread);
+    YT_VERIFY(JobInputCache_);
 
     PackBaggageFromJobSpec(TraceContext_, JobSpec_, OperationId_, Id_);
 
@@ -210,9 +215,8 @@ TJob::TJob(
 TJob::~TJob()
 {
     // Offload job spec destruction to a large thread pool.
-    auto jobSpec = std::make_unique<TJobSpec>(std::move(JobSpec_));
     NRpc::TDispatcher::Get()->GetCompressionPoolInvoker()->Invoke(
-        BIND([jobSpec = std::move(jobSpec)] () mutable { jobSpec.reset(); }));
+        BIND_NO_PROPAGATE([jobSpec = std::move(JobSpec_)]{ }));
 }
 
 void TJob::DoStart(TErrorOr<std::vector<TNameWithAddress>>&& resolvedNodeAddresses)
@@ -221,9 +225,9 @@ void TJob::DoStart(TErrorOr<std::vector<TNameWithAddress>>&& resolvedNodeAddress
 
     GuardedAction(
         "DoStart",
-        [&] () {
+        [&] {
             auto now = TInstant::Now();
-            PrepareStartTime_ = now;
+            PreparationStartTime_ = now;
 
             if (!resolvedNodeAddresses.IsOK()) {
                 THROW_ERROR TError("Failed to resolve node addresses") << std::move(resolvedNodeAddresses);
@@ -264,12 +268,12 @@ void TJob::DoStart(TErrorOr<std::vector<TNameWithAddress>>&& resolvedNodeAddress
 
             // This is a heavy part of preparation, offload it to compression invoker.
             // TODO(babenko): get rid of MakeWeak
-            BIND([weakThis = MakeWeak(this)] {
-                auto strongThis = weakThis.Lock();
-                if (!strongThis) {
+            BIND([this, weakThis = MakeWeak(this)] {
+                auto this_ = weakThis.Lock();
+                if (!this_) {
                     return std::unique_ptr<NNodeTrackerClient::NProto::TNodeDirectory>();
                 }
-                return strongThis->PrepareNodeDirectory();
+                return PrepareNodeDirectory();
             })
                 .AsyncVia(NRpc::TDispatcher::Get()->GetCompressionPoolInvoker())
                 .Run()
@@ -308,6 +312,8 @@ void TJob::Start() noexcept
     }
 
     YT_VERIFY(!std::exchange(Started_, true));
+
+    ResourcesAcquiredTime_ = TInstant::Now();
 
     YT_LOG_INFO("Starting job");
 
@@ -394,7 +400,7 @@ void TJob::OnJobProxySpawned()
             ValidateJobPhase(EJobPhase::SpawningJobProxy);
             SetJobPhase(EJobPhase::PreparingArtifacts);
 
-            if (!Bootstrap_->GetJobController()->IsJobProxyProfilingDisabled()) {
+            if (!Bootstrap_->GetJobController()->IsJobProxyProfilingDisabled() && UserJobSpec_ && UserJobSpec_->monitoring_config().enable()) {
                 Bootstrap_->GetJobProxySolomonExporter()->AttachRemoteProcess(BIND(&TJob::DumpSensors, MakeStrong(this)));
             }
         });
@@ -559,7 +565,18 @@ void TJob::Terminate(EJobState finalState, TError error)
     switch (JobPhase_) {
         case EJobPhase::Created:
             doTerminate();
-            Cleanup();
+            // NB(arkady-e1ppa): We can have
+            // job controller methods forbidding
+            // context switch in the callstack.
+            // Thus we do cleanup asynchronously.
+            GetInvoker()
+                ->Invoke(BIND([this, this_ = MakeStrong(this)] {
+                    // NB(arkady-e1ppa): We don't do plain cleanup
+                    // here because due to async nature of this call
+                    // some could beat us to it.
+                    HandleFinishingPhase();
+                }));
+
             break;
 
         case EJobPhase::PreparingNodeDirectory:
@@ -739,6 +756,8 @@ void TJob::OnResultReceived(TJobResult jobResult)
     GuardedAction(
         "OnResultReceived",
         [&] {
+            ResultReceivedTime_ = TInstant::Now();
+
             SetJobPhase(EJobPhase::FinalizingJobProxy);
 
             std::optional<NControllerAgent::NProto::TJobResultExt> jobResultExtension;
@@ -771,18 +790,11 @@ TJobId TJob::GetId() const noexcept
     return Id_;
 }
 
-TGuid TJob::GetIdAsGuid() const noexcept
-{
-    VERIFY_THREAD_AFFINITY_ANY();
-
-    return Id_.Underlying();
-}
-
 TAllocationId TJob::GetAllocationId() const
 {
     VERIFY_THREAD_AFFINITY_ANY();
 
-    return TAllocationId(GetIdAsGuid());
+    return AllocationIdFromJobId(Id_);
 }
 
 TOperationId TJob::GetOperationId() const
@@ -861,17 +873,25 @@ NJobAgent::TTimeStatistics TJob::GetTimeStatistics() const
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
+    auto getWaitForResourcesDuration = [&] () -> std::optional<TDuration> {
+        if (!ResourcesAcquiredTime_) {
+            return TInstant::Now() - CreationTime_;
+        }
+
+        return *ResourcesAcquiredTime_ - CreationTime_;
+    };
+
     auto getPrepareDuration = [&] () -> std::optional<TDuration> {
         // TODO(arkady-e1ppa): Fix PrepareStartTime semantics.
         if (!StartTime_) {
             return std::nullopt;
         }
-        if (!PrepareStartTime_) {
+        if (!PreparationStartTime_) {
             return std::nullopt;
         } else if (!ExecStartTime_) {
-            return TInstant::Now() - *PrepareStartTime_;
+            return TInstant::Now() - *PreparationStartTime_;
         } else {
-            return *ExecStartTime_ - *PrepareStartTime_;
+            return *ExecStartTime_ - *PreparationStartTime_;
         }
     };
     auto getPrepareRootFSDuration = [&] () -> std::optional<TDuration> {
@@ -884,12 +904,12 @@ NJobAgent::TTimeStatistics TJob::GetTimeStatistics() const
         }
     };
     auto getArtifactsDownloadDuration = [&] () -> std::optional<TDuration> {
-        if (!PrepareStartTime_) {
+        if (!PreparationStartTime_) {
             return std::nullopt;
         } else if (!CopyFinishTime_) {
-            return TInstant::Now() - *PrepareStartTime_;
+            return TInstant::Now() - *PreparationStartTime_;
         } else {
-            return *CopyFinishTime_ - *PrepareStartTime_;
+            return *CopyFinishTime_ - *PreparationStartTime_;
         }
     };
     auto getExecDuration = [&] () -> std::optional<TDuration> {
@@ -931,12 +951,14 @@ NJobAgent::TTimeStatistics TJob::GetTimeStatistics() const
         }
     };
 
-    return NJobAgent::TTimeStatistics{
+    return {
+        .WaitingForResourcesDuration = getWaitForResourcesDuration(),
         .PrepareDuration = getPrepareDuration(),
         .ArtifactsDownloadDuration = getArtifactsDownloadDuration(),
         .PrepareRootFSDuration = getPrepareRootFSDuration(),
         .ExecDuration = getExecDuration(),
-        .GpuCheckDuration = sumOptionals(getPreliminaryGpuCheckDuration(), getExtraGpuCheckDuration())};
+        .GpuCheckDuration = sumOptionals(getPreliminaryGpuCheckDuration(), getExtraGpuCheckDuration())
+    };
 }
 
 std::optional<TInstant> TJob::GetStartTime() const
@@ -969,7 +991,7 @@ NClusterNode::TJobResources TJob::GetResourceUsage() const
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
-    return TResourceHolder::GetResourceUsage();
+    return ResourceHolder_->GetResourceUsage();
 }
 
 bool TJob::IsGpuRequested() const
@@ -981,7 +1003,7 @@ const std::vector<int>& TJob::GetPorts() const
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
-    return TResourceHolder::GetPorts();
+    return ResourceHolder_->GetPorts();
 }
 
 const TError& TJob::GetJobError() const
@@ -1022,7 +1044,7 @@ void TJob::SetResourceUsage(const NClusterNode::TJobResources& newUsage)
     VERIFY_THREAD_AFFINITY(JobThread);
 
     if (JobPhase_ == EJobPhase::Running) {
-        TResourceHolder::SetBaseResourceUsage(newUsage);
+        ResourceHolder_->SetBaseResourceUsage(newUsage);
     }
 }
 
@@ -1180,7 +1202,7 @@ TBriefJobInfo TJob::GetBriefInfo() const
     auto [
         baseResourceUsage,
         additionalResourceUsage
-    ] = TResourceHolder::GetDetailedResourceUsage();
+    ] = ResourceHolder_->GetDetailedResourceUsage();
 
     return TBriefJobInfo(
         GetId(),
@@ -1375,6 +1397,7 @@ void TJob::DoInterrupt(
         "Job interruption requested (Timeout: %v, InterruptionReason: %v, Preempted: %v, PreemptionReason: %v, PreemptedFor: %v)",
         timeout,
         interruptionReason,
+        preemptionReason.has_value(),
         preemptionReason,
         preemptedFor);
 
@@ -1413,7 +1436,7 @@ void TJob::DoInterrupt(
     }
 
     if (JobPhase_ < EJobPhase::Running) {
-        auto error = TError(NJobProxy::EErrorCode::JobNotPrepared, "Interrupting job that has not started yet")
+        auto error = TError(NJobProxy::EErrorCode::InterruptionFailed, "Interrupting job that has not started yet")
             << TErrorAttribute("interruption_reason", InterruptionReason_);
 
         if (interruptionReason == EInterruptReason::Preemption) {
@@ -1452,9 +1475,10 @@ void TJob::DoInterrupt(
         ReportJobInterruptionInfo(timeout, interruptionReason, preemptionReason, preemptedFor);
     } catch (const std::exception& ex) {
         auto error = TError("Error interrupting job on job proxy")
+            << TErrorAttribute("interruption_reason", InterruptionReason_)
             << ex;
 
-        if (error.FindMatching(NJobProxy::EErrorCode::JobNotPrepared)) {
+        if (error.FindMatching(NJobProxy::EErrorCode::InterruptionFailed)) {
             Abort(error);
         } else {
             THROW_ERROR error;
@@ -1502,9 +1526,14 @@ void TJob::DoFail(std::optional<TError> error)
 void TJob::RequestGracefulAbort(TError error)
 {
     YT_LOG_INFO("Requesting job graceful abort (Error: %v)", error);
+    if (GracefulAbortRequested_) {
+        YT_LOG_INFO("Repeating job graceful abort request; ignored");
+        return;
+    }
 
     try {
         DoRequestGracefulAbort(std::move(error));
+        GracefulAbortRequested_ = true;
     } catch (const std::exception& ex) {
         YT_LOG_WARNING(ex, "Failed to request job graceful abort");
     }
@@ -1515,7 +1544,7 @@ void TJob::DoRequestGracefulAbort(TError error)
     VERIFY_THREAD_AFFINITY(JobThread);
 
     if (JobPhase_ != EJobPhase::Running) {
-        Terminate(EJobState::Failed, std::move(error));
+        Terminate(EJobState::Aborted, std::move(error));
         return;
     }
 
@@ -1558,6 +1587,21 @@ void TJob::OnEvictedFromAllocation()
     VERIFY_THREAD_AFFINITY(JobThread);
 
     Allocation_.Reset();
+    PrepareResourcesRelease();
+}
+
+void TJob::PrepareResourcesRelease()
+{
+    VERIFY_THREAD_AFFINITY(JobThread);
+
+    // NB(arkady-e1ppa): In some cases job can
+    // be finished (and also enter cleanup phase)
+    // before it is evicted from the allocation.
+    // In such a case ResourceHolder_ would be
+    // already reset.
+    if (ResourceHolder_) {
+        ResourceHolder_->PrepareResourcesRelease();
+    }
 }
 
 bool TJob::IsJobProxyCompleted() const noexcept
@@ -1887,7 +1931,8 @@ std::vector<TDevice> TJob::GetGpuDevices()
 
 bool TJob::IsFullHostGpuJob() const
 {
-    return !GpuSlots_.empty() && GpuSlots_.size() == Bootstrap_->GetGpuManager()->GetGpuDevices().size();
+    const auto& gpuSlots = GetGpuSlots();
+    return !gpuSlots.empty() && gpuSlots.size() == Bootstrap_->GetGpuManager()->GetGpuDevices().size();
 }
 
 void TJob::OnArtifactsDownloaded(const TErrorOr<std::vector<NDataNode::IChunkPtr>>& errorOrArtifacts)
@@ -1962,32 +2007,34 @@ void TJob::RunWithWorkspaceBuilder()
         Invoker_,
         std::move(context));
 
-    workspaceBuilder->SubscribeUpdateArtifactStatistics(BIND_NO_PROPAGATE([this, this_ = MakeWeak(this)] (i64 compressedDataSize, bool cacheHit) {
-        UpdateArtifactStatistics(compressedDataSize, cacheHit);
-    })
-        .Via(Invoker_));
+    workspaceBuilder->SubscribeUpdateArtifactStatistics(
+        BIND_NO_PROPAGATE(&TJob::UpdateArtifactStatistics, MakeWeak(this)));
 
     // TODO(pogorelov): Refactor it. Phase should be changed in callback, not in signal handler.
     // We intentionally subscribe here without Via(Invoker_) to prevent data race.
-    workspaceBuilder->SubscribeUpdateBuilderPhase(BIND_NO_PROPAGATE([this, this_ = MakeWeak(this)] (EJobPhase phase) {
-        VERIFY_THREAD_AFFINITY(JobThread);
-
-        SetJobPhase(phase);
-    }));
+    workspaceBuilder->SubscribeUpdateBuilderPhase(
+        BIND_NO_PROPAGATE(&TJob::SetJobPhase, MakeWeak(this)));
 
     // TODO(pogorelov): Do not pass TJobWorkspaceBuilderPtr, define structure.
-    workspaceBuilder->SubscribeUpdateTimers(BIND_NO_PROPAGATE([this, this_ = MakeWeak(this)] (const TJobWorkspaceBuilderPtr& workspace) {
-        PreliminaryGpuCheckStartTime_ = workspace->GetGpuCheckStartTime();
-        PreliminaryGpuCheckFinishTime_ = workspace->GetGpuCheckFinishTime();
+    workspaceBuilder->SubscribeUpdateTimers(
+        BIND_NO_PROPAGATE([this, weakThis = MakeWeak(this)] (const TJobWorkspaceBuilderPtr& workspace) {
+            auto this_ = weakThis.Lock();
+            if (!this_) {
+                return;
+            }
 
-        StartPrepareVolumeTime_ = workspace->GetVolumePrepareStartTime();
-        FinishPrepareVolumeTime_ = workspace->GetVolumePrepareFinishTime();
-    })
-        .Via(Invoker_));
+            PreliminaryGpuCheckStartTime_ = workspace->GetGpuCheckStartTime();
+            PreliminaryGpuCheckFinishTime_ = workspace->GetGpuCheckFinishTime();
+
+            StartPrepareVolumeTime_ = workspace->GetVolumePrepareStartTime();
+            FinishPrepareVolumeTime_ = workspace->GetVolumePrepareFinishTime();
+        })
+            .Via(Invoker_));
 
     auto workspaceFuture = workspaceBuilder->Run();
-    workspaceFuture.Subscribe(BIND(&TJob::OnWorkspacePreparationFinished, MakeStrong(this))
-        .Via(Invoker_));
+    workspaceFuture.Subscribe(
+        BIND(&TJob::OnWorkspacePreparationFinished, MakeStrong(this))
+            .Via(Invoker_));
     WorkspaceBuildingFuture_ = workspaceFuture.AsVoid();
 }
 
@@ -2074,6 +2121,15 @@ void TJob::RunJobProxy()
     SetJobPhase(EJobPhase::SpawningJobProxy);
     InitializeJobProbe();
 
+    auto eligibleChunks = GetKeys(ProxiableChunks_.Load());
+    auto hotChunks = JobInputCache_->FilterHotChunkIds(eligibleChunks);
+
+    PrepareProxiedChunkReading(
+        Bootstrap_->GetNodeId(),
+        hotChunks,
+        THashSet<TChunkId>(eligibleChunks.begin(), eligibleChunks.end()),
+        JobSpec_.MutableExtension(TJobSpecExt::job_spec_ext));
+
     BIND(
         &IUserSlot::RunJobProxy,
         GetUserSlot(),
@@ -2137,11 +2193,11 @@ void TJob::OnWaitingForCleanupTimeout()
     if (JobPhase_ == EJobPhase::WaitingForCleanup) {
         auto timeout = CommonConfig_->WaitingForJobCleanupTimeout;
 
-        auto error = TError("Failed to wait for job cleanup within timeout")
+        auto error = TError(EErrorCode::JobCleanupTimeout, "Failed to wait for job cleanup within timeout")
             << TErrorAttribute("job_id", Id_)
             << TErrorAttribute("operation_id", OperationId_)
             << TErrorAttribute("waiting_for_job_cleanup_timeout", timeout);
-        Bootstrap_->GetSlotManager()->Disable(error);
+        Bootstrap_->GetSlotManager()->OnWaitingForJobCleanupTimeout(std::move(error));
     }
 }
 
@@ -2149,7 +2205,7 @@ IUserSlotPtr TJob::GetUserSlot() const
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
-    const auto& userSlot = Allocation_ ? Allocation_->GetUserSlot() : UserSlot_;
+    const auto& userSlot = ResourceHolder_->GetUserSlot();
 
     return StaticPointerCast<IUserSlot>(userSlot);
 }
@@ -2158,7 +2214,7 @@ std::vector<TGpuSlotPtr> TJob::GetGpuSlots() const
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
-    const auto& gpuSlots = Allocation_ ? Allocation_->GetGpuSlots() : GpuSlots_;
+    const auto& gpuSlots = ResourceHolder_->GetGpuSlots();
 
     std::vector<TGpuSlotPtr> result;
     result.reserve(std::size(gpuSlots));
@@ -2177,6 +2233,8 @@ void TJob::OnJobProxyFinished(const TError& error)
     YT_LOG_INFO(error, "Job proxy finished");
 
     ResetJobProbe();
+
+    ReportJobProxyProcessFinish(error);
 
     if (HandleFinishingPhase()) {
         return;
@@ -2203,11 +2261,11 @@ void TJob::OnJobProxyFinished(const TError& error)
         };
 
         auto checker = New<TJobGpuChecker>(std::move(context), Logger);
-        checker->SubscribeRunCheck(BIND_NO_PROPAGATE([this, this_ = MakeStrong(this)] () {
+        checker->SubscribeRunCheck(BIND_NO_PROPAGATE([this, this_ = MakeStrong(this)] {
             ExtraGpuCheckStartTime_ = TInstant::Now();
         })
             .Via(Invoker_));
-        checker->SubscribeFinishCheck(BIND_NO_PROPAGATE([this, this_ = MakeStrong(this)] () {
+        checker->SubscribeFinishCheck(BIND_NO_PROPAGATE([this, this_ = MakeStrong(this)] {
             ExtraGpuCheckFinishTime_ = TInstant::Now();
         })
             .Via(Invoker_));
@@ -2223,8 +2281,7 @@ void TJob::OnJobProxyFinished(const TError& error)
                 .Via(Invoker_));
     } else {
         if (!error.IsOK()) {
-            Finalize(TError(NExecNode::EErrorCode::JobProxyFailed, "Job proxy failed")
-                << BuildJobProxyError(error));
+            Finalize(BuildJobProxyError(error));
         } else {
             YT_VERIFY(IsFinished());
         }
@@ -2313,7 +2370,7 @@ void TJob::Cleanup()
     {
         auto* inputNodeDirectory = JobSpec_.MutableExtension(TJobSpecExt::job_spec_ext)
             ->release_input_node_directory();
-        NRpc::TDispatcher::Get()->GetCompressionPoolInvoker()->Invoke(BIND([inputNodeDirectory] () {
+        NRpc::TDispatcher::Get()->GetCompressionPoolInvoker()->Invoke(BIND([inputNodeDirectory] {
             delete inputNodeDirectory;
         }));
     }
@@ -2321,8 +2378,8 @@ void TJob::Cleanup()
     // Release resources.
     GpuStatistics_.clear();
 
-    if (IsStarted()) {
-        ReleaseCumulativeResources();
+    if (IsStarted() && !Allocation_) {
+        ResourceHolder_->ReleaseNonSlotResources();
     }
 
     if (RootVolume_) {
@@ -2354,7 +2411,15 @@ void TJob::Cleanup()
         }
     }
 
-    ReleaseResources();
+    if (!Allocation_) {
+        ResourceHolder_->ReleaseBaseResources();
+    } else {
+        ResourceHolder_.Reset();
+    }
+
+    if (UseJobInputCache_.load()) {
+        JobInputCache_->UnregisterJobChunks(Id_);
+    }
 
     SetJobPhase(EJobPhase::Finished);
 
@@ -2474,6 +2539,15 @@ std::unique_ptr<NNodeTrackerClient::NProto::TNodeDirectory> TJob::PrepareNodeDir
     auto protoNodeDirectory = std::make_unique<NNodeTrackerClient::NProto::TNodeDirectory>();
     nodeDirectory->DumpTo(protoNodeDirectory.get());
 
+    if (JobInputCache_->IsEnabled()) {
+        UseJobInputCache_.store(true);
+        auto chunkSpecs = GetProxiableChunkSpecs(jobSpecExt, GetType());
+        ProxiableChunks_.Store(chunkSpecs);
+        JobInputCache_->RegisterJobChunks(
+            Id_,
+            std::move(chunkSpecs));
+    }
+
     YT_LOG_INFO("Finish preparing node directory");
 
     return protoNodeDirectory;
@@ -2545,8 +2619,8 @@ TJobProxyInternalConfigPtr TJob::CreateConfig()
                 YT_VERIFY(artifact.Chunk);
 
                 YT_LOG_INFO(
-                    "Make bind for artifact (FileName: %v, Executable: %v"
-                    ", SandboxKind: %v, CompressedDataSize: %v)",
+                    "Make bind for artifact (FileName: %v, Executable: %v, "
+                    "SandboxKind: %v, CompressedDataSize: %v)",
                     artifact.Name,
                     artifact.Executable,
                     artifact.SandboxKind,
@@ -2565,12 +2639,20 @@ TJobProxyInternalConfigPtr TJob::CreateConfig()
         }
     }
 
+    auto calculateShardingKey = [&] (int shardingKeyLength) {
+        auto entropy = EntropyFromAllocationId(GetAllocationId());
+        auto entropyHex = Format("%016lx", entropy);
+        return entropyHex.substr(0, shardingKeyLength);
+    };
+
     auto tryReplaceSlotIndex = [&] (TString& str) {
-        size_t index = str.find(SlotIndexPattern);
+        auto index = str.find(SlotIndexPattern);
         if (index != TString::npos) {
             str.replace(index, SlotIndexPattern.size(), ToString(GetUserSlot()->GetSlotIndex()));
         }
     };
+
+    auto execNodeConfig = Bootstrap_->GetConfig()->ExecNode;
 
     // This replace logic is used for testing puproses.
     proxyConfig->Logging->UpdateWriters([&] (const IMapNodePtr& writerConfigNode) {
@@ -2580,7 +2662,17 @@ TJobProxyInternalConfigPtr TJob::CreateConfig()
         }
 
         auto fileLogWriterConfig = ConvertTo<NLogging::TFileLogWriterConfigPtr>(writerConfigNode);
-        tryReplaceSlotIndex(fileLogWriterConfig->FileName);
+
+        if (execNodeConfig->JobProxy->JobProxyLogging->Mode == EJobProxyLoggingMode::Simple) {
+            tryReplaceSlotIndex(fileLogWriterConfig->FileName);
+        } else {
+            fileLogWriterConfig->FileName = NFS::JoinPaths(
+                NFS::JoinPaths(
+                    execNodeConfig->JobProxyLogManager->Directory,
+                    calculateShardingKey(execNodeConfig->JobProxyLogManager->ShardingKeyLength)),
+                NFS::JoinPaths(ToString(GetId()), "job_proxy.log"));
+        }
+
         return writerConfig->BuildFullConfig(fileLogWriterConfig);
     });
 
@@ -2597,6 +2689,9 @@ TJobProxyInternalConfigPtr TJob::CreateConfig()
     }
 
     proxyConfig->MakeRootFSWritable = UserJobSpec_ && UserJobSpec_->make_rootfs_writable();
+
+    // TODO(ignat): add option to disable fuse within exec node.
+    proxyConfig->EnableFuse = UserJobSpec_ && UserJobSpec_->enable_fuse();
 
     std::vector<TIP6Address> ipAddresses;
     ipAddresses.reserve(ResolvedNodeAddresses_.size());
@@ -2707,8 +2802,8 @@ TUserSandboxOptions TJob::BuildUserSandboxOptions()
     // NB: this eventually results in job graceful abort.
     options.DiskOverdraftCallback = BIND(&TJob::Fail, MakeWeak(this))
         .Via(Invoker_);
-    options.HasRootFSQuota = false;
-    options.EnableDiskQuota = Bootstrap_->GetConfig()->DataNode->VolumeManager->EnableDiskQuota;
+    // TODO(khlebnikov): Move into volume manager.
+    options.EnableRootVolumeDiskQuota = false;
     options.UserId = GetUserSlot()->GetUserId();
 
     if (UserJobSpec_) {
@@ -2922,12 +3017,52 @@ std::optional<EAbortReason> TJob::DeduceAbortReason()
 
     const auto& resultError = *Error_;
 
+    static const THashSet<TErrorCode> layerErrorCodes = {
+        NExecNode::EErrorCode::LayerUnpackingFailed,
+        NExecNode::EErrorCode::DockerImagePullingFailed,
+        NExecNode::EErrorCode::InvalidImage,
+    };
+
+    static const THashSet<TErrorCode> ignoredFailedChunksErrorCodes = {
+        NNet::EErrorCode::ResolveTimedOut,
+        NChunkClient::EErrorCode::ReaderThrottlingFailed,
+        NTableClient::EErrorCode::NameTableUpdateFailed,
+    };
+
+    static const THashSet<TErrorCode> otherAbortErrorCodes = {
+        NChunkClient::EErrorCode::AllTargetNodesFailed,
+        NChunkClient::EErrorCode::ReaderThrottlingFailed,
+        NChunkClient::EErrorCode::MasterCommunicationFailed,
+        NChunkClient::EErrorCode::MasterNotConnected,
+        NChunkClient::EErrorCode::ReaderTimeout,
+        NChunkClient::EErrorCode::ChunkBlockFetchFailed,
+        NChunkClient::EErrorCode::ChunkMetaFetchFailed,
+        NChunkClient::EErrorCode::AutoRepairFailed,
+        NExecNode::EErrorCode::ConfigCreationFailed,
+        NExecNode::EErrorCode::SlotNotFound,
+        NExecNode::EErrorCode::JobEnvironmentDisabled,
+        NExecNode::EErrorCode::ArtifactCopyingFailed,
+        NExecNode::EErrorCode::ArtifactDownloadFailed,
+        NExecNode::EErrorCode::NodeDirectoryPreparationFailed,
+        NExecNode::EErrorCode::SlotLocationDisabled,
+        NExecNode::EErrorCode::NoLayerLocationAvailable,
+        NExecNode::EErrorCode::NotEnoughDiskSpace,
+        NJobProxy::EErrorCode::MemoryCheckFailed,
+        NContainers::EErrorCode::FailedToStartContainer,
+        EProcessErrorCode::CannotResolveBinary,
+        NNet::EErrorCode::ResolveTimedOut,
+        NExecNode::EErrorCode::JobProxyPreparationTimeout,
+        NExecNode::EErrorCode::JobPreparationTimeout,
+        NExecNode::EErrorCode::GpuCheckCommandFailed,
+        NExecNode::EErrorCode::GpuLayerNotFetched,
+        NJobProxy::EErrorCode::JobNotRunning,
+        NExecNode::EErrorCode::ArtifactFetchFailed,
+    };
+
     if (JobResultExtension_) {
         const auto& schedulerResultExt = *JobResultExtension_;
 
-        if (!resultError.FindMatching(NNet::EErrorCode::ResolveTimedOut) &&
-            !resultError.FindMatching(NChunkClient::EErrorCode::ReaderThrottlingFailed) &&
-            !resultError.FindMatching(NTableClient::EErrorCode::NameTableUpdateFailed) &&
+        if (!resultError.FindMatching(ignoredFailedChunksErrorCodes) &&
             schedulerResultExt.failed_chunk_ids_size() > 0)
         {
             return EAbortReason::FailedChunks;
@@ -2935,9 +3070,7 @@ std::optional<EAbortReason> TJob::DeduceAbortReason()
     }
 
     // This is most probably user error, still we don't want to make it fatal.
-    if (resultError.FindMatching(NExecNode::EErrorCode::LayerUnpackingFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::DockerImagePullingFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::InvalidImage))
+    if (resultError.FindMatching(layerErrorCodes))
     {
         return std::nullopt;
     }
@@ -2948,8 +3081,7 @@ std::optional<EAbortReason> TJob::DeduceAbortReason()
         }
     }
 
-    auto abortReason = resultError.Attributes().Find<EAbortReason>("abort_reason");
-    if (abortReason) {
+    if (auto abortReason = FindAttributeRecursive<EAbortReason>(resultError, "abort_reason")) {
         return *abortReason;
     }
 
@@ -2981,6 +3113,10 @@ std::optional<EAbortReason> TJob::DeduceAbortReason()
         return EAbortReason::ShallowMergeFailed;
     }
 
+    if (resultError.FindMatching(NJobProxy::EErrorCode::InterruptionFailed)) {
+        return EAbortReason::InterruptionFailed;
+    }
+
     if (resultError.FindMatching(NJobProxy::EErrorCode::InterruptionTimeout)) {
         return EAbortReason::InterruptionTimeout;
     }
@@ -2993,40 +3129,18 @@ std::optional<EAbortReason> TJob::DeduceAbortReason()
         return EAbortReason::RootVolumePreparationFailed;
     }
 
-    if (resultError.FindMatching(NJobProxy::EErrorCode::UserJobPortoAPIError)) {
+    if (resultError.FindMatching(NJobProxy::EErrorCode::UserJobPortoApiError)) {
         return EAbortReason::Other;
     }
 
-    if (resultError.FindMatching(NChunkClient::EErrorCode::AllTargetNodesFailed) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::ReaderThrottlingFailed) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::MasterCommunicationFailed) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::MasterNotConnected) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::ReaderTimeout) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::ChunkBlockFetchFailed) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::ChunkMetaFetchFailed) ||
-        resultError.FindMatching(NChunkClient::EErrorCode::AutoRepairFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::ConfigCreationFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::SlotNotFound) ||
-        resultError.FindMatching(NExecNode::EErrorCode::JobEnvironmentDisabled) ||
-        resultError.FindMatching(NExecNode::EErrorCode::ArtifactCopyingFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::ArtifactDownloadFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::NodeDirectoryPreparationFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::SlotLocationDisabled) ||
-        resultError.FindMatching(NExecNode::EErrorCode::NotEnoughDiskSpace) ||
-        resultError.FindMatching(NJobProxy::EErrorCode::MemoryCheckFailed) ||
-        resultError.FindMatching(NContainers::EErrorCode::FailedToStartContainer) ||
-        resultError.FindMatching(EProcessErrorCode::CannotResolveBinary) ||
-        resultError.FindMatching(NNet::EErrorCode::ResolveTimedOut) ||
-        resultError.FindMatching(NExecNode::EErrorCode::JobProxyPreparationTimeout) ||
-        resultError.FindMatching(NExecNode::EErrorCode::JobPreparationTimeout) ||
-        resultError.FindMatching(NExecNode::EErrorCode::GpuCheckCommandFailed) ||
-        resultError.FindMatching(NExecNode::EErrorCode::GpuLayerNotFetched) ||
-        resultError.FindMatching(NJobProxy::EErrorCode::JobNotRunning))
-    {
+    if (resultError.FindMatching(otherAbortErrorCodes)) {
         return EAbortReason::Other;
     }
 
     if (auto jobProxyFailedError = resultError.FindMatching(NExecNode::EErrorCode::JobProxyFailed)) {
+        if (resultError.FindMatching(EProcessErrorCode::CannotStartProcess)) {
+            return EAbortReason::Other;
+        }
         if (auto processError = resultError.FindMatching(EProcessErrorCode::NonZeroExitCode)) {
             auto exitCode = NExecNode::EJobProxyExitCode(processError->Attributes().Get<int>("exit_code"));
             switch (exitCode) {
@@ -3064,9 +3178,9 @@ bool TJob::IsFatalError(const TError& error)
         error.FindMatching(NSecurityClient::EErrorCode::AuthorizationError) ||
         (
             error.FindMatching(NSecurityClient::EErrorCode::AccountLimitExceeded) &&
-            !AbortJobIfAccountLimitExceeded_
-        ) ||
+            !AbortJobIfAccountLimitExceeded_) ||
         error.FindMatching(NSecurityClient::EErrorCode::NoSuchAccount) ||
+        error.FindMatching(NChunkClient::EErrorCode::NoSuchMedium) ||
         error.FindMatching(NNodeTrackerClient::EErrorCode::NoSuchNetwork) ||
         error.FindMatching(NTableClient::EErrorCode::InvalidDoubleValue) ||
         error.FindMatching(NTableClient::EErrorCode::IncomparableTypes) ||
@@ -3388,6 +3502,18 @@ IJobProbePtr TJob::GetJobProbeOrThrow()
         THROW_ERROR_EXCEPTION("Job probe is not available");
     }
     return JobProbe_;
+}
+
+void TJob::ReportJobProxyProcessFinish(const TError& error)
+{
+    VERIFY_THREAD_AFFINITY(JobThread);
+
+    std::optional<TDuration> delay;
+    if (ResultReceivedTime_) {
+        delay = TInstant::Now() - *ResultReceivedTime_;
+    }
+
+    Bootstrap_->GetJobController()->OnJobProxyProcessFinished(error, delay);
 }
 
 bool TJob::ShouldCleanSandboxes()

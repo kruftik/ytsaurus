@@ -2,6 +2,9 @@
 #include "private.h"
 #include "job_detail.h"
 
+#include <yt/yt/ytlib/api/native/client.h>
+#include <yt/yt/ytlib/api/native/connection.h>
+
 #include <yt/yt/ytlib/chunk_client/chunk_spec.h>
 #include <yt/yt/ytlib/chunk_client/data_source.h>
 #include <yt/yt/ytlib/chunk_client/job_spec_extensions.h>
@@ -16,6 +19,9 @@
 #include <yt/yt/ytlib/table_client/schemaless_multi_chunk_reader.h>
 #include <yt/yt/ytlib/table_client/schemaless_chunk_writer.h>
 #include <yt/yt/ytlib/table_client/sorting_reader.h>
+
+#include <yt/yt/library/query/engine_api/column_evaluator.h>
+#include <yt/yt/library/query/row_comparer_api/row_comparer_generator.h>
 
 namespace NYT::NJobProxy {
 
@@ -75,7 +81,19 @@ public:
                 /*partitionTag*/ std::nullopt,
                 MultiReaderMemoryManager_->CreateMultiReaderMemoryManager(tableReaderConfig->MaxBufferSize));
 
-            return CreateSortingReader(reader, nameTable, keyColumns, outputSchema->ToComparator());
+            TCallback<TUUComparerSignature> cgComparer;
+            if (JobSpecExt_.enable_codegen_comparator() && outputSchema->IsCGCompatarorApplicable()) {
+                cgComparer = NQueryClient::GenerateStaticTableKeyComparer(outputSchema->GetKeyColumnTypes());
+            }
+
+            auto columnEvaluator = Host_->GetClient()->GetNativeConnection()->GetColumnEvaluatorCache()->Find(outputSchema);
+
+            return CreateSortingReader(
+                reader,
+                nameTable,
+                keyColumns,
+                outputSchema->ToComparator(std::move(cgComparer)),
+                std::move(columnEvaluator));
         };
 
         auto transactionId = FromProto<TTransactionId>(JobSpecExt_.output_transaction_id());

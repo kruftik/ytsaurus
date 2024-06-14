@@ -16,6 +16,8 @@
 
 #include <yt/yt/server/lib/tablet_balancer/config.h>
 
+#include <yt/yt/server/lib/misc/assert_sizeof.h>
+
 #include <yt/yt/ytlib/chunk_client/chunk_owner_ypath_proxy.h>
 
 #include <yt/yt/ytlib/transaction_client/public.h>
@@ -82,13 +84,13 @@ private:
         TError BackupError;
         std::vector<NTabletClient::TTableReplicaBackupDescriptor> ReplicaBackupDescriptors;
         std::optional<TString> QueueAgentStage;
-        bool TreatAsConsumer = false;
+        bool TreatAsQueueConsumer = false;
         bool IsVitalConsumer = false;
+        bool TreatAsQueueProducer = false;
         NTabletServer::TMountConfigStoragePtr MountConfigStorage;
         NTabletServer::THunkStorageNodePtr HunkStorageNode;
         THashSet<TSecondaryIndex*> SecondaryIndices;
         TSecondaryIndex* IndexTo = nullptr;
-        bool EnableSharedWriteLocks = false;
 
         TDynamicTableAttributes();
 
@@ -104,6 +106,7 @@ public:
     DEFINE_BYVAL_RW_PROPERTY(NTransactionClient::TTimestamp, RetainedTimestamp, NTransactionClient::NullTimestamp);
     DEFINE_BYVAL_RW_PROPERTY(NTransactionClient::TTimestamp, UnflushedTimestamp, NTransactionClient::NullTimestamp);
     DEFINE_BYVAL_RW_PROPERTY(TTableCollocation*, ReplicationCollocation);
+    DEFINE_BYREF_RW_PROPERTY(NYson::TYsonString, CustomRuntimeData);
 
     DEFINE_CYPRESS_BUILTIN_VERSIONED_ATTRIBUTE(TTableNode, NTableClient::EOptimizeFor, OptimizeFor);
     DEFINE_CYPRESS_BUILTIN_VERSIONED_ATTRIBUTE(TTableNode, NChunkClient::EChunkFormat, ChunkFormat);
@@ -128,7 +131,6 @@ public:
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, ProfilingTag);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, EnableDetailedProfiling);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, EnableConsistentChunkReplicaPlacement);
-    DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, EnableSharedWriteLocks);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, BackupState);
     DEFINE_BYREF_RW_EXTRA_PROPERTY(DynamicTableAttributes, TabletCountByBackupState);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, AggregatedTabletBackupState);
@@ -137,8 +139,9 @@ public:
     DEFINE_BYREF_RW_EXTRA_PROPERTY(DynamicTableAttributes, BackupError);
     DEFINE_BYREF_RW_EXTRA_PROPERTY(DynamicTableAttributes, ReplicaBackupDescriptors);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, QueueAgentStage);
-    DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, TreatAsConsumer);
+    DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, TreatAsQueueConsumer);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, IsVitalConsumer);
+    DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, TreatAsQueueProducer);
     DEFINE_BYREF_RW_EXTRA_PROPERTY(DynamicTableAttributes, SecondaryIndices);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(DynamicTableAttributes, IndexTo);
 
@@ -174,8 +177,10 @@ public:
     bool IsDynamic() const;
     bool IsQueue() const;
     bool IsTrackedQueueObject() const;
-    bool IsConsumer() const;
-    bool IsTrackedConsumerObject() const;
+    bool IsQueueConsumer() const;
+    bool IsTrackedQueueConsumerObject() const;
+    bool IsQueueProducer() const;
+    bool IsTrackedQueueProducerObject() const;
     bool IsEmpty() const;
     bool IsLogicallyEmpty() const;
     bool IsUniqueKeys() const;
@@ -231,6 +236,9 @@ private:
     NTransactionClient::TTimestamp CalculateUnflushedTimestamp(
         NTransactionClient::TTimestamp latestTimestamp) const;
 };
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TTableNode, 848);
 
 ////////////////////////////////////////////////////////////////////////////////
 

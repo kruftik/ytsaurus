@@ -11,6 +11,7 @@ SRCS(
     cg_ir_builder.cpp
     cg_routines.cpp
     GLOBAL column_evaluator.cpp
+    GLOBAL expression_evaluator.cpp
     GLOBAL coordinator.cpp
     GLOBAL evaluator.cpp
     folding_profiler.cpp
@@ -194,6 +195,13 @@ LLVM_BC(
 )
 
 LLVM_BC(
+    udf/is_finite.cpp
+    NAME is_finite
+    SYMBOLS
+      is_finite
+)
+
+LLVM_BC(
     udf/to_any.cpp
     NAME to_any
     SYMBOLS
@@ -224,7 +232,6 @@ LLVM_BC(
     udf/sleep.c
     NAME sleep
     SYMBOLS
-        sleep
         sleep
 )
 
@@ -339,6 +346,23 @@ LLVM_BC(
     NAME greatest
     SYMBOLS
         greatest
+)
+
+LLVM_BC(
+    udf/dict_sum.c
+    NAME dict_sum
+    SYMBOLS
+        dict_sum_init
+        dict_sum_update
+        dict_sum_merge
+        dict_sum_finalize
+)
+
+LLVM_BC(
+    udf/yson_string_to_any.cpp
+    NAME yson_string_to_any
+    SYMBOLS
+        yson_string_to_any
 )
 
 END()

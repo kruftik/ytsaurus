@@ -465,7 +465,6 @@ void TObjectProxyBase::ListSystemAttributes(std::vector<TAttributeDescriptor>* d
     bool hasAcd = acd;
     bool hasOwner = acd && acd->GetOwner();
     bool isForeign = Object_->IsForeign();
-    bool isSequoia = Object_->IsSequoia();
 
     descriptors->push_back(EInternedAttributeKey::Id);
     descriptors->push_back(EInternedAttributeKey::Type);
@@ -506,8 +505,6 @@ void TObjectProxyBase::ListSystemAttributes(std::vector<TAttributeDescriptor>* d
         .SetMandatory(true));
     descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::EstimatedCreationTime)
         .SetOpaque(true));
-    descriptors->push_back(TAttributeDescriptor(EInternedAttributeKey::Aevum)
-        .SetPresent(isSequoia));
 }
 
 const THashSet<TInternedAttributeKey>& TObjectProxyBase::GetBuiltinAttributeKeys()
@@ -675,16 +672,6 @@ bool TObjectProxyBase::GetBuiltinAttribute(TInternedAttributeKey key, IYsonConsu
             return true;
         }
 
-        case EInternedAttributeKey::Aevum: {
-            if (!Object_->IsSequoia()) {
-                break;
-            }
-
-            BuildYsonFluently(consumer)
-                .Value(Object_->GetAevum());
-            return true;
-        }
-
         default:
             break;
     }
@@ -753,6 +740,14 @@ bool TObjectProxyBase::SetBuiltinAttribute(TInternedAttributeKey key, const TYso
                 THROW_ERROR_EXCEPTION(
                     NSecurityClient::EErrorCode::AuthorizationError,
                     "Access denied: can only set owner to self");
+            }
+
+            if (owner->IsUser()) {
+                owner->AsUser()->AlertIfPendingRemoval(
+                    Format("User pending for removal is being set as %Q attribute for object (User: %v, ObjectId: %v)",
+                    EInternedAttributeKey::Owner.Unintern(),
+                    owner->GetName(),
+                    GetId()));
             }
 
             if (!force) {

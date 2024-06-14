@@ -32,7 +32,7 @@ public:
             bootstrap,
             TDataNodeTrackerServiceProxy::GetDescriptor(),
             EAutomatonThreadQueue::DataNodeTrackerService,
-            ChunkServerLogger)
+            ChunkServerLogger())
     {
         RegisterMethod(RPC_SERVICE_METHOD_DESC(FullHeartbeat)
             .SetHeavy(true));
@@ -49,6 +49,9 @@ private:
         ValidatePeer(EPeerKind::Leader);
         ValidateLocationDirectory(*request);
         SyncWithUpstream();
+
+        const auto& multicellManager = Bootstrap_->GetMulticellManager();
+        multicellManager->ValidateRegisteredMasterCell();
 
         auto nodeId = FromProto<TNodeId>(request->node_id());
 
@@ -69,6 +72,9 @@ private:
         ValidatePeer(EPeerKind::Leader);
         ValidateLocationDirectory(*request);
         SyncWithUpstream();
+
+        const auto& multicellManager = Bootstrap_->GetMulticellManager();
+        multicellManager->ValidateRegisteredMasterCell();
 
         auto nodeId = FromProto<TNodeId>(request->node_id());
 

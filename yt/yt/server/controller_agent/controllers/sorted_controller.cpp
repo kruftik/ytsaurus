@@ -304,7 +304,7 @@ protected:
 
             // If teleport chunks were found, then teleport table index should be non-null.
             Controller_->RegisterTeleportChunk(
-                std::move(teleportChunk), /*key=*/0, /*tableIndex=*/*Controller_->GetOutputTeleportTableIndex());
+                std::move(teleportChunk), /*key*/ 0, /*tableIndex*/*Controller_->GetOutputTeleportTableIndex());
         }
 
         TJobSplitterConfigPtr GetJobSplitterConfig() const override
@@ -313,7 +313,7 @@ protected:
 
             config->EnableJobSplitting &=
                 (IsJobInterruptible() &&
-                std::ssize(Controller_->InputTables_) <= Controller_->Options_->JobSplitter->MaxInputTableCount);
+                std::ssize(Controller_->InputManager->GetInputTables()) <= Controller_->Options_->JobSplitter->MaxInputTableCount);
 
             return config;
         }
@@ -322,6 +322,10 @@ protected:
         {
             if (!TTask::IsJobInterruptible()) {
                 return false;
+            }
+
+            if (Controller_->JobSizeConstraints_->ForceAllowJobInterruption()) {
+                return true;
             }
 
             auto totalJobCount = Controller_->GetTotalJobCounter()->GetTotal();
@@ -387,7 +391,7 @@ protected:
                     PrimaryInputDataWeight,
                     DataWeightRatio,
                     InputCompressionRatio,
-                    InputTables_.size(),
+                    InputManager->GetInputTables().size(),
                     GetPrimaryInputTableCount());
                 break;
             default:
@@ -401,9 +405,9 @@ protected:
                     PrimaryInputDataWeight,
                     std::numeric_limits<i64>::max() / 4 /*InputRowCount*/, // It is not important in sorted operations.
                     GetForeignInputDataWeight(),
-                    InputTables_.size(),
+                    InputManager->GetInputTables().size(),
                     GetPrimaryInputTableCount(),
-                    /*sortedOperation=*/true);
+                    /*sortedOperation*/ true);
                 break;
         }
 
@@ -427,12 +431,12 @@ protected:
         const TSortColumns& sortColumns,
         std::function<bool(const TInputTablePtr& table)> inputTableFilter = [] (const TInputTablePtr& /*table*/) { return true; })
     {
-        YT_VERIFY(!InputTables_.empty());
+        YT_VERIFY(!InputManager->GetInputTables().empty());
 
         for (const auto& sortColumn : sortColumns) {
             const TColumnSchema* referenceColumn = nullptr;
             TInputTablePtr referenceTable;
-            for (const auto& table : InputTables_) {
+            for (const auto& table : InputManager->GetInputTables()) {
                 if (!inputTableFilter(table)) {
                     continue;
                 }
@@ -475,7 +479,7 @@ protected:
 
     TChunkStripePtr CreateChunkStripe(TLegacyDataSlicePtr dataSlice)
     {
-        auto chunkStripe = New<TChunkStripe>(InputTables_[dataSlice->GetTableIndex()]->IsForeign());
+        auto chunkStripe = New<TChunkStripe>(InputManager->GetInputTables()[dataSlice->GetTableIndex()]->IsForeign());
         chunkStripe->DataSlices.emplace_back(std::move(dataSlice));
         return chunkStripe;
     }
@@ -494,7 +498,7 @@ protected:
             int foreignSlices = 0;
             // TODO(max42): use CollectPrimaryInputDataSlices() here?
             for (const auto& chunk : CollectPrimaryUnversionedChunks()) {
-                const auto& comparator = InputTables_[chunk->GetTableIndex()]->Comparator;
+                const auto& comparator = InputManager->GetInputTables()[chunk->GetTableIndex()]->Comparator;
                 YT_VERIFY(comparator);
 
                 const auto& dataSlice = CreateUnversionedInputDataSlice(CreateInputChunkSlice(chunk));
@@ -573,7 +577,7 @@ protected:
     {
         auto tableIndex = GetOutputTeleportTableIndex();
         if (tableIndex) {
-            for (const auto& inputTable : InputTables_) {
+            for (const auto& inputTable : InputManager->GetInputTables()) {
                 if (inputTable->SupportsTeleportation() && OutputTables_[*tableIndex]->SupportsTeleportation()) {
                     inputTable->Teleportable = CheckTableSchemaCompatibility(
                         *inputTable->Schema,
@@ -704,8 +708,8 @@ protected:
         chunkPoolOptions.SortedJobOptions = jobOptions;
         chunkPoolOptions.MinTeleportChunkSize = GetMinTeleportChunkSize();
         chunkPoolOptions.JobSizeConstraints = JobSizeConstraints_;
-        chunkPoolOptions.Logger = Logger.WithTag("Name: Root");
-        chunkPoolOptions.StructuredLogger = ChunkPoolStructuredLogger
+        chunkPoolOptions.Logger = Logger().WithTag("Name: Root");
+        chunkPoolOptions.StructuredLogger = ChunkPoolStructuredLogger()
             .WithStructuredTag("operation_id", OperationId);
         return chunkPoolOptions;
     }
@@ -733,14 +737,19 @@ protected:
         }
     }
 
+    TDataFlowGraph::TVertexDescriptor GetOutputLivePreviewVertexDescriptor() const override
+    {
+        return SortedTask_->GetVertexDescriptor();
+    }
+
 private:
     IChunkSliceFetcherPtr CreateChunkSliceFetcher()
     {
-        FetcherChunkScraper_ = CreateFetcherChunkScraper();
+        FetcherChunkScraper_ = InputManager->CreateFetcherChunkScraper();
 
         auto fetcher = NTableClient::CreateChunkSliceFetcher(
             Config->ChunkSliceFetcher,
-            InputNodeDirectory_,
+            InputManager->GetInputNodeDirectory(),
             GetCancelableInvoker(),
             FetcherChunkScraper_,
             Host->GetClient(),
@@ -850,7 +859,7 @@ public:
 
         SetProtoExtension<NChunkClient::NProto::TDataSourceDirectoryExt>(
             jobSpecExt->mutable_extensions(),
-            BuildDataSourceDirectoryFromInputTables(InputTables_));
+            BuildDataSourceDirectoryFromInputTables(InputManager->GetInputTables()));
         SetProtoExtension<NChunkClient::NProto::TDataSinkDirectoryExt>(
             jobSpecExt->mutable_extensions(),
             BuildDataSinkDirectoryFromOutputTables(OutputTables_));
@@ -1056,7 +1065,7 @@ public:
 
         SetProtoExtension<NChunkClient::NProto::TDataSourceDirectoryExt>(
             jobSpecExt->mutable_extensions(),
-            BuildDataSourceDirectoryFromInputTables(InputTables_));
+            BuildDataSourceDirectoryFromInputTables(InputManager->GetInputTables()));
         SetProtoExtension<NChunkClient::NProto::TDataSinkDirectoryExt>(
             jobSpecExt->mutable_extensions(),
             BuildDataSinkDirectoryWithAutoMerge(
@@ -1104,20 +1113,17 @@ public:
         ValidateUserFileCount(Spec_->Reducer, "reducer");
 
         int foreignInputCount = 0;
-        for (auto& table : InputTables_) {
+        for (auto& table : InputManager->GetInputTables()) {
             if (table->Path.GetForeign()) {
                 if (table->Path.GetTeleport()) {
                     THROW_ERROR_EXCEPTION("Foreign table can not be specified as teleport")
                         << TErrorAttribute("path", table->Path);
                 }
-                if (table->Path.GetNewRanges(table->Comparator).size() > 1) {
-                    THROW_ERROR_EXCEPTION("Reduce operation does not support foreign tables with multiple ranges");
-                }
                 ++foreignInputCount;
             }
         }
 
-        if (foreignInputCount == std::ssize(InputTables_)) {
+        if (foreignInputCount == std::ssize(InputManager->GetInputTables())) {
             THROW_ERROR_EXCEPTION("At least one non-foreign input table is required");
         }
 
@@ -1293,7 +1299,7 @@ public:
                 }
                 previousUpperBound = upperBound;
             }
-            for (const auto& table : InputTables_) {
+            for (const auto& table : InputManager->GetInputTables()) {
                 if (table->Path.GetTeleport()) {
                     THROW_ERROR_EXCEPTION("Chunk teleportation is not supported when pivot keys are specified");
                 }

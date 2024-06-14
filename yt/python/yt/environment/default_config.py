@@ -107,6 +107,7 @@ def get_dynamic_master_config():
         request_rate_smoothing_period = 60000;
         account_master_memory_usage_update_period = 500;
         enable_delayed_membership_closure_recomputation = %false;
+        fix_subject_tag_filter_iterator_never_skipping_first_ace = %true;
     };
 
     cypress_manager = {
@@ -236,6 +237,7 @@ def get_scheduler_config():
             enable_response_keeper = %true;
         };
         crash_on_allocation_heartbeat_processing_exception = %true;
+        enable_fair_share_preupdate_offloading = %true;
     };
 }
 """)
@@ -401,6 +403,8 @@ def get_controller_agent_config():
 
         set_committed_attribute_via_transaction_action = %false;
         commit_operation_cypress_node_changes_via_system_transaction = %true;
+
+        job_id_unequal_to_allocation_id = %true;
     };
 }
 """)
@@ -702,6 +706,7 @@ def get_dynamic_node_config():
                 operation_infos_request_period = 1000;
 
                 unknown_operation_jobs_removal_delay = 5000;
+                disable_legacy_allocation_preparation = %true;
             };
 
             controller_agent_connector = {
@@ -852,6 +857,19 @@ def get_queue_agent_config():
 """)
 
 
+def get_kafka_proxy_config():
+    return yson.loads(b"""
+{
+    dynamic_config_manager = {
+        update_period = 100;
+    };
+    auth = {
+        cypress_token_authenticator = {};
+    };
+}
+""")
+
+
 def get_dynamic_queue_agent_config(yt_config):
     return yson.loads(b"""
 {
@@ -866,7 +884,7 @@ def get_dynamic_queue_agent_config(yt_config):
         "enable_validation" = %false;
     };
     "cypress_synchronizer" = {
-        "write_registration_table_mapping" = %true;
+        "write_replicated_table_mapping" = %true;
         "poll_replicated_objects" = %true;
         "clusters" = [\""""
                       +

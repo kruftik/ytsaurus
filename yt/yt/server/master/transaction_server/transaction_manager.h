@@ -43,22 +43,29 @@ struct ITransactionManager
 
     virtual void Initialize() = 0;
 
-    virtual TTransaction* StartTransaction(
-        TTransaction* parent,
-        std::vector<TTransaction*> prerequisiteTransactions,
+    virtual TTransaction* StartSystemTransaction(
         const NObjectClient::TCellTagList& replicatedToCellTags,
         std::optional<TDuration> timeout,
-        std::optional<TInstant> deadline,
-        const std::optional<TString>& title,
+        const TString& title,
         const NYTree::IAttributeDictionary& attributes,
-        bool isCypressTransaction,
         TTransactionId hintId = NullTransactionId) = 0;
+
+    //! Starts Cypress transaction which is not mirrored to Sequoia.
+    /*!
+     *  NB: such transaction should be finished with either
+     *  CommitMasterTransaction() or AbortMasterTransaction().
+     */
+    virtual TTransaction* StartNonMirroredCypressTransaction(
+        const NObjectClient::TCellTagList& replicatedToCellTags,
+        const TString& title) = 0;
+
     virtual void CommitMasterTransaction(
         TTransaction* transaction,
         const NTransactionSupervisor::TTransactionCommitOptions& options) = 0;
     virtual void AbortMasterTransaction(
         TTransaction* transaction,
         const NTransactionSupervisor::TTransactionAbortOptions& options) = 0;
+
     virtual TTransaction* StartUploadTransaction(
         TTransaction* parent,
         std::vector<TTransaction*> prerequisiteTransactions,
@@ -77,8 +84,9 @@ struct ITransactionManager
 
     virtual NHydra::TEntityMap<TTransaction>* MutableTransactionMap() = 0;
 
-    virtual const THashSet<TTransaction*>& NativeTransactions() const = 0;
+    virtual const THashSet<TTransaction*>& ForeignTransactions() const = 0;
     virtual const THashSet<TTransaction*>& NativeTopmostTransactions() const = 0;
+    virtual const THashSet<TTransaction*>& NativeTransactions() const = 0;
 
     //! Finds transaction by id, throws if nothing is found.
     virtual TTransaction* GetTransactionOrThrow(TTransactionId transactionId) = 0;
@@ -141,9 +149,6 @@ struct ITransactionManager
     void RegisterTransactionActionHandlers(
         NTransactionSupervisor::TTypedTransactionActionDescriptor<TTransaction, TProto> descriptor);
 
-    virtual void RegisterTransactionActionHandlers(
-        NTransactionSupervisor::TTransactionActionDescriptor<TTransaction> descriptor) = 0;
-
     using TCtxStartTransaction = NRpc::TTypedServiceContext<
         NTransactionClient::NProto::TReqStartTransaction,
         NTransactionClient::NProto::TRspStartTransaction>;
@@ -151,14 +156,6 @@ struct ITransactionManager
     virtual std::unique_ptr<NHydra::TMutation> CreateStartTransactionMutation(
         TCtxStartTransactionPtr context,
         const NTransactionServer::NProto::TReqStartTransaction& request) = 0;
-
-    using TCtxStartCypressTransaction = NRpc::TTypedServiceContext<
-        NCypressTransactionClient::NProto::TReqStartTransaction,
-        NCypressTransactionClient::NProto::TRspStartTransaction>;
-    using TCtxStartCypressTransactionPtr = TIntrusivePtr<TCtxStartCypressTransaction>;
-    virtual std::unique_ptr<NHydra::TMutation> CreateStartCypressTransactionMutation(
-        TCtxStartCypressTransactionPtr context,
-        const NTransactionServer::NProto::TReqStartCypressTransaction& request) = 0;
 
     using TCtxRegisterTransactionActions = NRpc::TTypedServiceContext<
         NProto::TReqRegisterTransactionActions,
@@ -188,6 +185,10 @@ struct ITransactionManager
 
     virtual const TTransactionPresenceCachePtr& GetTransactionPresenceCache() = 0;
 
+    using TCtxStartCypressTransaction = NRpc::TTypedServiceContext<
+        NCypressTransactionClient::NProto::TReqStartTransaction,
+        NCypressTransactionClient::NProto::TRspStartTransaction>;
+    using TCtxStartCypressTransactionPtr = TIntrusivePtr<TCtxStartCypressTransaction>;
     virtual void StartCypressTransaction(const TCtxStartCypressTransactionPtr& context) = 0;
 
     using TCtxCommitCypressTransaction = NRpc::TTypedServiceContext<
@@ -203,6 +204,10 @@ struct ITransactionManager
     virtual void AbortCypressTransaction(const TCtxAbortCypressTransactionPtr& context) = 0;
 
     virtual TTransaction* GetAndValidatePrerequisiteTransaction(TTransactionId transactionId) = 0;
+
+protected:
+    virtual void DoRegisterTransactionActionHandlers(
+        NTransactionSupervisor::TTransactionActionDescriptor<TTransaction> descriptor) = 0;
 };
 
 DEFINE_REFCOUNTED_TYPE(ITransactionManager)

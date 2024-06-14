@@ -29,6 +29,8 @@ public:
         TChunkId chunkId,
         const TFuture<TAllyReplicasInfo>& future) = 0;
 
+    virtual void PingChunks(const std::vector<TChunkId>& chunkIds) = 0;
+
     virtual void UpdateReplicas(
         TChunkId chunkId,
         const TAllyReplicasInfo& replicas) = 0;
@@ -36,11 +38,15 @@ public:
     virtual void RegisterReplicas(
         TChunkId chunkId,
         const NChunkClient::TChunkReplicaWithMediumList& replicas) = 0;
+
+    virtual void Reconfigure(TChunkReplicaCacheConfigPtr config) = 0;
 };
 
 DEFINE_REFCOUNTED_TYPE(IChunkReplicaCache)
 
-IChunkReplicaCachePtr CreateChunkReplicaCache(NApi::NNative::IConnectionPtr connection);
+IChunkReplicaCachePtr CreateChunkReplicaCache(
+    NApi::NNative::IConnectionPtr connection,
+    const NProfiling::TProfiler& profiler);
 
 ////////////////////////////////////////////////////////////////////////////////
 

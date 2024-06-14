@@ -1,10 +1,11 @@
 RECURSE(
     misc
     base
+    distributed
     engine_api
     engine
     row_comparer
     row_comparer_api
     proto
-    unittests   
+    unittests
 )

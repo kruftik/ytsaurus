@@ -4,54 +4,58 @@
 #include "client.h"
 #include "connection.h"
 #include "config.h"
+#include "helpers.h"
 #include "secondary_index_modification.h"
 #include "sync_replica_cache.h"
 #include "tablet_commit_session.h"
+#include "tablet_helpers.h"
 
-#include <yt/yt/client/transaction_client/timestamp_provider.h>
+#include <yt/yt/client/api/dynamic_table_transaction_mixin.h>
+#include <yt/yt/client/api/queue_transaction_mixin.h>
+
+#include <yt/yt/client/chaos_client/replication_card_cache.h>
 
 #include <yt/yt/client/object_client/helpers.h>
 
+#include <yt/yt/client/queue_client/consumer_client.h>
+
+#include <yt/yt/client/table_client/name_table.h>
+#include <yt/yt/client/table_client/record_helpers.h>
+#include <yt/yt/client/table_client/row_buffer.h>
+#include <yt/yt/client/table_client/wire_protocol.h>
+
 #include <yt/yt/client/tablet_client/table_mount_cache.h>
+
+#include <yt/yt/client/transaction_client/helpers.h>
+#include <yt/yt/client/transaction_client/timestamp_provider.h>
 
 #include <yt/yt_proto/yt/client/table_chunk_format/proto/wire_protocol.pb.h>
 
-#include <yt/yt/client/table_client/wire_protocol.h>
-#include <yt/yt/client/table_client/name_table.h>
-#include <yt/yt/client/table_client/row_buffer.h>
+#include <yt/yt/ytlib/chaos_client/coordinator_service_proxy.h>
+#include <yt/yt/ytlib/chaos_client/proto/coordinator_service.pb.h>
 
-#include <yt/yt/client/transaction_client/helpers.h>
+#include <yt/yt/ytlib/hive/cluster_directory.h>
+#include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
+
+#include <yt/yt/ytlib/queue_client/records/queue_producer_session.record.h>
+
+#include <yt/yt/ytlib/queue_client/registration_manager.h>
+#include <yt/yt/ytlib/queue_client/helpers.h>
+
+#include <yt/yt/ytlib/security_client/permission_cache.h>
 
 #include <yt/yt/ytlib/table_client/helpers.h>
 #include <yt/yt/ytlib/table_client/hunks.h>
+#include <yt/yt/ytlib/table_client/row_merger.h>
+#include <yt/yt/ytlib/table_client/schema.h>
 
-#include <yt/yt/ytlib/api/native/tablet_helpers.h>
+#include <yt/yt/ytlib/tablet_client/tablet_service_proxy.h>
 
 #include <yt/yt/ytlib/transaction_client/transaction_manager.h>
 #include <yt/yt/ytlib/transaction_client/action.h>
 #include <yt/yt/ytlib/transaction_client/transaction_service_proxy.h>
 
-#include <yt/yt/ytlib/tablet_client/tablet_service_proxy.h>
-
-#include <yt/yt/ytlib/table_client/row_merger.h>
-#include <yt/yt/ytlib/table_client/schema.h>
-
-#include <yt/yt/ytlib/hive/cluster_directory.h>
-#include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
-
 #include <yt/yt/library/query/engine_api/column_evaluator.h>
-
-#include <yt/yt/ytlib/security_client/permission_cache.h>
-
-#include <yt/yt/ytlib/chaos_client/coordinator_service_proxy.h>
-#include <yt/yt/ytlib/chaos_client/proto/coordinator_service.pb.h>
-
-#include <yt/yt/client/chaos_client/replication_card_cache.h>
-
-#include <yt/yt/client/queue_client/consumer_client.h>
-
-#include <yt/yt/client/api/dynamic_table_transaction_mixin.h>
-#include <yt/yt/client/api/queue_transaction_mixin.h>
 
 #include <yt/yt/core/concurrency/action_queue.h>
 
@@ -352,34 +356,149 @@ public:
         i64 newOffset,
         const TAdvanceConsumerOptions& /*options*/) override
     {
-        auto tableMountCache = GetClient()->GetTableMountCache();
-        auto queuePhysicalPath = queuePath;
-        auto queueTableInfoOrError = WaitFor(tableMountCache->GetTableInfo(queuePath.GetPath()));
-        if (!queueTableInfoOrError.IsOK()) {
-            THROW_ERROR_EXCEPTION("Failed to resolve queue path")
-                << queueTableInfoOrError;
-        }
-        queuePhysicalPath = NYPath::TRichYPath(queueTableInfoOrError.Value()->PhysicalPath, queuePath.Attributes());
+        const auto& tableMountCache = Client_->GetNativeConnection()->GetTableMountCache();
+        auto tableInfo = WaitFor(tableMountCache->GetTableInfo(consumerPath.GetPath()))
+            .ValueOrThrow();
+
+        CheckReadPermission(consumerPath.GetPath(), tableInfo, Client_->GetOptions(), Client_->GetNativeConnection());
+
+        auto registrationCheckResult = Client_->GetNativeConnection()->GetQueueConsumerRegistrationManager()->GetRegistrationOrThrow(queuePath, consumerPath);
 
         auto queueClient = GetClient();
-        if (auto queueCluster = queuePath.GetCluster()) {
+        if (auto queueCluster = registrationCheckResult.ResolvedQueue.GetCluster()) {
             auto queueConnection = FindRemoteConnection(Client_->GetNativeConnection(), *queueCluster);
             if (!queueConnection) {
                 THROW_ERROR_EXCEPTION(
                     "Queue cluster %Qv was not found for path %v",
                     *queueCluster,
-                    queuePath
-                );
+                    queuePath);
             }
 
             auto queueClientOptions = TClientOptions::FromUser(Client_->GetOptions().GetAuthenticatedUser());
             queueClient = queueConnection->CreateNativeClient(queueClientOptions);
         }
 
-        auto subConsumerClient = CreateSubConsumerClient(GetClient(), queueClient, consumerPath.GetPath(), queuePhysicalPath);
+        auto subConsumerClient = CreateSubConsumerClient(GetClient(), queueClient, consumerPath.GetPath(), registrationCheckResult.ResolvedQueue);
         subConsumerClient->Advance(this, partitionIndex, oldOffset, newOffset);
 
         return VoidFuture;
+    }
+
+    TFuture<TPushQueueProducerResult> PushQueueProducer(
+        const NYPath::TRichYPath& producerPath,
+        const NYPath::TRichYPath& queuePath,
+        const TString& sessionId,
+        i64 epoch,
+        NTableClient::TNameTablePtr nameTable,
+        TSharedRange<NTableClient::TUnversionedRow> rows,
+        const TPushQueueProducerOptions& options) override
+    {
+        ValidateTabletTransactionId(GetId());
+
+        const auto& tableMountCache = Client_->GetNativeConnection()->GetTableMountCache();
+        auto producerTableInfoFuture = tableMountCache->GetTableInfo(producerPath.GetPath());
+        auto queueTableInfoFuture = tableMountCache->GetTableInfo(queuePath.GetPath());
+
+        auto producerTableInfo = WaitFor(producerTableInfoFuture).ValueOrThrow();
+        // TODO(nadya73): use special producer permission.
+        CheckWritePermission(producerPath.GetPath(), producerTableInfo, Client_->GetOptions(), Client_->GetNativeConnection());
+
+        auto queueTableInfo = WaitFor(queueTableInfoFuture).ValueOrThrow();
+        CheckWritePermission(queuePath.GetPath(), queueTableInfo, Client_->GetOptions(), Client_->GetNativeConnection());
+
+        // TODO(nadya73): check queue producer registration.
+
+        // Cluster for queue and producer should be the same.
+        auto cluster = Client_->GetClusterName();
+        if (!cluster) {
+            THROW_ERROR_EXCEPTION("Cannot serve request, there is a server-side misconfiguration, "
+                "cluster connection was not properly configured with a cluster name");
+        }
+
+        // TODO(nadya73): resolve RT/CRT paths by replicas.
+
+        auto producerNameTable = NQueueClient::NRecords::TQueueProducerSessionDescriptor::Get()->GetNameTable();
+        NQueueClient::NRecords::TQueueProducerSessionKey sessionKey{
+            .QueueCluster = TString(*cluster),
+            .QueuePath = queuePath.GetPath(),
+            .SessionId = sessionId,
+        };
+
+        auto keys = FromRecordKeys(MakeRange(std::array{sessionKey}));
+
+        auto sessionRowset = WaitFor(LookupRows(
+            producerPath.GetPath(),
+            producerNameTable,
+            keys,
+            TLookupRowsOptions{}))
+            .ValueOrThrow()
+            .Rowset;
+
+        auto sessions = ToRecords<NRecords::TQueueProducerSession>(sessionRowset);
+        THROW_ERROR_EXCEPTION_IF(sessions.empty(), "Unknown queue producer session %Qv", sessionId);
+
+        YT_VERIFY(sessions.size() == 1);
+        const auto& session = sessions[0];
+
+        THROW_ERROR_EXCEPTION_IF(
+            session.Epoch > epoch,
+            NQueueClient::EErrorCode::ZombieEpoch,
+            "Received session epoch %v is less than the actual %v epoch, probably it is a zombie",
+            epoch,
+            session.Epoch);
+
+        THROW_ERROR_EXCEPTION_IF(
+            session.Epoch < epoch,
+            NQueueClient::EErrorCode::InvalidEpoch,
+            "Received epoch %v is greater than the actual %v epoch",
+            epoch,
+            session.Epoch);
+
+        auto lastProducerSequenceNumber = session.SequenceNumber;
+
+        // If we push in the same transaction using the same session several times,
+        // we should save last sequence number in the transaction state for the correct checking of sequence numbers.
+        auto actualLastProducerSequenceNumberIt = QueueProducerSessionToSequenceNumber_.find(std::tuple(producerPath, queuePath, sessionId));
+        if (actualLastProducerSequenceNumberIt != QueueProducerSessionToSequenceNumber_.end()) {
+            lastProducerSequenceNumber = actualLastProducerSequenceNumberIt->second;
+        }
+
+        auto validateResult = ValidatePushQueueProducerRows(
+            nameTable, rows, lastProducerSequenceNumber, options.SequenceNumber);
+
+        YT_LOG_DEBUG("Rows were validated (SkipRowCount: %v, LastSequenceNumber: %v)",
+            validateResult.SkipRowCount,
+            validateResult.LastSequenceNumber);
+
+        if (validateResult.SkipRowCount >= std::ssize(rows)) {
+            YT_LOG_DEBUG("After validation %v rows should be skipped, do nothing", validateResult.SkipRowCount);
+        }
+
+        auto filteredRows = rows.Slice(validateResult.SkipRowCount, rows.Size());
+        WriteRows(
+            queuePath.GetPath(),
+            nameTable,
+            filteredRows,
+            TModifyRowsOptions{ .WriteViaQueueProducer = true });
+
+        QueueProducerSessionToSequenceNumber_[std::tuple(producerPath, queuePath, sessionId)] = validateResult.LastSequenceNumber;
+
+        NQueueClient::NRecords::TQueueProducerSessionPartial updatedSession{
+            .Key = sessionKey,
+            .SequenceNumber = validateResult.LastSequenceNumber,
+            .Epoch = epoch,
+        };
+        if (options.UserMeta) {
+            updatedSession.UserMeta = ConvertToYsonString(options.UserMeta);
+        }
+
+        auto updatedSessionRows = FromRecords(MakeRange(std::array{updatedSession}));
+        WriteRows(producerPath.GetPath(), producerNameTable, updatedSessionRows);
+
+        return MakeFuture(TPushQueueProducerResult{
+            .LastSequenceNumber = validateResult.LastSequenceNumber,
+            .SkippedRowCount = validateResult.SkipRowCount,
+        });
     }
 
     void ModifyRows(
@@ -628,14 +747,14 @@ private:
         TModificationRequest(
             TTransaction* transaction,
             IConnectionPtr connection,
-            const TYPath& path,
+            TYPath path,
             TNameTablePtr nameTable,
             TChunkedMemoryPool* memoryPool,
             TSharedRange<TRowModification> modifications,
             const TModifyRowsOptions& options)
             : Transaction_(transaction)
             , Connection_(std::move(connection))
-            , Path_(path)
+            , Path_(std::move(path))
             , NameTable_(std::move(nameTable))
             , HunkMemoryPool_(memoryPool)
             , Modifications_(std::move(modifications))
@@ -751,8 +870,9 @@ private:
             const auto& primarySchemaWithTabletIndex = tableInfo->Schemas[ETableSchemaKind::PrimaryWithTabletIndex];
             const auto& primaryWithTabletIndexIdMapping = GetColumnIdMapping(transaction, tableInfo, ETableSchemaKind::PrimaryWithTabletIndex);
 
-            const auto& writeSchema = tableInfo->Schemas[ETableSchemaKind::Write];
-            const auto& writeIdMapping = GetColumnIdMapping(transaction, tableInfo, ETableSchemaKind::Write);
+            auto writeSchemaKind = Options_.WriteViaQueueProducer ? ETableSchemaKind::WriteViaQueueProducer : ETableSchemaKind::Write;
+            const auto& writeSchema = tableInfo->Schemas[writeSchemaKind];
+            const auto& writeIdMapping = GetColumnIdMapping(transaction, tableInfo, writeSchemaKind);
 
             const auto& versionedWriteSchema = tableInfo->Schemas[ETableSchemaKind::VersionedWrite];
             const auto& versionedWriteIdMapping = GetColumnIdMapping(transaction, tableInfo, ETableSchemaKind::VersionedWrite);
@@ -870,8 +990,6 @@ private:
 
             const auto& rowBuffer = transaction->RowBuffer_;
 
-            std::vector<bool> columnPresenceBuffer(modificationSchema->GetColumnCount());
-
             ModificationsData_.resize(Modifications_.size());
             for (int modificationIndex = 0; modificationIndex < std::ssize(Modifications_); ++modificationIndex) {
                 const auto& modification = Modifications_[modificationIndex];
@@ -885,7 +1003,7 @@ private:
                             *modificationSchema,
                             modificationSchema->GetKeyColumnCount(),
                             modificationIdMapping,
-                            modification.Type == ERowModificationType::Write ? &columnPresenceBuffer : nullptr);
+                            /*validateDuplicateAndRequiredValueColumns*/ modification.Type == ERowModificationType::Write);
 
                         if (tableInfo->HunkStorageId) {
                             auto rowPayloads = ExtractHunks(modificationsData.CapturedRow, modificationSchema);
@@ -976,8 +1094,6 @@ private:
                 return;
             }
 
-            ProcessSecondaryIndices(tableInfo, transaction);
-
             std::optional<int> tabletIndexColumnId;
             if (!tableInfo->IsSorted()) {
                 tabletIndexColumnId = NameTable_->GetIdOrRegisterName(TabletIndexColumnName);
@@ -996,8 +1112,6 @@ private:
             auto evaluator = tableInfo->NeedKeyEvaluation ? evaluatorCache->Find(primarySchema) : nullptr;
 
             auto randomTabletInfo = tableInfo->GetRandomMountedTablet();
-
-            std::vector<bool> columnPresenceBuffer(modificationSchema->GetColumnCount());
 
             std::vector<int> columnIndexToLockIndex;
             GetLocksMapping(
@@ -1113,7 +1227,7 @@ private:
                                 TVersionedRow(modification.Row),
                                 *primarySchema,
                                 primaryIdMapping,
-                                &columnPresenceBuffer,
+                                /*validateDuplicateAndRequiredValueColumns*/ true,
                                 Options_.AllowMissingKeyColumns);
                             if (evaluator) {
                                 evaluator->EvaluateKeys(capturedRow, rowBuffer);
@@ -1126,7 +1240,7 @@ private:
                                 *primarySchema,
                                 primarySchema->GetKeyColumnCount(),
                                 primaryIdMapping,
-                                &columnPresenceBuffer);
+                                /*validateDuplicateAndRequiredValueColumns*/ true);
                             row = capturedRow.ToTypeErasedRow();
                             tabletInfo = GetOrderedTabletForRow(
                                 tableInfo,
@@ -1198,64 +1312,14 @@ private:
         {
             return transaction->GetColumnIdMapping(tableInfo, NameTable_, kind, Options_.AllowMissingKeyColumns);
         }
-
-        void ProcessSecondaryIndices(TTableMountInfoPtr tableInfo, TTransactionPtr transaction)
-        {
-            if (tableInfo->Indices.empty()) {
-                return;
-            }
-
-            int indexTableCount = tableInfo->Indices.size();
-            std::vector<TFuture<TTableMountInfoPtr>> indexTableInfoFutures;
-            indexTableInfoFutures.reserve(indexTableCount);
-            for (const auto& indexInfo : tableInfo->Indices) {
-                indexTableInfoFutures.push_back(Connection_
-                    ->GetTableMountCache()
-                    ->GetTableInfo(FromObjectId(indexInfo.TableId)));
-            }
-
-            auto indexTableInfos = WaitForUnique(AllSucceeded(indexTableInfoFutures))
-                .ValueOrThrow();
-            auto secondaryIndexModifier = TSecondaryIndexModifier(
-                tableInfo->Schemas[ETableSchemaKind::Write],
-                NameTable_,
-                Modifications_,
-                tableInfo,
-                std::move(indexTableInfos),
-                Logger);
-
-            auto lookupKeys = secondaryIndexModifier.GetLookupKeys();
-
-            TLookupRowsOptions options;
-            options.ColumnFilter = TColumnFilter(secondaryIndexModifier.GetPositionToTableIdMapping());
-            auto lookupRows = WaitForUnique(transaction->LookupRows(
-                Path_,
-                NameTable_,
-                MakeSharedRange(std::move(lookupKeys)),
-                options))
-                .ValueOrThrow().Rowset->GetRows();
-
-            secondaryIndexModifier.SetInitialAndResultingRows(std::move(lookupRows));
-
-            auto modifyRowsOptions = Options_;
-            modifyRowsOptions.SequenceNumber.reset();
-
-            for (int index = 0; index < indexTableCount; ++index) {
-                transaction->EnqueueModificationRequest(std::make_unique<TModificationRequest>(
-                    transaction.Get(),
-                    Connection_,
-                    FromObjectId(tableInfo->Indices[index].TableId),
-                    NameTable_,
-                    HunkMemoryPool_,
-                    secondaryIndexModifier.ProduceModificationsForIndex(index),
-                    modifyRowsOptions));
-            }
-        }
     };
 
     std::vector<std::unique_ptr<TModificationRequest>> Requests_;
     std::vector<TModificationRequest*> PendingRequests_;
     TMultiSlidingWindow<TModificationRequest*> OrderedRequestsSlidingWindow_;
+    bool SecondaryIndicesProcessed_ = false;
+
+    THashMap<std::tuple<TRichYPath, TRichYPath, TString>, int> QueueProducerSessionToSequenceNumber_;
 
     struct TSyncReplica
     {
@@ -1276,7 +1340,7 @@ private:
             : Transaction_(transaction)
             , UpstreamReplicaId_(upstreamReplicaId)
             , ReplicationCard_(std::move(replicationCard))
-            , Logger(transaction->Logger.WithTag("Path: %v", path))
+            , Logger(transaction->Logger().WithTag("Path: %v", path))
         {
             const auto& tableMountCache = transaction->Client_->GetTableMountCache();
             auto tableInfoFuture = tableMountCache->GetTableInfo(path);
@@ -1822,12 +1886,101 @@ private:
         return DoPrepareRequests();
     }
 
+    void PrepareRequestsForTablesWithIndices()
+    {
+        SecondaryIndicesProcessed_ = true;
+
+        const auto& connection = Client_->GetNativeConnection();
+        THashMap<TTableId, std::vector<TUnversionedSubmittedRow>> mergedRowsByTable;
+        THashMap<TTableId, TTableMountInfoPtr> mountInfosByTable;
+        std::vector<TSharedRange<TUnversionedSubmittedRow>> holders;
+
+        for (const auto& [tabletId, tabletSession] : TabletIdToSession_) {
+            auto tableMountInfo = tabletSession->GetTableMountInfo();
+            if (tableMountInfo->Indices.empty()) {
+                continue;
+            }
+
+            auto tableId = tableMountInfo->TableId;
+            auto sessionMergedRows = tabletSession->PrepareRequests();
+            auto& tableMergedRows = mergedRowsByTable[tableId];
+            mountInfosByTable.insert({tableId, std::move(tableMountInfo)});
+
+            tableMergedRows.insert(tableMergedRows.end(), sessionMergedRows.begin(), sessionMergedRows.end());
+            holders.push_back(std::move(sessionMergedRows));
+        }
+
+        if (mergedRowsByTable.empty()) {
+            return;
+        }
+
+        std::vector<std::unique_ptr<TSecondaryIndexModifier>> indexModifiers;
+        std::vector<TFuture<void>> lookupRowsEvents;
+
+        for (auto& [tableId, mergedRows] : mergedRowsByTable) {
+            const auto& mountInfo = GetOrCrash(mountInfosByTable, tableId);
+
+            std::vector<TFuture<TTableMountInfoPtr>> indexTableInfoFutures;
+            indexTableInfoFutures.reserve(mountInfo->Indices.size());
+            for (const auto& indexInfo : mountInfo->Indices) {
+                indexTableInfoFutures.push_back(Client_
+                    ->GetNativeConnection()
+                    ->GetTableMountCache()
+                    ->GetTableInfo(FromObjectId(indexInfo.TableId)));
+            }
+
+            auto indexTableInfos = WaitForUnique(AllSucceeded(indexTableInfoFutures))
+                .ValueOrThrow();
+            auto indexModifier = std::make_unique<TSecondaryIndexModifier>(
+                mountInfo,
+                std::move(indexTableInfos),
+                mergedRows,
+                connection->GetExpressionEvaluatorCache(),
+                Logger);
+
+            lookupRowsEvents.push_back(indexModifier->LookupRows(this));
+            indexModifiers.push_back(std::move(indexModifier));
+        }
+
+        WaitFor(AllSucceeded(std::move(lookupRowsEvents)))
+            .ThrowOnError();
+
+        for (const auto& modifier : indexModifiers) {
+            TModifyRowsOptions modifyRowsOptions{
+                .RequireSyncReplica=false,
+                .AllowMissingKeyColumns=true,
+            };
+
+            modifier->OnIndexModifications([&] (
+                TYPath path,
+                TNameTablePtr nameTable,
+                TSharedRange<TRowModification> modifications)
+            {
+                EnqueueModificationRequest(std::make_unique<TModificationRequest>(
+                    this,
+                    connection,
+                    std::move(path),
+                    std::move(nameTable),
+                    &HunkMemoryPool_,
+                    std::move(modifications),
+                    modifyRowsOptions));
+            });
+        }
+
+    }
+
     TFuture<void> DoPrepareRequests()
     {
         // Tables with local sync replicas pose a problem since modifications in such tables
         // induce more modifications that need to be taken care of.
         // Here we iterate over requests and sessions until no more new items are added.
-        if (!PendingRequests_.empty() || !PendingSessions_.empty()) {
+        auto pending = !PendingRequests_.empty() || !PendingSessions_.empty();
+        if (pending || !SecondaryIndicesProcessed_) {
+            if (!pending) {
+                PrepareRequestsForTablesWithIndices();
+                return DoPrepareRequests();
+            }
+
             decltype(PendingRequests_) pendingRequests;
             std::swap(PendingRequests_, pendingRequests);
 

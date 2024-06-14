@@ -1,5 +1,4 @@
 #include "config.h"
-#include "helpers.h"
 #include "job_resources.h"
 
 #include "yt/yt/core/misc/error.h"
@@ -202,6 +201,9 @@ void TJobIOConfig::Register(TRegistrar registrar)
         .Default()
         .GreaterThan(0);
 
+    registrar.Parameter("use_delivery_fenced_pipe_writer", &TThis::UseDeliveryFencedPipeWriter)
+        .Default(false);
+
     registrar.Parameter("pipe_io_pool_size", &TThis::PipeIOPoolSize)
         .Default(1)
         .GreaterThan(0);
@@ -350,12 +352,20 @@ void TAutoMergeConfig::Register(TRegistrar registrar)
         .Default(false);
     registrar.Parameter("shallow_merge_min_data_weight_per_chunk", &TThis::ShallowMergeMinDataWeightPerChunk)
         .Default(64_KB);
+    registrar.Parameter("single_chunk_teleport_strategy", &TThis::SingleChunkTeleportStrategy)
+        .Default(ESingleChunkTeleportStrategy::Disabled);
 
     registrar.Preprocessor([] (TAutoMergeConfig* config) {
         config->JobIO->TableWriter->DesiredChunkWeight = 8_GB;
     });
 
     registrar.Postprocessor([] (TAutoMergeConfig* config) {
+        if (config->JobIO->TableWriter->DesiredChunkWeight < config->ChunkSizeThreshold) {
+            THROW_ERROR_EXCEPTION("Desired chunk weight cannot be less than chunk size threshold")
+                << TErrorAttribute("chunk_size_threshold", config->ChunkSizeThreshold)
+                << TErrorAttribute("desired_chunk_weight", config->JobIO->TableWriter->DesiredChunkWeight);
+        }
+
         if (config->Mode == EAutoMergeMode::Manual) {
             if (!config->MaxIntermediateChunkCount || !config->ChunkCountPerMergeJob) {
                 THROW_ERROR_EXCEPTION(
@@ -497,10 +507,12 @@ void TUserJobMonitoringConfig::Register(TRegistrar registrar)
 const std::vector<TString>& TUserJobMonitoringConfig::GetDefaultSensorNames()
 {
     static const std::vector<TString> DefaultSensorNames = {
+        "cpu/burst",
         "cpu/user",
         "cpu/system",
         "cpu/wait",
         "cpu/throttled",
+        "cpu/cfs_throttled",
         "cpu/context_switches",
         "current_memory/rss",
         "current_memory/mapped_file",
@@ -715,6 +727,8 @@ void TOperationSpecBase::Register(TRegistrar registrar)
 
     registrar.Parameter("use_columnar_statistics", &TThis::UseColumnarStatistics)
         .Default(false);
+    registrar.Parameter("use_chunk_slice_statistics", &TThis::UseChunkSliceStatistics)
+        .Default(false);
 
     registrar.Parameter("ban_nodes_with_failed_jobs", &TThis::BanNodesWithFailedJobs)
         .Default(false);
@@ -787,6 +801,12 @@ void TOperationSpecBase::Register(TRegistrar registrar)
     registrar.Parameter("enable_prefetching_job_throttler", &TThis::EnablePrefetchingJobThrottler)
         .Default(false);
 
+    registrar.Parameter("read_via_exec_node", &TThis::ReadViaExecNode)
+        .Default(false);
+
+    registrar.Parameter("enable_codegen_comparator", &TThis::EnableCodegenComparator)
+        .Default(false);
+
     registrar.Parameter("chunk_availability_policy", &TThis::ChunkAvailabilityPolicy)
         .Default(NChunkClient::EChunkAvailabilityPolicy::DataPartsAvailable);
 
@@ -804,6 +824,9 @@ void TOperationSpecBase::Register(TRegistrar registrar)
 
     registrar.Parameter("adjust_dynamic_table_data_slices", &TThis::AdjustDynamicTableDataSlices)
         .Default(false);
+
+    registrar.Parameter("batch_row_count", &TThis::BatchRowCount)
+        .Default();
 
     registrar.Parameter("bypass_hunk_remote_copy_prohibition", &TThis::BypassHunkRemoteCopyProhibition)
         .Default();
@@ -857,6 +880,11 @@ void TOperationSpecBase::Register(TRegistrar registrar)
         if (spec->UseColumnarStatistics) {
             spec->InputTableColumnarStatistics->Enabled = true;
             spec->UserFileColumnarStatistics->Enabled = true;
+        }
+
+        if (spec->BatchRowCount) {
+            THROW_ERROR_EXCEPTION_IF(*spec->BatchRowCount <= 0, "Value of \"batch_row_count\" of must be positive");
+            THROW_ERROR_EXCEPTION_IF(spec->Sampling && spec->Sampling->SamplingRate, "Option \"batch_row_count\" cannot be used with input sampling");
         }
     });
 }
@@ -1036,6 +1064,8 @@ void TUserJobSpec::Register(TRegistrar registrar)
         .Default(true);
     registrar.Parameter("make_rootfs_writable", &TThis::MakeRootFSWritable)
         .Default(false);
+    registrar.Parameter("enable_fuse", &TThis::EnableFuse)
+        .Default(false);
     registrar.Parameter("use_smaps_memory_tracker", &TThis::UseSMapsMemoryTracker)
         .Default(false);
     registrar.Parameter("monitoring", &TThis::Monitoring)
@@ -1058,6 +1088,12 @@ void TUserJobSpec::Register(TRegistrar registrar)
     registrar.Parameter("rpc_proxy_worker_thread_pool_size", &TThis::RpcProxyWorkerThreadPoolSize)
         .Default(1)
         .GreaterThan(0);
+
+    registrar.Parameter("fail_on_job_restart", &TThis::FailOnJobRestart)
+        .Default(false);
+
+    registrar.Parameter("extra_environment", &TThis::ExtraEnvironment)
+        .Default();
 
     registrar.Postprocessor([] (TUserJobSpec* spec) {
         if ((spec->TmpfsSize || spec->TmpfsPath) && !spec->TmpfsVolumes.empty()) {
@@ -1119,12 +1155,10 @@ void TUserJobSpec::Register(TRegistrar registrar)
         auto memoryDigestLowerLimit = static_cast<double>(totalTmpfsSize) / spec->MemoryLimit;
         spec->UserJobMemoryDigestDefaultValue = std::min(
             1.0,
-            std::max(spec->UserJobMemoryDigestDefaultValue, memoryDigestLowerLimit)
-        );
+            std::max(spec->UserJobMemoryDigestDefaultValue, memoryDigestLowerLimit));
         spec->UserJobMemoryDigestLowerBound = std::min(
             1.0,
-            std::max(spec->UserJobMemoryDigestLowerBound, memoryDigestLowerLimit)
-        );
+            std::max(spec->UserJobMemoryDigestLowerBound, memoryDigestLowerLimit));
         spec->UserJobMemoryDigestDefaultValue = std::max(spec->UserJobMemoryDigestLowerBound, spec->UserJobMemoryDigestDefaultValue);
 
         for (const auto& [variableName, _] : spec->Environment) {
@@ -1292,6 +1326,8 @@ void TSimpleOperationSpecBase::Register(TRegistrar registrar)
         .Default()
         .GreaterThan(0);
     registrar.Parameter("force_job_size_adjuster", &TThis::ForceJobSizeAdjuster)
+        .Default(false);
+    registrar.Parameter("force_allow_job_interruption", &TThis::ForceAllowJobInterruption)
         .Default(false);
     registrar.Parameter("locality_timeout", &TThis::LocalityTimeout)
         .Default(TDuration::Seconds(5));
@@ -1740,9 +1776,10 @@ void TMapReduceOperationSpec::Register(TRegistrar registrar)
         }
 
         if (spec->HasNontrivialMapper()) {
-            for (const auto& stream : spec->Mapper->OutputStreams) {
+            for (int i = 0; i < std::ssize(spec->Mapper->OutputStreams) - spec->MapperOutputTableCount; ++i) {
+                const auto& stream = spec->Mapper->OutputStreams[i];
                 if (stream->Schema->GetSortColumns() != spec->SortBy) {
-                    THROW_ERROR_EXCEPTION("Schemas of mapper output streams should have exactly "
+                    THROW_ERROR_EXCEPTION("Schemas of mapper output streams should have exactly the same "
                         "\"sort_by\" sort column prefix")
                         << TErrorAttribute("violating_schema", stream->Schema)
                         << TErrorAttribute("sort_by", spec->SortBy);
@@ -1877,8 +1914,6 @@ void TRemoteCopyOperationSpec::Register(TRegistrar registrar)
         .Default(false);
     registrar.Parameter("use_remote_master_caches", &TThis::UseRemoteMasterCaches)
         .Default(false);
-    registrar.Parameter("restrict_destination_ypath_attributes", &TThis::RestrictDestinationYPathAttributes)
-        .Default(false);
 
     registrar.Preprocessor([] (TRemoteCopyOperationSpec* spec) {
         // NB: in remote copy operation chunks are never decompressed,
@@ -1904,6 +1939,11 @@ void TRemoteCopyOperationSpec::Register(TRegistrar registrar)
 
         if (spec->Sampling && spec->Sampling->SamplingRate) {
             THROW_ERROR_EXCEPTION("You do not want sampling in remote copy operation :)");
+        }
+
+        if (spec->RepairErasureChunks) {
+            // If we are OK with repairing chunks, we are OK with repairing chunks from parity parts.
+            spec->ChunkAvailabilityPolicy = NChunkClient::EChunkAvailabilityPolicy::Repairable;
         }
     });
 }
@@ -1979,12 +2019,6 @@ TJobResourcesConfigPtr TJobResourcesConfig::operator-()
 
 void TCommonPreemptionConfig::Register(TRegistrar registrar)
 {
-    registrar.Parameter("enable_aggressive_starvation", &TThis::EnableAggressiveStarvation)
-        .Default();
-}
-
-void TPoolPreemptionConfig::Register(TRegistrar registrar)
-{
     registrar.Parameter("fair_share_starvation_timeout", &TThis::FairShareStarvationTimeout)
         .Alias("fair_share_preemption_timeout")
         .Default();
@@ -1992,6 +2026,14 @@ void TPoolPreemptionConfig::Register(TRegistrar registrar)
         .InRange(0.0, 1.0)
         .Default();
 
+    registrar.Parameter("non_preemptible_resource_usage_threshold", &TThis::NonPreemptibleResourceUsageThreshold)
+        .Default();
+}
+
+void TPoolPreemptionConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("enable_aggressive_starvation", &TThis::EnableAggressiveStarvation)
+        .Default();
     registrar.Parameter("allow_aggressive_preemption", &TThis::AllowAggressivePreemption)
         .Alias("allow_aggressive_starvation_preemption")
         .Default();
@@ -2009,6 +2051,9 @@ void TPoolPresetConfig::Register(TRegistrar registrar)
     registrar.Parameter("allow_regular_allocations_on_ssd_nodes", &TThis::AllowRegularAllocationsOnSsdNodes)
         .Alias("allow_regular_jobs_on_ssd_nodes")
         .Default(true);
+
+    registrar.Parameter("enable_lightweight_operations", &TThis::EnableLightweightOperations)
+        .Default(false);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2141,6 +2186,9 @@ void TPoolConfig::Register(TRegistrar registrar)
     registrar.Parameter("enable_detailed_logs", &TThis::EnableDetailedLogs)
         .Default(false);
 
+    registrar.Parameter("config_presets", &TThis::ConfigPresets)
+        .Default();
+
     registrar.Parameter("config_preset", &TThis::ConfigPreset)
         .Default();
 
@@ -2152,9 +2200,6 @@ void TPoolConfig::Register(TRegistrar registrar)
         .Default();
 
     registrar.Parameter("offloading_settings", &TThis::OffloadingSettings)
-        .Default();
-
-    registrar.Parameter("non_preemptible_resource_usage_threshold", &TThis::NonPreemptibleResourceUsageThreshold)
         .Default();
 
     registrar.Parameter("use_pool_satisfaction_for_scheduling", &TThis::UsePoolSatisfactionForScheduling)
@@ -2169,16 +2214,20 @@ void TPoolConfig::Register(TRegistrar registrar)
     registrar.Parameter("enable_priority_scheduling_segment_module_assignment", &TThis::EnablePrioritySchedulingSegmentModuleAssignment)
         .Default();
 
-    registrar.Parameter("enable_lightweight_operations", &TThis::EnableLightweightOperations)
-        .Default(false);
-
-    // COMPAT(arkady-e1ppa)
     registrar.Postprocessor([] (TThis* config) {
+        // COMPAT(arkady-e1ppa)
         if (config->InferChildrenWeightsFromHistoricUsage) {
             config->HistoricUsageAggregationPeriod =
                 config->HistoricUsageAggregationPeriod.value_or(TAdjustedExponentialMovingAverage::DefaultHalflife);
         } else {
             config->HistoricUsageAggregationPeriod.reset();
+        }
+
+        // COMPAT(omgronny)
+        if (config->ConfigPreset && !config->ConfigPresets.empty()) {
+            THROW_ERROR_EXCEPTION("Cannot specify both %Qv and %Qv at the same time",
+                "config_preset",
+                "config_presets");
         }
     });
 }
@@ -2334,6 +2383,24 @@ void TStrategyOperationSpec::Register(TRegistrar registrar)
             THROW_ERROR_EXCEPTION("%Qv option cannot be used without %Qv",
                 "consider_guarantees_for_single_tree",
                 "schedule_in_single_tree");
+        }
+
+        // COMPAT(eshcherbin)
+        if (spec->MaxUnpreemptibleRunningAllocationCount) {
+            if (*spec->MaxUnpreemptibleRunningAllocationCount != 0) {
+                THROW_ERROR_EXCEPTION("%Qv, %Qv or %Qv cannot be set to a non-zero value, use %Qv instead",
+                    "max_unpreemptible_allocation_count",
+                    "max_unpreemptible_job_count",
+                    "max_unpreemptable_job_count",
+                    "non_preemptible_resource_usage_threshold");
+            }
+
+            if (!spec->NonPreemptibleResourceUsageThreshold) {
+                spec->NonPreemptibleResourceUsageThreshold = New<TJobResourcesConfig>();
+            }
+            if (!spec->NonPreemptibleResourceUsageThreshold->UserSlots) {
+                spec->NonPreemptibleResourceUsageThreshold->UserSlots = *spec->MaxUnpreemptibleRunningAllocationCount;
+            }
         }
     });
 }

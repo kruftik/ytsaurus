@@ -94,6 +94,10 @@ public:
     //! Configuration for various per-location throttlers.
     TEnumIndexedArray<EChunkLocationThrottlerKind, NConcurrency::TThroughputThrottlerConfigPtr> Throttlers;
 
+    //! Configuration for uncategorized throttler.
+    bool EnableUncategorizedThrottler;
+    NConcurrency::TThroughputThrottlerConfigPtr UncategorizedThrottler;
+
     //! IO engine type.
     NIO::EIOEngineType IOEngineType;
 
@@ -111,6 +115,21 @@ public:
     double IOWeight;
 
     bool ResetUuid;
+
+    //! Limit on the maximum memory used of location reads.
+    i64 ReadMemoryLimit;
+
+    //! Limit on the maximum memory used of location writes.
+    i64 WriteMemoryLimit;
+
+    //! Limit on the maximum IO in bytes used of location reads.
+    i64 PendingReadIOLimit;
+
+    //! Limit on the maximum IO in bytes used of location writes.
+    i64 PendingWriteIOLimit;
+
+    //! Limit on the maximum count of location write sessions.
+    i64 SessionCountLimit;
 
     void ApplyDynamicInplace(const TChunkLocationDynamicConfig& dynamicConfig);
 
@@ -133,7 +152,25 @@ public:
     TEnumIndexedArray<EChunkLocationThrottlerKind, NConcurrency::TThroughputThrottlerConfigPtr> Throttlers;
     std::optional<TDuration> ThrottleDuration;
 
+    std::optional<bool> EnableUncategorizedThrottler;
+    NConcurrency::TThroughputThrottlerConfigPtr UncategorizedThrottler;
+
     std::optional<i64> CoalescedReadMaxGapSize;
+
+    //! Limit on the maximum memory used by location reads.
+    std::optional<i64> ReadMemoryLimit;
+
+    //! Limit on the maximum memory used by location writes.
+    std::optional<i64> WriteMemoryLimit;
+
+    //! Limit on the maximum IO in bytes used by location reads.
+    std::optional<i64> PendingReadIOLimit;
+
+    //! Limit on the maximum IO in bytes used by location writes.
+    std::optional<i64> PendingWriteIOLimit;
+
+    //! Limit on the maximum count of location write sessions.
+    std::optional<i64> SessionCountLimit;
 
     REGISTER_YSON_STRUCT(TChunkLocationDynamicConfig);
 
@@ -300,6 +337,8 @@ public:
 
     bool LocationIsAbsolute;
 
+    bool ResidesOnTmpfs;
+
     REGISTER_YSON_STRUCT(TLayerLocationConfig);
 
     static void Register(TRegistrar registrar);
@@ -367,6 +406,7 @@ public:
     double CacheCapacityFraction;
     int LayerImportConcurrency;
 
+    //! Enforce disk space limits for porto volumes.
     bool EnableDiskQuota;
 
     TTmpfsLayerCacheConfigPtr RegularTmpfsLayerCache;
@@ -437,6 +477,9 @@ public:
 
     //! Enable detailed incremental heartbeat statistics profiling.
     bool EnableProfiling;
+
+    //! Test location disable during full heartbeat, contains location uuid.
+    std::optional<TChunkLocationUuid> LocationUuidToDisableDuringFullHeartbeat;
 
     REGISTER_YSON_STRUCT(TMasterConnectorDynamicConfig);
 
@@ -1008,8 +1051,6 @@ public:
 
     //! If |true|, node will abort when location becomes disabled.
     bool AbortOnLocationDisabled;
-
-    bool TrackMemoryAfterSessionCompletion;
 
     bool TrackSystemJobsMemory;
 

@@ -97,7 +97,15 @@ class TCommonPreemptionConfig
     : public virtual NYTree::TYsonStruct
 {
 public:
-    std::optional<bool> EnableAggressiveStarvation;
+    // The following options are applied recursively, i.e. the effective value for an element
+    // is taken from the configuration of the nearest ancestor (incl. the element itself)
+    // that has the option explicitly specified.
+    // However, if an explicit value is specified for an operation, it cannot overwrite its
+    // parent's effective value unless the operation's value is more conservative (e.g. longer timeout).
+    std::optional<double> FairShareStarvationTolerance;
+    std::optional<TDuration> FairShareStarvationTimeout;
+
+    TJobResourcesConfigPtr NonPreemptibleResourceUsageThreshold;
 
     REGISTER_YSON_STRUCT(TCommonPreemptionConfig);
 
@@ -108,10 +116,7 @@ class TPoolPreemptionConfig
     : public TCommonPreemptionConfig
 {
 public:
-    // The following settings override scheduler configuration is specified.
-    std::optional<TDuration> FairShareStarvationTimeout;
-    std::optional<double> FairShareStarvationTolerance;
-
+    std::optional<bool> EnableAggressiveStarvation;
     std::optional<bool> AllowAggressivePreemption;
 
     // NB(eshcherbin): Intended for testing purposes only.
@@ -131,7 +136,7 @@ class TOffloadingPoolSettingsConfig
     : public NYTree::TYsonStruct
 {
 public:
-    TString Pool;
+    std::optional<TString> Pool;
 
     std::optional<double> Weight;
 
@@ -243,6 +248,8 @@ class TPoolPresetConfig
 public:
     bool AllowRegularAllocationsOnSsdNodes;
 
+    bool EnableLightweightOperations;
+
     REGISTER_YSON_STRUCT(TPoolPresetConfig);
 
     static void Register(TRegistrar registrar);
@@ -285,6 +292,8 @@ public:
 
     bool EnableDetailedLogs;
 
+    std::vector<TString> ConfigPresets;
+    // COMPAT(omgronny)
     std::optional<TString> ConfigPreset;
 
     // Overrides the same option in tree config.
@@ -294,8 +303,6 @@ public:
 
     TOffloadingSettings OffloadingSettings;
 
-    TJobResourcesConfigPtr NonPreemptibleResourceUsageThreshold;
-
     std::optional<bool> UsePoolSatisfactionForScheduling;
 
     std::optional<bool> AllowIdleCpuPolicy;
@@ -303,8 +310,6 @@ public:
     bool ComputePromisedGuaranteeFairShare;
 
     std::optional<bool> EnablePrioritySchedulingSegmentModuleAssignment;
-
-    bool EnableLightweightOperations;
 
     void Validate(const TString& poolName);
 
@@ -450,6 +455,7 @@ public:
 
     std::optional<TString> CustomProfilingTag;
 
+    // COMPAT(eshcherbin)
     std::optional<int> MaxUnpreemptibleRunningAllocationCount;
 
     bool TryAvoidDuplicatingJobs;
@@ -503,6 +509,7 @@ public:
 
     i64 BufferRowCount;
     std::optional<int> PipeCapacity;
+    bool UseDeliveryFencedPipeWriter;
 
     int PipeIOPoolSize;
 
@@ -665,6 +672,11 @@ DEFINE_REFCOUNTED_TYPE(TJobSplitterConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+DEFINE_ENUM(ESingleChunkTeleportStrategy,
+    (Disabled)
+    (Enabled)
+);
+
 class TAutoMergeConfig
     : public NYTree::TYsonStruct
 {
@@ -694,6 +706,8 @@ public:
     //! Minimum data weight per chunk for shallow merge job. Useful only when EnableShallowMerge
     //! is set to true.
     i64 ShallowMergeMinDataWeightPerChunk;
+
+    ESingleChunkTeleportStrategy SingleChunkTeleportStrategy;
 
     REGISTER_YSON_STRUCT(TAutoMergeConfig);
 
@@ -727,8 +741,12 @@ class TDiskRequestConfig
     : public NYTree::TYsonStruct
 {
 public:
+    //! Required disk space in bytes, may be enforced as a limit.
     i64 DiskSpace;
+
+    //! Limit for disk inodes.
     std::optional<i64> InodeCount;
+
     std::optional<TString> MediumName;
     std::optional<int> MediumIndex;
     std::optional<TString> Account;
@@ -1012,6 +1030,11 @@ public:
     //! Note that turning this on may significantly affect workload partitioning for existing operations.
     bool UseColumnarStatistics;
 
+    //! If true, enables more accurate job size estimation for operations on tables with key bounds.
+    //! This is achieved by computing more precise data weights for slices with non-trivial limits based on data node block key bounds.
+    //! Note that turning this on might significantly affect workload partitioning for existing operations.
+    bool UseChunkSliceStatistics;
+
     //! If true, node is banned each time a job is failed there.
     bool BanNodesWithFailedJobs;
 
@@ -1085,6 +1108,10 @@ public:
     //! This option is not expected to be set by users manually.
     bool EnablePrefetchingJobThrottler;
 
+    //! Enable code generated comparator.
+    //! Currently used by simple sort job and partition sort job.
+    bool EnableCodegenComparator;
+
     NChunkClient::EChunkAvailabilityPolicy ChunkAvailabilityPolicy;
 
     //! Delay for performing sanity checks for operations (useful in tests).
@@ -1101,12 +1128,20 @@ public:
 
     bool AdjustDynamicTableDataSlices;
 
+    //! If set, the operation tries to run jobs with row counts divisible by this number.
+    //! Generic, but only supported by operations for which you can specify ordered=%true (Map, Merge, MapReduce, Erase).
+    //! NB: Disables job interrupts and chunk teleportation. Cannot be used together with input sampling.
+    std::optional<i64> BatchRowCount;
+
     //! If explicitly true, allow remote copy of tables with hunk columns.
     std::optional<bool> BypassHunkRemoteCopyProhibition;
 
     //! Options for cuda profiler.
     std::optional<TString> CudaProfilerLayerPath;
     TCudaProfilerEnvironmentPtr CudaProfilerEnvironment;
+
+    //! Read input tables via exec node.
+    bool ReadViaExecNode;
 
     REGISTER_YSON_STRUCT(TOperationSpecBase);
 
@@ -1247,6 +1282,9 @@ public:
     //! If true, RootFS in user job is writable.
     bool MakeRootFSWritable;
 
+    //! Enable mount of fuse device to user job container.
+    bool EnableFuse;
+
     //! If true, job proxy looks through all the user job allocations
     //! via reading /proc/$PID/smaps and checks, whether they belong to
     //! file in tmpfs. This allows not to account memory for mapped files
@@ -1268,6 +1306,10 @@ public:
 
     bool EnableRpcProxyInJobProxy;
     int RpcProxyWorkerThreadPoolSize;
+
+    bool FailOnJobRestart;
+
+    THashSet<EExtraEnvironment> ExtraEnvironment;
 
     void InitEnableInputTableIndex(int inputTableCount, TJobIOConfigPtr jobIOConfig);
 
@@ -1400,6 +1442,7 @@ public:
     std::optional<int> MaxDataSlicesPerJob;
 
     bool ForceJobSizeAdjuster;
+    bool ForceAllowJobInterruption;
 
     TDuration LocalityTimeout;
     TJobIOConfigPtr JobIO;
@@ -1840,8 +1883,6 @@ public:
     //! If true, jobs will never open a channel to masters and will always use
     //! remote master caches.
     bool UseRemoteMasterCaches;
-
-    bool RestrictDestinationYPathAttributes;
 
     REGISTER_YSON_STRUCT(TRemoteCopyOperationSpec);
 

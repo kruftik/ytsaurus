@@ -56,10 +56,16 @@ bool IsTableMovable(TTableId tableId)
 }
 
 TParameterizedReassignSolverConfig TParameterizedReassignSolverConfig::MergeWith(
-    const TParameterizedBalancingConfigPtr& groupConfig) const
+    const TParameterizedBalancingConfigPtr& groupConfig,
+    std::optional<int> maxMoveActionHardLimit) const
 {
+    auto maxMoveActionCount = groupConfig->MaxActionCount.value_or(MaxMoveActionCount);
+    if (maxMoveActionHardLimit) {
+        maxMoveActionCount = std::min(maxMoveActionCount, *maxMoveActionHardLimit);
+    }
+
     return TParameterizedReassignSolverConfig{
-        .MaxMoveActionCount = groupConfig->MaxActionCount.value_or(MaxMoveActionCount),
+        .MaxMoveActionCount = maxMoveActionCount,
         .NodeDeviationThreshold = groupConfig->NodeDeviationThreshold.value_or(NodeDeviationThreshold),
         .CellDeviationThreshold = groupConfig->CellDeviationThreshold.value_or(CellDeviationThreshold),
         .MinRelativeMetricImprovement = groupConfig->MinRelativeMetricImprovement.value_or(
@@ -80,6 +86,26 @@ TParameterizedResharderConfig TParameterizedResharderConfig::MergeWith(
     };
 }
 
+void FormatValue(TStringBuilderBase* builder, const TParameterizedReassignSolverConfig& config, TStringBuf /*format*/)
+{
+    builder->AppendFormat(
+        "MaxMoveActionCount: %v, NodeDeviationThreshold: %v, CellDeviationThreshold: %v, "
+        "MinRelativeMetricImprovement: %v, Metric: %v",
+        config.MaxMoveActionCount,
+        config.NodeDeviationThreshold,
+        config.CellDeviationThreshold,
+        config.MinRelativeMetricImprovement,
+        config.Metric);
+}
+
+void FormatValue(TStringBuilderBase* builder, const TParameterizedResharderConfig& config, TStringBuf /*spec*/)
+{
+    builder->AppendFormat(
+        "EnableReshardByDefault: %v, Metric: %v",
+        config.EnableReshardByDefault,
+        config.Metric);
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 class TParameterizedMetricsCalculator
@@ -92,7 +118,7 @@ public:
     : PerformanceCountersKeys_(std::move(performanceCountersKeys))
     , PerformanceCountersTableSchema_(std::move(performanceCountersTableSchema))
     , Metric_(std::move(metric))
-    , Evaluator_(NOrm::NQuery::CreateExpressionEvaluator(
+    , Evaluator_(NOrm::NQuery::CreateOrmExpressionEvaluator(
         Metric_,
         ParameterizedBalancingAttributes))
     { }
@@ -194,12 +220,15 @@ private:
     THashMap<TNodeAddress, TNodeInfo> Nodes_;
 
     double CurrentMetric_;
+    double CellFactor_ = 1;
+    double NodeFactor_ = 1;
     TBestAction BestAction_;
     int LogMessageCount_ = 0;
 
     void Initialize();
 
     double CalculateTotalBundleMetric() const;
+    void CalculateModifyingFactors();
 
     bool TryMoveTablet(
         TTabletInfo* tablet,
@@ -242,6 +271,12 @@ void TParameterizedReassignSolver::Initialize()
 {
     auto cells = Bundle_->GetAliveCells();
 
+    if (cells.empty()) {
+        // Therefore nodes list will be empty and balancing will not be triggered
+        YT_LOG_WARNING("There is no alive cells");
+        return;
+    }
+
     THashMap<TTabletCellId, int> cellInfoIndex;
     Cells_.reserve(std::ssize(cells));
     for (const auto& cell : cells) {
@@ -250,8 +285,9 @@ void TParameterizedReassignSolver::Initialize()
         }).first->second;
 
         int cellIndex = std::ssize(Cells_);
+
         EmplaceOrCrash(cellInfoIndex, cell->Id, cellIndex);
-        auto* cellInfo = &Cells_.emplace_back(TTabletCellInfo{
+        Cells_.emplace_back(TTabletCellInfo{
             .Cell = cell,
             .Id = cell->Id,
             .Node = nodeInfo,
@@ -302,16 +338,16 @@ void TParameterizedReassignSolver::Initialize()
                 .Metric = tabletMetric,
                 .CellIndex = cellIndex
             });
-            cellInfo->Metric += tabletMetric;
         }
+    }
 
-        nodeInfo->Metric += cellInfo->Metric;
+    CalculateModifyingFactors();
 
-        YT_LOG_DEBUG_IF(
-            Bundle_->Config->EnableVerboseLogging,
-            "Calculated cell metric (CellId: %v, CellMetric: %v)",
-            cell->Id,
-            cellInfo->Metric);
+    for (const auto& tablet : Tablets_) {
+        const auto& nodeAdress = Cells_[tablet.CellIndex].Cell->NodeAddress.value();
+
+        Cells_[tablet.CellIndex].Metric += tablet.Metric * CellFactor_;
+        Nodes_[nodeAdress].Metric += tablet.Metric * NodeFactor_;
     }
 
     if (Bundle_->Config->EnableVerboseLogging) {
@@ -323,6 +359,7 @@ void TParameterizedReassignSolver::Initialize()
     }
 
     CurrentMetric_ = CalculateTotalBundleMetric();
+
     if (MetricTracker_) {
         MetricTracker_->BeforeMetric.Update(CurrentMetric_);
     }
@@ -465,6 +502,34 @@ double TParameterizedReassignSolver::CalculateTotalBundleMetric() const
     return cellMetric + nodeMetric;
 }
 
+void TParameterizedReassignSolver::CalculateModifyingFactors()
+{
+    YT_VERIFY(Cells_.size() > 0);
+    YT_VERIFY(Nodes_.size() > 0);
+
+    double cellCount = std::ssize(Cells_);
+    double nodeCount = std::ssize(Nodes_);
+
+    double totalMetric = std::accumulate(
+        Tablets_.begin(),
+        Tablets_.end(),
+        0.0,
+        [] (double x, const auto &item) {
+            return x + item.Metric;
+        });
+
+    CellFactor_ = cellCount / totalMetric;
+    NodeFactor_ = nodeCount / totalMetric;
+
+    //  Per-cell dispersion is less important than per-node so we decrease its absolute value
+    CellFactor_ *= nodeCount / cellCount;
+
+    YT_LOG_DEBUG(
+        "Calculated modifying factors (CellFactor: %v, NodeFactor: %v)",
+        CellFactor_,
+        NodeFactor_);
+}
+
 bool TParameterizedReassignSolver::CheckMoveFollowsMemoryLimits(
     const TTabletInfo* tablet,
     const TTabletCellInfo* sourceCell,
@@ -513,7 +578,10 @@ bool TParameterizedReassignSolver::TryMoveTablet(
 
     double newMetricDiff = 0;
     if (sourceNode != destinationNode) {
-        newMetricDiff += sourceNodeMetric - destinationNodeMetric - tablet->Metric;
+        newMetricDiff +=
+            (sourceNodeMetric - destinationNodeMetric -
+            tablet->Metric * NodeFactor_) *
+            NodeFactor_;
     } else {
         if (sourceCell->Metric < cell->Metric) {
             // Moving to larger cell on the same node will not make metric smaller.
@@ -522,7 +590,11 @@ bool TParameterizedReassignSolver::TryMoveTablet(
         }
     }
 
-    newMetricDiff += sourceCell->Metric - cell->Metric - tablet->Metric;
+    newMetricDiff +=
+        (sourceCell->Metric - cell->Metric -
+        tablet->Metric * CellFactor_) *
+        CellFactor_;
+
     newMetricDiff *= 2 * tablet->Metric;
 
     YT_LOG_DEBUG_IF(
@@ -546,13 +618,13 @@ bool TParameterizedReassignSolver::TryMoveTablet(
 
         BestAction_.Callback = [=, this] (int* availableActionCount) {
             tablet->CellIndex = cell->SortingIndex;
-            sourceCell->Metric -= tablet->Metric;
-            cell->Metric += tablet->Metric;
+            sourceCell->Metric -= tablet->Metric * CellFactor_;
+            cell->Metric += tablet->Metric * CellFactor_;
             *availableActionCount -= 1;
 
             if (sourceNode != destinationNode) {
-                sourceNode->Metric -= tablet->Metric;
-                destinationNode->Metric += tablet->Metric;
+                sourceNode->Metric -= tablet->Metric * NodeFactor_;
+                destinationNode->Metric += tablet->Metric * NodeFactor_;
             } else {
                 YT_LOG_WARNING("The best action is between cells on the same node "
                     "(Node: %v, TabletId: %v)",
@@ -588,7 +660,7 @@ bool TParameterizedReassignSolver::TryMoveTablet(
 
 void TParameterizedReassignSolver::SortCells()
 {
-    std::sort(Cells_.begin(), Cells_.end(), [&](const auto& lhs, const auto& rhs) {
+    std::sort(Cells_.begin(), Cells_.end(), [&] (const auto& lhs, const auto& rhs) {
         if (lhs.Node == rhs.Node) {
             return lhs.Metric < rhs.Metric;
         }
@@ -632,6 +704,9 @@ bool TParameterizedReassignSolver::TryFindBestAction()
 
 std::vector<TMoveDescriptor> TParameterizedReassignSolver::BuildActionDescriptors()
 {
+    YT_LOG_DEBUG("Reporting parameterized balancing config (Config: %v)",
+        Config_);
+
     Initialize();
 
     if (!ShouldTrigger()) {
@@ -818,7 +893,10 @@ TParameterizedResharder::TParameterizedResharder(
         .WithTag("Group: %v", groupName))
     , Config_(std::move(config))
     , GroupName_(std::move(groupName))
-{ }
+{
+    YT_LOG_DEBUG("Reporting parameterized resharder config (Config: %v)",
+        Config_);
+}
 
 void TParameterizedResharder::SortTabletActionsByUsefulness(std::vector<TReshardDescriptor>* actions) const
 {
@@ -1067,7 +1145,8 @@ std::optional<TReshardDescriptor> TParameterizedResharder::MergeTablets(
     YT_LOG_DEBUG("Merging tablets (Tablets: %v, TabletSize: %v, TabletMetric: %v, CorrelationId: %v)",
         tabletsToMerge,
         enlargedTabletSize,
-        enlargedTabletMetric);
+        enlargedTabletMetric,
+        correlationId);
 
     return TReshardDescriptor{
         .Tablets = std::move(tabletsToMerge),

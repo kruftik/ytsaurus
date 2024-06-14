@@ -63,7 +63,7 @@ using NChunkClient::NProto::TDataStatistics;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TableClientLogger;
+static constexpr auto& Logger = TableClientLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -230,11 +230,6 @@ void FormatValue(TStringBuilderBase* builder, const THunkChunkRef& ref, TStringB
     builder->AppendFormat("HunkCount: %v, TotalHunkLength: %v}",
         ref.HunkCount,
         ref.TotalHunkLength);
-}
-
-TString ToString(const THunkChunkRef& ref)
-{
-    return ToStringViaBuilder(ref);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1724,7 +1719,7 @@ public:
         , ChunkFragmentReader_(std::move(chunkFragmentReader))
         , DictionaryCompressionFactory_(std::move(dictionaryCompressionFactory))
         , Options_(std::move(options))
-        , Logger(TableClientLogger.WithTag("ReadSessionId: %v",
+        , Logger(TableClientLogger().WithTag("ReadSessionId: %v",
             Options_.ReadSessionId))
     { }
 

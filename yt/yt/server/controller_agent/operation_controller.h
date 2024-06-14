@@ -165,8 +165,9 @@ struct IOperationControllerHost
     virtual void UpdateRunningAllocationsStatistics(
         std::vector<TAgentToSchedulerRunningAllocationStatistics> runningAllocationsStatisticsUpdates) = 0;
 
+    virtual void RegisterAllocation(TStartedAllocationInfo allocationInfo) = 0;
     virtual void RegisterJob(TStartedJobInfo jobInfo) = 0;
-    virtual void ReviveJobs(std::vector<TStartedJobInfo> jobs) = 0;
+    virtual void Revive(std::vector<TStartedAllocationInfo> allocations) = 0;
     virtual void ReleaseJobs(std::vector<TJobToRelease> jobs) = 0;
     virtual void AbortJob(
         TJobId jobId,
@@ -203,6 +204,7 @@ struct IOperationControllerHost
     virtual const NNodeTrackerClient::TNodeDirectoryPtr& GetNodeDirectory() = 0;
     virtual const NChunkClient::TThrottlerManagerPtr& GetChunkLocationThrottlerManager() = 0;
     virtual const IInvokerPtr& GetControllerThreadPoolInvoker() = 0;
+    virtual const IInvokerPtr& GetChunkScraperThreadPoolInvoker() = 0;
     virtual const IInvokerPtr& GetJobSpecBuildPoolInvoker() = 0;
     virtual const IInvokerPtr& GetStatisticsOffloadInvoker() = 0;
     virtual const IInvokerPtr& GetExecNodesUpdateInvoker() = 0;
@@ -324,6 +326,11 @@ struct IOperationControllerSchedulerHost
      *  \note Invoker affinity: cancellable Controller invoker
      */
     virtual void OnAllocationAborted(TAbortedAllocationSummary&& abortedAllocationSummary) = 0;
+
+    /*!
+     *  \note Invoker affinity: cancellable Controller invoker
+     */
+    virtual void OnAllocationFinished(TFinishedAllocationSummary&& finishedAllocationSummary) = 0;
 
     //! Method that is called after operation results are committed and before
     //! controller is disposed.
@@ -457,7 +464,7 @@ struct IOperationController
     /*!
      *  \note Thread affinity: any
      */
-    virtual bool IsThrottling() const noexcept = 0;
+    virtual bool ShouldSkipScheduleAllocationRequest() const noexcept = 0;
 
     /*!
      *  \note Thread affinity: any

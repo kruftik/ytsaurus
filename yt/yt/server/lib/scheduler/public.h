@@ -23,8 +23,6 @@ class TAllocationToAbort;
 
 class TAllocationStatus;
 
-class TSchedulerToAgentAllocationEvent;
-
 class TReqScheduleAllocationHeartbeat;
 class TRspScheduleAllocationHeartbeat;
 
@@ -103,6 +101,7 @@ DEFINE_ENUM(EOperationAlertType,
     ((BaseLayerProbeFailed)                        (33))
     ((MtnExperimentFailed)                         (34))
     ((NewPartitionsCountIsSignificantlyLarger)     (36))
+    ((UseChunkSliceStatisticsDisabled)             (37))
 );
 
 DEFINE_ENUM(EAgentToSchedulerOperationEventType,

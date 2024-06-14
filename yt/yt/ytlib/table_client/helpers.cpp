@@ -69,6 +69,7 @@ using namespace NTableChunkFormat;
 using namespace NYTree;
 using namespace NYson;
 
+using NControllerAgent::NProto::TJobSpecExt;
 using NChunkClient::NProto::TChunkSpec;
 
 using NYPath::TRichYPath;
@@ -844,6 +845,76 @@ void FromProto(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void ToProto(
+    NProto::TColumnMetaExt* protoColumnMetaExt,
+    const TColumnMetaExtension& columnMetaExtension)
+{
+    protoColumnMetaExt->Clear();
+
+    ToProto(protoColumnMetaExt->mutable_columns(), columnMetaExtension.Columns);
+}
+
+void FromProto(
+    TColumnMetaExtension* columnMetaExtension,
+    const NProto::TColumnMetaExt& protoColumnMetaExt)
+{
+    FromProto(&columnMetaExtension->Columns, protoColumnMetaExt.columns());
+}
+
+void ToProto(
+    NProto::TBoundaryKeysExt* protoBoundaryKeysExt,
+    const TBoundaryKeysExtension& boundaryKeys)
+{
+    protoBoundaryKeysExt->Clear();
+
+    ToProto(protoBoundaryKeysExt->mutable_min(), boundaryKeys.Min);
+    ToProto(protoBoundaryKeysExt->mutable_max(), boundaryKeys.Max);
+}
+
+void FromProto(
+    TBoundaryKeysExtension* boundaryKeys,
+    const NProto::TBoundaryKeysExt& protoBoundaryKeysExt)
+{
+    FromProto(&boundaryKeys->Min, protoBoundaryKeysExt.min());
+    FromProto(&boundaryKeys->Max, protoBoundaryKeysExt.max());
+}
+
+void ToProto(
+    NProto::TKeyColumnsExt* protoKeyColumnsExt,
+    const TKeyColumnsExtension& keyColumns)
+{
+    protoKeyColumnsExt->Clear();
+
+    ToProto(protoKeyColumnsExt->mutable_names(), keyColumns.Names);
+}
+
+void FromProto(
+    TKeyColumnsExtension* keyColumns,
+    const NProto::TKeyColumnsExt& protoKeyColumnsExt)
+{
+    FromProto(&keyColumns->Names, protoKeyColumnsExt.names());
+}
+
+void ToProto(
+    NProto::TSamplesExt* protoSamplesExtension,
+    const TSamplesExtension& samplesExtension)
+{
+    protoSamplesExtension->Clear();
+
+    ToProto(protoSamplesExtension->mutable_entries(), samplesExtension.Entries);
+    ToProto(protoSamplesExtension->mutable_weights(), samplesExtension.Weights);
+}
+
+void FromProto(
+    TSamplesExtension* samplesExtension,
+    const NProto::TSamplesExt& protoSamplesExtension)
+{
+    FromProto(&samplesExtension->Entries, protoSamplesExtension.entries());
+    FromProto(&samplesExtension->Weights, protoSamplesExtension.weights());
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void EnsureAnyValueEncoded(
     TUnversionedValue* value,
     const TTableSchema& schema,
@@ -883,6 +954,30 @@ void EnsureAnyValueEncoded(
     } else {
         ValidateValueType(*value, schema, id, /*typeAnyAcceptsAllValues*/ false, ignoreRequired);
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+std::vector<TTableSchemaPtr> GetJobInputTableSchemas(
+    const TJobSpecExt& jobSpecExt,
+    const NChunkClient::TDataSourceDirectoryPtr& dataSourceDirectory)
+{
+    std::vector<TTableSchemaPtr> schemas;
+    if (jobSpecExt.input_stream_schemas_size() > 0) {
+        for (const auto& schemaProto : jobSpecExt.input_stream_schemas()) {
+            DeserializeFromWireProto(&schemas.emplace_back(), schemaProto);
+        }
+    } else {
+        if (!dataSourceDirectory) {
+            return schemas;
+        }
+
+        for (const auto& dataSource : dataSourceDirectory->DataSources()) {
+            schemas.emplace_back(dataSource.Schema() ? dataSource.Schema() : New<TTableSchema>());
+        }
+    }
+
+    return schemas;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -40,7 +40,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -79,7 +79,7 @@ public:
 
     bool IsOutOfMemory(const std::optional<TString>& poolTag) const override
     {
-        const auto& tracker = Bootstrap_->GetMemoryUsageTracker();
+        const auto& tracker = Bootstrap_->GetNodeMemoryUsageTracker();
         return tracker->IsExceeded(EMemoryCategory::TabletDynamic, poolTag);
     }
 
@@ -157,7 +157,7 @@ private:
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
-        const auto& memoryTracker = Bootstrap_->GetMemoryUsageTracker();
+        const auto& memoryTracker = Bootstrap_->GetNodeMemoryUsageTracker();
 
         auto update = [&] (const TString& bundleName, int weight) {
             YT_LOG_DEBUG("Tablet cell bundle memory pool weight updated (Bundle: %v, Weight: %v)",
@@ -209,7 +209,7 @@ private:
             }
 
             asyncResults.push_back(
-                BIND([=, this, this_ = MakeStrong(this)] () {
+                BIND([=, this, this_ = MakeStrong(this)] {
                     ScanSlot_.Fire(occupier);
                 })
                 .AsyncVia(occupier->GetGuardedAutomatonInvoker())
@@ -256,7 +256,7 @@ private:
         auto summary = CalculateNodeMemoryUsageSummary(rawStatistics);
 
         // Fill total limits.
-        const auto& memoryTracker = Bootstrap_->GetMemoryUsageTracker();
+        const auto& memoryTracker = Bootstrap_->GetNodeMemoryUsageTracker();
         summary.Total.Dynamic = {
             .Usage = memoryTracker->GetUsed(EMemoryCategory::TabletDynamic),
             .Limit = memoryTracker->GetLimit(EMemoryCategory::TabletDynamic),

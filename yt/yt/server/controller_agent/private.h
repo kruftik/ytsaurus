@@ -63,7 +63,13 @@ struct TJobStartInfo
 struct TStartedJobInfo
 {
     TJobId JobId;
+};
+
+struct TStartedAllocationInfo
+{
+    TAllocationId AllocationId;
     TString NodeAddress;
+    std::optional<TStartedJobInfo> StartedJobInfo;
 };
 
 struct TJobMonitoringDescriptor
@@ -72,18 +78,16 @@ struct TJobMonitoringDescriptor
     int Index;
 };
 
-void FormatValue(TStringBuilderBase* builder, const TJobMonitoringDescriptor& descriptor, TStringBuf /*format*/);
-
-TString ToString(const TJobMonitoringDescriptor& descriptor);
+void FormatValue(TStringBuilderBase* builder, const TJobMonitoringDescriptor& descriptor, TStringBuf /*spec*/);
 
 struct TLivePreviewTableBase;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-inline const NLogging::TLogger ControllerLogger("Controller");
-inline const NLogging::TLogger ControllerAgentLogger("ControllerAgent");
-inline const NLogging::TLogger ControllerEventLogger("ControllerEventLog");
-inline const NLogging::TLogger ControllerFeatureStructuredLogger("ControllerFeatureStructuredLog");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, ControllerLogger, "Controller");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, ControllerAgentLogger, "ControllerAgent");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, ControllerEventLogger, "ControllerEventLog");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, ControllerFeatureStructuredLogger, "ControllerFeatureStructuredLog");
 
 inline const NProfiling::TProfiler ControllerAgentProfiler("/controller_agent");
 

@@ -7,6 +7,8 @@
 
 #include <yt/yt/server/master/chunk_server/chunk_owner_base.h>
 
+#include <yt/yt/server/lib/misc/assert_sizeof.h>
+
 namespace NYT::NTabletServer {
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -80,8 +82,6 @@ public:
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(TabletOwnerAttributes, CurrentMountTransactionId);
 
     DEFINE_BYVAL_EXTRA_AGGREGATE_PROPERTY(TabletOwnerAttributes, TabletStatistics);
-    // COMPAT(gritukan)
-    void LoadTabletStatisticsCompat(NCellMaster::TLoadContext& context);
 
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(TabletOwnerAttributes, SettingsUpdateRevision);
     DEFINE_BYVAL_RW_EXTRA_PROPERTY(TabletOwnerAttributes, RemountNeededTabletCount);
@@ -134,6 +134,9 @@ public:
 private:
     void ValidateExpectedTabletState(TStringBuf message, bool allowFrozen) const;
 };
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TTabletOwnerBase, 736);
 
 ////////////////////////////////////////////////////////////////////////////////
 

@@ -1,5 +1,6 @@
 #include "bootstrap.h"
 #include "config.h"
+#include "serialize.h"
 #include "snapshot_exporter.h"
 
 #include <yt/yt/server/lib/hydra/dry_run/utils.h>
@@ -17,6 +18,8 @@
 #include <yt/yt/core/bus/tcp/dispatcher.h>
 
 #include <yt/yt/core/misc/shutdown.h>
+
+#include <yt/yt/core/yson/writer.h>
 
 #include <library/cpp/yt/phdr_cache/phdr_cache.h>
 
@@ -46,10 +49,6 @@ public:
             .StoreMappedResult(&SnapshotPath_, &CheckPathExistsArgMapper)
             .RequiredArgument("SNAPSHOT");
         Opts_
-            .AddLongOption("dump-config", "config for snapshot dumping, which contains 'lower_limit' and 'upper_limit'")
-            .StoreResult(&DumpSnapshotConfig_)
-            .RequiredArgument("CONFIG_YSON");
-        Opts_
             .AddLongOption("export-snapshot", "export master snapshot\nexpects path to snapshot")
             .StoreMappedResult(&SnapshotPath_, &CheckPathExistsArgMapper)
             .RequiredArgument("SNAPSHOT");
@@ -74,16 +73,16 @@ public:
             .StoreResult(&SnapshotBuildDirectory_)
             .OptionalArgument("DIRECTORY");
         Opts_
-            .AddLongOption("report-total-write-count")
-            .SetFlag(&EnableTotalWriteCountReport_)
-            .NoArgument();
-        Opts_
             .AddLongOption("skip-tvm-service-env-validation", "don't validate tvm service files")
             .SetFlag(&SkipTvmServiceEnvValidation_)
             .NoArgument();
         Opts_
             .AddLongOption("sleep-after-initialize", "sleep for 10s after calling TBootstrap::Initialize()")
             .SetFlag(&SleepAfterInitialize_)
+            .NoArgument();
+        Opts_
+            .AddLongOption("compatibility-info", "Print master binary compatibility info and exit")
+            .SetFlag(&PrintCompatibilityInfo_)
             .NoArgument();
     }
 
@@ -95,11 +94,12 @@ protected:
         auto dumpSnapshot = parseResult.Has("dump-snapshot");
         auto exportSnapshot = parseResult.Has("export-snapshot");
         auto validateSnapshot = parseResult.Has("validate-snapshot");
+        auto printCompatibilityInfo = parseResult.Has("compatibility-info");
         auto replayChangelogs = parseResult.Has("replay-changelogs");
         auto buildSnapshot = parseResult.Has("build-snapshot");
 
-        if (dumpSnapshot + validateSnapshot + exportSnapshot > 1) {
-            THROW_ERROR_EXCEPTION("Options 'dump-snapshot', 'validate-snapshot' and 'export-snapshot' are mutually exclusive");
+        if (dumpSnapshot + validateSnapshot + exportSnapshot + printCompatibilityInfo  > 1) {
+            THROW_ERROR_EXCEPTION("Options 'dump-snapshot', 'validate-snapshot', 'export-snapshot' and 'compatibility-info' are mutually exclusive");
         }
 
         if ((dumpSnapshot || exportSnapshot) && replayChangelogs) {
@@ -108,6 +108,10 @@ protected:
 
         if (buildSnapshot && !replayChangelogs && !validateSnapshot) {
             THROW_ERROR_EXCEPTION("Option 'build-snapshot' can only be used with 'validate-snapshot' or 'replay-changelog'");
+        }
+
+        if (HandleCompatibilityInfo()) {
+            return;
         }
 
         ConfigureUids();
@@ -189,7 +193,7 @@ protected:
             bootstrap->Run();
         } else {
             if (loadSnapshot) {
-                bootstrap->LoadSnapshotOrThrow(SnapshotPath_, dumpSnapshot, EnableTotalWriteCountReport_, DumpSnapshotConfig_);
+                bootstrap->LoadSnapshotOrThrow(SnapshotPath_, dumpSnapshot);
             }
             if (exportSnapshot) {
                 // TODO (h0pless): maybe rename this to ExportState
@@ -210,14 +214,31 @@ protected:
     }
 
 private:
+    bool HandleCompatibilityInfo()
+    {
+        if (!PrintCompatibilityInfo_) {
+            return false;
+        }
+
+        NYson::TYsonWriter writer(&Cout, NYson::EYsonFormat::Pretty);
+        auto info = NYTree::BuildYsonStringFluently()
+            .BeginMap()
+                .Item("current_reign").Value(NCellMaster::GetCurrentReign())
+            .EndMap();
+        NYson::Serialize(info, &writer);
+        Cout << Endl;
+
+        return true;
+    }
+
+private:
     TString SnapshotPath_;
-    TString DumpSnapshotConfig_;
     TString ExportSnapshotConfig_;
     std::vector<TString> ChangelogFileNames_;
     TString SnapshotBuildDirectory_;
-    bool EnableTotalWriteCountReport_ = false;
     bool SkipTvmServiceEnvValidation_ = false;
     bool SleepAfterInitialize_ = false;
+    bool PrintCompatibilityInfo_ = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////

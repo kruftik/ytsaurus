@@ -36,7 +36,7 @@ using namespace NTableClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SequoiaServerLogger;
+static constexpr auto& Logger = SequoiaServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -80,11 +80,11 @@ public:
     {
         RegisterLoader(
             "SequoiaQueueManager",
-            BIND(&TSequoiaQueueManager::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TSequoiaQueueManager::Load, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "SequoiaQueueManager",
-            BIND(&TSequoiaQueueManager::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TSequoiaQueueManager::Save, Unretained(this)));
     }
 
     void EnqueueRow(
@@ -315,7 +315,6 @@ private:
                     .CoordinatorCellId = Bootstrap_->GetCellId(),
                     .CoordinatorPrepareMode = NApi::ETransactionCoordinatorPrepareMode::Late,
                 };
-
                 return transaction->Commit(commitOptions);
             }).AsyncVia(EpochAutomatonInvoker_))));
     }

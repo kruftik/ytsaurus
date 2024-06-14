@@ -1320,7 +1320,7 @@ class TestSortedDynamicTablesHunks(TestSortedDynamicTablesBase):
             "read_quorum": read_quorum,
             "write_quorum": write_quorum
         })
-        write_journal("//tmp/j", self.JOURNAL_HUNK_PAYLOAD)
+        write_journal("//tmp/j", self.JOURNAL_HUNK_PAYLOAD, enable_chunk_preallocation=False)
         return get_singular_chunk_id("//tmp/j")
 
     @authors("babenko")
@@ -2838,13 +2838,19 @@ class TestHunkValuesDictionaryCompression(TestSortedDynamicTablesHunks):
         self._wait_dictionaries_built("//tmp/t", 1)
         self._perform_forced_compaction("//tmp/t", "compaction")
 
-        chunk_format_statistics = get("//tmp/t/@chunk_format_statistics")
-        assert chunk_format_statistics["table_versioned_simple"]["data_weight"] == 18080
-        assert chunk_format_statistics["table_versioned_simple"]["uncompressed_data_size"] == 10016
-        assert chunk_format_statistics["table_versioned_simple"]["compressed_data_size"] == 3480
-        assert chunk_format_statistics["hunk_default"]["data_weight"] == 11714
-        assert chunk_format_statistics["hunk_default"]["uncompressed_data_size"] == 3627
-        assert chunk_format_statistics["hunk_default"]["compressed_data_size"] == 3627
+        def _check_statistics():
+            chunk_format_statistics = get("//tmp/t/@chunk_format_statistics")
+            if chunk_format_statistics["hunk_default"]["chunk_count"] != 3:
+                return False
+            assert chunk_format_statistics["table_versioned_simple"]["data_weight"] == 18080
+            assert chunk_format_statistics["table_versioned_simple"]["uncompressed_data_size"] == 10016
+            assert chunk_format_statistics["table_versioned_simple"]["compressed_data_size"] < 5000
+            assert chunk_format_statistics["hunk_default"]["data_weight"] == 11714
+            assert chunk_format_statistics["hunk_default"]["uncompressed_data_size"] == 3627
+            assert chunk_format_statistics["hunk_default"]["compressed_data_size"] == 3627
+            return True
+
+        wait(lambda: _check_statistics())
 
     @authors("akozhikhov")
     def test_value_compression_dictionary_cache(self):

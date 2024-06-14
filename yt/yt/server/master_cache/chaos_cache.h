@@ -14,7 +14,6 @@ namespace NYT::NMasterCache {
 
 struct TChaosCacheKey
 {
-    TString User;
     NChaosClient::TReplicationCardId CardId;
     NChaosClient::TReplicationCardFetchOptions FetchOptions;
 
@@ -22,8 +21,7 @@ struct TChaosCacheKey
     bool operator == (const TChaosCacheKey& other) const = default;
 };
 
-void FormatValue(TStringBuilderBase* builder, const TChaosCacheKey& key, TStringBuf /*format*/);
-TString ToString(const TChaosCacheKey& key);
+void FormatValue(TStringBuilderBase* builder, const TChaosCacheKey& key, TStringBuf /*spec*/);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -79,7 +77,8 @@ public:
         const TChaosCacheKey& key,
         TDuration successExpirationTime,
         TDuration failureExpirationTime,
-        NChaosClient::TReplicationEra refreshEra);
+        NChaosClient::TReplicationEra refreshEra,
+        const TString& user);
 
     void EndLookup(
         NRpc::TRequestId requestId,

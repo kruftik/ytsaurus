@@ -37,7 +37,7 @@ public:
     TDuration RequestRateSmoothingPeriod;
     TDuration AccountMasterMemoryUsageUpdatePeriod;
 
-    // COMPAT(vovamelnikov)
+    // COMPAT(h0pless): This is a panic button, in case account profiling breaks.
     bool EnableAccountsProfiling;
     bool EnableDelayedMembershipClosureRecomputation;
     bool EnableAccessLog;
@@ -64,6 +64,15 @@ public:
 
     //! Period between user statistics commits.
     TDuration UserStatisticsFlushPeriod;
+
+    //! COMPAT(cherepashka)
+    bool DisableUpdateUserLastSeen;
+
+    // COMPAT(h0pless): This is a flag that makes the related commit rollable. See ace_iterator.cpp.
+    bool FixSubjectTagFilterIteratorNeverSkippingFirstAce;
+
+    // This is a panic button.
+    bool EnableSubjectTagFilters;
 
     REGISTER_YSON_STRUCT(TDynamicSecurityManagerConfig);
 

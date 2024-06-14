@@ -32,7 +32,7 @@ public:
             bootstrap,
             TTabletNodeTrackerServiceProxy::GetDescriptor(),
             EAutomatonThreadQueue::TabletNodeTrackerService,
-            TabletServerLogger)
+            TabletServerLogger())
     {
         RegisterMethod(RPC_SERVICE_METHOD_DESC(Heartbeat)
             .SetHeavy(true));
@@ -44,6 +44,9 @@ private:
         ValidateClusterInitialized();
         ValidatePeer(EPeerKind::Leader);
         SyncWithUpstream();
+
+        const auto& multicellManager = Bootstrap_->GetMulticellManager();
+        multicellManager->ValidateRegisteredMasterCell();
 
         auto nodeId = FromProto<NNodeTrackerClient::TNodeId>(request->node_id());
 

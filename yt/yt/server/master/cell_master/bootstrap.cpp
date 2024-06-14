@@ -177,6 +177,7 @@
 #include <yt/yt/core/rpc/local_channel.h>
 #include <yt/yt/core/rpc/bus/server.h>
 #include <yt/yt/core/rpc/server.h>
+#include <yt/yt/core/rpc/null_channel.h>
 
 #include <yt/yt/core/ytree/ephemeral_node_factory.h>
 #include <yt/yt/core/ytree/tree_builder.h>
@@ -234,8 +235,8 @@ using NTransactionServer::ITransactionManagerPtr;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static inline const NLogging::TLogger Logger("Bootstrap");
-static inline const NLogging::TLogger DryRunLogger("DryRun");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "Bootstrap");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, DryRunLogger, "DryRun");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -245,9 +246,9 @@ TBootstrap::TBootstrap(TCellMasterConfigPtr config)
     : Config_(std::move(config))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 }
 
@@ -311,6 +312,11 @@ const IAlertManagerPtr& TBootstrap::GetAlertManager() const
 const IConfigManagerPtr& TBootstrap::GetConfigManager() const
 {
     return ConfigManager_;
+}
+
+const TDynamicClusterConfigPtr& TBootstrap::GetDynamicConfig() const
+{
+    return ConfigManager_->GetConfig();
 }
 
 const IMulticellManagerPtr& TBootstrap::GetMulticellManager() const
@@ -613,14 +619,9 @@ void TBootstrap::Run()
 
 void TBootstrap::LoadSnapshotOrThrow(
     const TString& fileName,
-    bool dump,
-    bool enableTotalWriteCountReport,
-    const TString& dumpConfigString)
+    bool dump)
 {
-    TSerializationDumperConfigPtr dumpConfig;
-    ValidateLoadSnapshotParameters(dump, enableTotalWriteCountReport, dumpConfigString, &dumpConfig);
-
-    BIND(&TBootstrap::DoLoadSnapshot, this, fileName, dump, enableTotalWriteCountReport, dumpConfig)
+    BIND(&TBootstrap::DoLoadSnapshot, this, fileName, dump)
         .AsyncVia(GetControlInvoker())
         .Run()
         .Get()
@@ -775,7 +776,7 @@ void TBootstrap::DoInitialize()
 
     RootClient_ = ClusterConnection_->CreateNativeClient(NApi::TClientOptions::FromUser(NSecurityClient::RootUserName));
 
-    SequoiaClient_ = CreateLazySequoiaClient(RootClient_, Logger);
+    SequoiaClient_ = CreateLazySequoiaClient(RootClient_, Logger());
 
     // If Sequoia is local it's safe to create the client right now.
     const auto& groundClusterName = Config_->ClusterConnection->Dynamic->SequoiaConnection->GroundClusterName;
@@ -792,14 +793,16 @@ void TBootstrap::DoInitialize()
 
     const auto& networks = Config_->Networks;
 
-    NodeChannelFactory_ = CreateNodeChannelFactory(ChannelFactory_, networks);
+    NodeChannelFactory_ = CreateNodeChannelFactory(
+        !Config_->DisableNodeConnections ? ChannelFactory_ : GetNullChannelFactory(),
+        networks);
 
     CellDirectory_ = CreateCellDirectory(
         Config_->CellDirectory,
         ChannelFactory_,
         ClusterConnection_->GetClusterDirectory(),
         networks,
-        Logger);
+        Logger());
 
     YT_VERIFY(CellDirectory_->ReconfigureCell(Config_->PrimaryMaster));
     for (const auto& cellConfig : Config_->SecondaryMasters) {
@@ -843,7 +846,7 @@ void TBootstrap::DoInitialize()
     AlertManager_ = CreateAlertManager(this);
 
     ConfigManager_ = CreateConfigManager(this);
-    ConfigManager_->SubscribeConfigChanged(BIND(&TBootstrap::OnDynamicConfigChanged, this));
+    ConfigManager_->SubscribeConfigChanged(BIND_NO_PROPAGATE(&TBootstrap::OnDynamicConfigChanged, this));
 
     EpochHistoryManager_ = CreateEpochHistoryManager(this);
 
@@ -946,7 +949,8 @@ void TBootstrap::DoInitialize()
             HydraFacade_->GetHydraManager(),
             HydraFacade_->GetAutomaton(),
             GetCellTag(),
-            /*authenticator*/ nullptr);
+            /*authenticator*/ nullptr,
+            InvalidCellTag);
     }
 
     LeaseManager_ = CreateLeaseManager(
@@ -1099,7 +1103,7 @@ void TBootstrap::DoRun()
 {
     if (const auto& groundClusterName = Config_->ClusterConnection->Dynamic->SequoiaConnection->GroundClusterName) {
         ClusterConnection_->GetClusterDirectory()->SubscribeOnClusterUpdated(
-            BIND([=, this] (const TString& clusterName, const INodePtr& /*configNode*/) {
+            BIND_NO_PROPAGATE([=, this] (const TString& clusterName, const INodePtr& /*configNode*/) {
                 if (clusterName == *groundClusterName) {
                     auto groundConnection = ClusterConnection_->GetClusterDirectory()->GetConnection(*groundClusterName);
                     auto groundClient = groundConnection->CreateNativeClient({.User = NSecurityClient::RootUserName});
@@ -1133,10 +1137,12 @@ void TBootstrap::DoRun()
         "/election",
         HydraFacade_->GetElectionManager()->GetMonitoringProducer());
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConvertTo<INodePtr>(Config_)));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConvertTo<INodePtr>(Config_)));
+    }
     SetNodeByYPath(
         orchidRoot,
         "/incumbent_manager",
@@ -1182,9 +1188,7 @@ void TBootstrap::DoRun()
 
 void TBootstrap::DoLoadSnapshot(
     const TString& fileName,
-    bool dump,
-    bool enableTotalWriteCountReport,
-    const TSerializationDumperConfigPtr& dumpConfig)
+    bool dump)
 {
     auto snapshotId = TryFromString<int>(NFS::GetFileNameWithoutExtension(fileName));
     if (snapshotId.Empty()) {
@@ -1200,7 +1204,7 @@ void TBootstrap::DoLoadSnapshot(
     dryRunHydraManager->Initialize();
 
     const auto& automaton = HydraFacade_->GetAutomaton();
-    automaton->SetSnapshotValidationOptions({dump, enableTotalWriteCountReport, dumpConfig});
+    automaton->SetSerializationDumpEnabled(dump);
 
     dryRunHydraManager->DryRunLoadSnapshot(std::move(snapshotReader), *snapshotId);
 }
@@ -1253,36 +1257,12 @@ void TBootstrap::DoFinishDryRun()
     dryRunHydraManager->DryRunShutdown();
 }
 
-void TBootstrap::ValidateLoadSnapshotParameters(
-    bool dump,
-    bool enableTotalWriteCountReport,
-    const TString& dumpConfigString,
-    TSerializationDumperConfigPtr* dumpConfig)
-{
-    if (dump && enableTotalWriteCountReport) {
-        THROW_ERROR_EXCEPTION("'EnableTotalWriteCountReport' can be specified only for snapshot validation");
-    }
-
-    if (dumpConfigString) {
-        if (!dump) {
-            THROW_ERROR_EXCEPTION("'DumpConfig' can be specified only for snapshot dumping");
-        }
-        *dumpConfig = ConvertTo<TSerializationDumperConfigPtr>(NYson::TYsonString(dumpConfigString));
-    }
-}
-
 void TBootstrap::OnDynamicConfigChanged(const TDynamicClusterConfigPtr& /*oldConfig*/)
 {
     const auto& config = ConfigManager_->GetConfig();
     ReconfigureNativeSingletons(Config_, config->CellMaster);
 
     HydraFacade_->Reconfigure(config->CellMaster);
-
-    const auto& testingConfig = config->MulticellManager->Testing;
-    // TODO(cherepashka): temporary logic.
-    if (testingConfig->MasterCellDirectoryOverride) {
-        MulticellManager_->GetMasterCellConnectionConfigs()->SecondaryMasters = testingConfig->MasterCellDirectoryOverride->SecondaryMasters;
-    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////

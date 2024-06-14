@@ -29,7 +29,6 @@ IF (NOT OPENSOURCE)
         docs
         docs/yandex-specific
         docs/ytsaurus
-        hermes
         idm-integration
         internal
         jaeger
@@ -38,10 +37,12 @@ IF (NOT OPENSOURCE)
         nirvana
         opensource
         packages
+        python_py2
         recipe
         scripts
         skynet
         terraform
         yt_proto
+        yt_sync
     )
 ENDIF()

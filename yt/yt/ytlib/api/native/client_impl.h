@@ -280,13 +280,13 @@ public: \
         const TPullQueueOptions& options = {}),
         (queuePath, offset, partitionIndex, rowBatchReadOptions, options))
 
-    IMPLEMENT_METHOD(NQueueClient::IQueueRowsetPtr, PullConsumer, (
+    IMPLEMENT_METHOD(NQueueClient::IQueueRowsetPtr, PullQueueConsumer, (
         const NYPath::TRichYPath& consumerPath,
         const NYPath::TRichYPath& queuePath,
         std::optional<i64> offset,
         int partitionIndex,
         const NQueueClient::TQueueRowBatchReadOptions& rowBatchReadOptions,
-        const TPullConsumerOptions& options = {}),
+        const TPullQueueConsumerOptions& options = {}),
         (consumerPath, queuePath, offset, partitionIndex, rowBatchReadOptions, options))
 
     IMPLEMENT_METHOD(void, RegisterQueueConsumer, (
@@ -307,6 +307,21 @@ public: \
         const std::optional<NYPath::TRichYPath>& consumerPath,
         const TListQueueConsumerRegistrationsOptions& options = {}),
         (queuePath, consumerPath, options))
+
+    IMPLEMENT_METHOD(TCreateQueueProducerSessionResult, CreateQueueProducerSession, (
+        const NYPath::TRichYPath& producerPath,
+        const NYPath::TRichYPath& queuePath,
+        const TString& sessionId,
+        const std::optional<NYson::TYsonString>& userMeta,
+        const TCreateQueueProducerSessionOptions& options = {}),
+        (producerPath, queuePath, sessionId, userMeta, options));
+
+    IMPLEMENT_METHOD(void, RemoveQueueProducerSession, (
+        const NYPath::TRichYPath& producerPath,
+        const NYPath::TRichYPath& queuePath,
+        const TString& sessionId,
+        const TRemoveQueueProducerSessionOptions& options = {}),
+        (producerPath, queuePath, sessionId, options));
 
     IMPLEMENT_METHOD(NQueryTrackerClient::TQueryId, StartQuery, (
         NQueryTrackerClient::EQueryEngine engine,
@@ -630,7 +645,7 @@ public: \
     IMPLEMENT_METHOD(TCellIdToSnapshotIdMap, BuildMasterSnapshots, (
         const TBuildMasterSnapshotsOptions& options),
         (options))
-    IMPLEMENT_METHOD(TCellIdToSequenceNumberMap, GetMasterConsistentState, (
+    IMPLEMENT_METHOD(TCellIdToConsistentStateMap, GetMasterConsistentState, (
         const TGetMasterConsistentStateOptions& options),
         (options))
     IMPLEMENT_METHOD(void, ExitReadOnly, (
@@ -858,10 +873,15 @@ public: \
         const NYPath::TYPath& pipelinePath,
         const TPausePipelineOptions& options),
         (pipelinePath, options))
-    IMPLEMENT_METHOD(TPipelineStatus, GetPipelineStatus, (
+    IMPLEMENT_METHOD(TPipelineState, GetPipelineState, (
         const NYPath::TYPath& pipelinePath,
-        const TGetPipelineStatusOptions& options),
+        const TGetPipelineStateOptions& options),
         (pipelinePath, options))
+    IMPLEMENT_METHOD(TGetFlowViewResult, GetFlowView, (
+        const NYPath::TYPath& pipelinePath,
+        const NYPath::TYPath& viewPath,
+        const TGetFlowViewOptions& options),
+        (pipelinePath, viewPath, options))
 
 #undef DROP_BRACES
 #undef IMPLEMENT_METHOD
@@ -889,8 +909,11 @@ private:
 
     const std::vector<ITypeHandlerPtr> TypeHandlers_;
 
-    TEnumIndexedArray<EMasterChannelKind, THashMap<NObjectClient::TCellTag, NRpc::IChannelPtr>> MasterChannels_;
-    TEnumIndexedArray<EMasterChannelKind, THashMap<NObjectClient::TCellTag, NRpc::IChannelPtr>> CypressChannels_;
+    using TChannels = THashMap<NObjectClient::TCellTag, NRpc::IChannelPtr>;
+    YT_DECLARE_SPIN_LOCK(NThreading::TReaderWriterSpinLock, MasterChannelsLock_);
+    TEnumIndexedArray<EMasterChannelKind, TChannels> MasterChannels_;
+    YT_DECLARE_SPIN_LOCK(NThreading::TReaderWriterSpinLock, CypressChannelsLock_);
+    TEnumIndexedArray<EMasterChannelKind, TChannels> CypressChannels_;
     NRpc::IChannelPtr SchedulerChannel_;
     YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, OperationsArchiveClientLock_);
     IClientPtr OperationsArchiveClient_;
@@ -900,8 +923,8 @@ private:
     TLazyIntrusivePtr<NQueryClient::IFunctionRegistry> FunctionRegistry_;
     std::unique_ptr<NScheduler::TOperationServiceProxy> SchedulerOperationProxy_;
     std::unique_ptr<NBundleController::TBundleControllerServiceProxy> BundleControllerProxy_;
-    const ITypedNodeMemoryTrackerPtr LookupMemoryTracker_;
-    const ITypedNodeMemoryTrackerPtr QueryMemoryTracker_;
+    const IMemoryUsageTrackerPtr LookupMemoryTracker_;
+    const IMemoryUsageTrackerPtr QueryMemoryTracker_;
     const NQueryClient::TMemoryProviderMapByTagPtr MemoryProvider_ = New<NQueryClient::TMemoryProviderMapByTag>();
 
     struct TReplicaClient final
@@ -915,6 +938,14 @@ private:
 
     YT_DECLARE_SPIN_LOCK(NThreading::TReaderWriterSpinLock, ReplicaClientsLock_);
     THashMap<TString, TIntrusivePtr<TReplicaClient>> ReplicaClients_;
+
+    TChannels GetMasterChannels(EMasterChannelKind kind);
+    NRpc::IChannelPtr FindMasterChannel(EMasterChannelKind kind, NObjectClient::TCellTag cellTag);
+    TChannels GetCypressChannels(EMasterChannelKind kind);
+    NRpc::IChannelPtr FindCypressChannel(EMasterChannelKind kind, NObjectClient::TCellTag cellTag);
+
+    //! NB: Could throw in case of non-existing cell tag.
+    void InitChannelsOrThrow(EMasterChannelKind kind, NObjectClient::TCellTag cellTag);
 
     const IClientPtr& GetOperationsArchiveClient();
 

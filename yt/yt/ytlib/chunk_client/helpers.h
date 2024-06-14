@@ -274,8 +274,8 @@ EChunkFeatures GetSupportedChunkFeatures();
 //! #chunkFeatures. Throws an error if client cannot process such a chunk.
 void ValidateChunkFeatures(
     TChunkId chunkId,
-    ui64 chunkFeatures,
-    ui64 supportedChunkFeatures);
+    NChunkClient::EChunkFeatures chunkFeatures,
+    NChunkClient::EChunkFeatures supportedChunkFeatures);
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -324,8 +324,14 @@ void FormatValue(
     TStringBuilderBase* builder,
     const TAllyReplicasInfo& allyReplicas,
     TStringBuf spec);
-TString ToString(
-    const TAllyReplicasInfo& allyReplicas);
+
+////////////////////////////////////////////////////////////////////////////////
+
+//! Is chunk size large enough to be teleported (is it large enough to be split).
+bool IsLargeEnoughChunkSize(i64 chunkSize, i64 chunkSizeThreshold);
+
+//! Is chunk weight large enough to be teleported (is it large enough to be split).
+bool IsLargeEnoughChunkWeight(i64 chunkWeight, i64 chunkWeightThreshold);
 
 ////////////////////////////////////////////////////////////////////////////////
 

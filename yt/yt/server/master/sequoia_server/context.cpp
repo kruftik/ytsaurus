@@ -25,6 +25,7 @@ using namespace NSecurityServer;
 using namespace NSequoiaClient;
 using namespace NTableClient;
 using namespace NTabletClient;
+using namespace NTracing;
 using namespace NTransactionClient;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -90,7 +91,7 @@ public:
         THashMap<TTabletId, std::vector<std::unique_ptr<ITabletRequestBatcher::TBatch>>> tabletIdToBatches;
 
         for (const auto& [tabletId, tabletRequestBatcher] : TabletIdToRequestBatcher_) {
-            auto batches = tabletRequestBatcher->PrepareBatches();
+            auto batches = tabletRequestBatcher->PrepareBatches().Batches;
             auto requestCount = std::max<int>(std::ssize(batches), 1);
 
             auto* cellSignatureGenerator = GetOrCrash(
@@ -142,36 +143,39 @@ ISequoiaContextPtr CreateSequoiaContext(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-YT_THREAD_LOCAL(ISequoiaContextPtr) SequoiaContext;
+YT_DEFINE_THREAD_LOCAL(ISequoiaContextPtr, SequoiaContext);
 
 void SetSequoiaContext(ISequoiaContextPtr context)
 {
-    GetTlsRef(SequoiaContext) = std::move(context);
+    SequoiaContext() = std::move(context);
 }
 
 const ISequoiaContextPtr& GetSequoiaContext()
 {
-    return GetTlsRef(SequoiaContext);
+    return SequoiaContext();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 TSequoiaContextGuard::TSequoiaContextGuard(ISecurityManagerPtr securityManager)
     : UserGuard_(std::move(securityManager))
+    , TraceContextGuard_(nullptr)
 { }
 
 TSequoiaContextGuard::TSequoiaContextGuard(
         ISequoiaContextPtr context,
         ISecurityManagerPtr securityManager,
-        TAuthenticationIdentity identity)
+        TAuthenticationIdentity identity,
+        TTraceContextPtr traceContext)
     : UserGuard_(std::move(securityManager), std::move(identity))
+    , TraceContextGuard_(std::move(traceContext))
 {
     SetSequoiaContext(std::move(context));
 }
 
 TSequoiaContextGuard::~TSequoiaContextGuard()
 {
-    auto& sequoiaContext = GetTlsRef(SequoiaContext);
+    auto& sequoiaContext = SequoiaContext();
     if (sequoiaContext) {
         sequoiaContext->SubmitRows();
     }

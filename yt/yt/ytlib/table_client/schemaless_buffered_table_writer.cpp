@@ -73,7 +73,7 @@ public:
 
     TFuture<void> GetReadyEvent() override
     {
-        YT_UNIMPLEMENTED();
+        return VoidFuture;
     }
 
     TFuture<void> Close() override
@@ -190,7 +190,7 @@ private:
     int PendingFlushes_ = 0;
     bool Closed_ = false;
 
-    NLogging::TLogger Logger = TableClientLogger;
+    NLogging::TLogger Logger = TableClientLogger();
 
 
     void OnPeriodicFlush()
@@ -251,8 +251,7 @@ private:
                     NameTable_,
                     Client_,
                     /*localHostName*/ TString(), // Locality is not important during table upload.
-                    /*transaction*/ nullptr
-                );
+                    /*transaction*/ nullptr);
 
                 auto writer = WaitFor(asyncWriter)
                     .ValueOrThrow();

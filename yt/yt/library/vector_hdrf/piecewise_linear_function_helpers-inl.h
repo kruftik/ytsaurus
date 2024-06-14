@@ -27,7 +27,7 @@ void VerifyNondecreasing(const TPiecewiseFunction& vecFunc, const NLogging::TLog
         }
 
         YT_LOG_ERROR(
-            "The vector function is decreasing at segment {%.16lf, %.16lf} (BoundValues: {%.16lf, %.16lf}, %s)",
+            "The vector function is decreasing at segment {%.16lf, %.16lf} (BoundValues: {%.16lf, %.16lf})",
             segment.LeftBound(),
             segment.RightBound(),
             segment.LeftValue(),
@@ -43,8 +43,7 @@ template <class TSegment>
 TSegment ConnectSegments(const TSegment& firstSegment, const TSegment& secondSegment) {
     return TSegment(
         {firstSegment.LeftBound(), firstSegment.LeftValue()},
-        {secondSegment.RightBound(), secondSegment.RightValue()}
-    );
+        {secondSegment.RightBound(), secondSegment.RightValue()});
 }
 
 ////////////////////////////////////////////////////////////////////////////////

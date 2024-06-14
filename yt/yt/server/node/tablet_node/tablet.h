@@ -277,6 +277,8 @@ struct TTabletSnapshot
 
     TString TabletCellBundle;
 
+    NYson::TYsonString CustomRuntimeData;
+
     std::atomic<bool> Unregistered = false;
 
     //! Returns a range of partitions intersecting with the range |[lowerBound, upperBound)|.
@@ -346,7 +348,7 @@ struct ITabletContext
     virtual NRpc::IServerPtr GetLocalRpcServer() const = 0;
     virtual TString GetLocalHostName() const = 0;
     virtual NNodeTrackerClient::TNodeDescriptor GetLocalDescriptor() const = 0;
-    virtual INodeMemoryTrackerPtr GetMemoryUsageTracker() const = 0;
+    virtual INodeMemoryTrackerPtr GetNodeMemoryUsageTracker() const = 0;
     virtual NChunkClient::IChunkReplicaCachePtr GetChunkReplicaCache() const = 0;
     virtual IHedgingManagerRegistryPtr GetHedgingManagerRegistry() const = 0;
     virtual ITabletWriteManagerHostPtr GetTabletWriteManagerHost() const = 0;
@@ -626,6 +628,8 @@ public:
     DEFINE_BYREF_RW_PROPERTY(NLsm::TTabletLsmStatistics, LsmStatistics);
 
     DEFINE_BYREF_RW_PROPERTY(TSmoothMovementData, SmoothMovementData);
+
+    DEFINE_BYREF_RW_PROPERTY(NYson::TYsonString, CustomRuntimeData);
 
 public:
     TTablet(

@@ -1,7 +1,5 @@
 UNITTEST_FOR(util)
 
-SUBSCRIBER(g:util-subscribers)
-
 FORK_TESTS()
 
 FORK_SUBTESTS()
@@ -85,10 +83,14 @@ ENDIF()
 IF (OS_WINDOWS)
     SRCS(
         system/fs_win_ut.cpp
+        system/mktemp_ut.cpp
     )
     DEPENDS(
         util/system/ut/stdin_osfhandle
     )
+    IF (ARCH_X86_64)
+        WINDOWS_LONG_PATH_MANIFEST()
+    ENDIF()
 ENDIF()
 
 REQUIREMENTS(ram:12)

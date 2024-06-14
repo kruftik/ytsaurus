@@ -109,12 +109,17 @@ public:
         YT_UNIMPLEMENTED();
     }
 
+    void RegisterAllocation(TStartedAllocationInfo) override
+    {
+        YT_UNIMPLEMENTED();
+    }
+
     void RegisterJob(TStartedJobInfo) override
     {
         YT_UNIMPLEMENTED();
     }
 
-    void ReviveJobs(std::vector<TStartedJobInfo>) override
+    void Revive(std::vector<TStartedAllocationInfo>) override
     {
         YT_UNIMPLEMENTED();
     }
@@ -185,6 +190,11 @@ public:
     }
 
     const IInvokerPtr& GetControllerThreadPoolInvoker() override
+    {
+        return ActionQueue_->GetInvoker();
+    }
+
+    const IInvokerPtr& GetChunkScraperThreadPoolInvoker() override
     {
         return ActionQueue_->GetInvoker();
     }
@@ -515,7 +525,7 @@ void GuardedMain(int argc, char** argv)
     auto controller = CreateOperationController(operation);
 
     if (rct) {
-        Cerr << TRefCountedTracker::Get()->GetDebugInfo(/*sortByColumn=*/2/*bytesAlive*/) << Endl;
+        Cerr << TRefCountedTracker::Get()->GetDebugInfo(/*sortByColumn*/2/*bytesAlive*/) << Endl;
     }
 
     if (loop) {

@@ -23,7 +23,7 @@ TKeyTriePtr ExtractMultipleConstraints(
             return IntersectKeyTrie(
                 ExtractMultipleConstraints(lhsExpr, keyColumns, rowBuffer, rangeExtractors),
                 ExtractMultipleConstraints(rhsExpr, keyColumns, rowBuffer, rangeExtractors));
-        } if (opcode == EBinaryOp::Or) {
+        } else if (opcode == EBinaryOp::Or) {
             return UniteKeyTrie(
                 ExtractMultipleConstraints(lhsExpr, keyColumns, rowBuffer, rangeExtractors),
                 ExtractMultipleConstraints(rhsExpr, keyColumns, rowBuffer, rangeExtractors));
@@ -54,34 +54,34 @@ TKeyTriePtr ExtractMultipleConstraints(
                             break;
                         case EBinaryOp::NotEqual:
                             result->Offset = keyPartIndex;
-                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Min), true);
-                            bounds.emplace_back(value, false);
-                            bounds.emplace_back(value, false);
-                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Max), true);
+                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Min), /*included*/ true);
+                            bounds.emplace_back(value, /*included*/ false);
+                            bounds.emplace_back(value, /*included*/ false);
+                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Max), /*included*/ true);
 
                             break;
                         case EBinaryOp::Less:
                             result->Offset = keyPartIndex;
-                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Min), true);
-                            bounds.emplace_back(value, false);
+                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Min), /*included*/ true);
+                            bounds.emplace_back(value, /*included*/ false);
 
                             break;
                         case EBinaryOp::LessOrEqual:
                             result->Offset = keyPartIndex;
-                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Min), true);
-                            bounds.emplace_back(value, true);
+                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Min), /*included*/ true);
+                            bounds.emplace_back(value, /*included*/ true);
 
                             break;
                         case EBinaryOp::Greater:
                             result->Offset = keyPartIndex;
-                            bounds.emplace_back(value, false);
-                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Max), true);
+                            bounds.emplace_back(value, /*included*/ false);
+                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Max), /*included*/ true);
 
                             break;
                         case EBinaryOp::GreaterOrEqual:
                             result->Offset = keyPartIndex;
-                            bounds.emplace_back(value, true);
-                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Max), true);
+                            bounds.emplace_back(value, /*included*/ true);
+                            bounds.emplace_back(MakeUnversionedSentinelValue(EValueType::Max), /*included*/ true);
 
                             break;
                         default:
@@ -212,7 +212,7 @@ TKeyTriePtr ExtractMultipleConstraints(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-Y_WEAK TRangeInferrer CreateRangeInferrer(
+Y_WEAK TSharedRange<TRowRange> CreateRangeInferrer(
     TConstExpressionPtr /*predicate*/,
     const TTableSchemaPtr& /*schema*/,
     const TKeyColumns& /*keyColumns*/,

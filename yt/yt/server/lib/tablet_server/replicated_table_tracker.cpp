@@ -41,7 +41,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static inline const NLogging::TLogger Logger("ReplicatedTableTracker");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "ReplicatedTableTracker");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -53,11 +53,6 @@ void FormatValue(
     builder->AppendFormat("ReplicaId: %v, TargetMode: %v",
         command.ReplicaId,
         command.TargetMode);
-}
-
-TString ToString(const TChangeReplicaModeCommand& command)
-{
-    return ToStringViaBuilder(command);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -205,7 +200,7 @@ public:
         TClusterClientCachePtr clusterClientCache)
         : TAsyncExpiringCache(
             std::move(config),
-            Logger.WithTag("Cache: ClusterLivenessCheck"))
+            Logger().WithTag("Cache: ClusterLivenessCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -249,7 +244,7 @@ public:
         TClusterClientCachePtr clusterClientCache)
         : TAsyncExpiringCache(
             std::move(config),
-            Logger.WithTag("Cache: ClusterIncomingReplicationCheck"))
+            Logger().WithTag("Cache: ClusterIncomingReplicationCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -301,7 +296,7 @@ public:
         TClusterClientCachePtr clusterClientCache)
         : TAsyncExpiringCache(
             std::move(config),
-            Logger.WithTag("Cache: ClusterSafeModeCheck"))
+            Logger().WithTag("Cache: ClusterSafeModeCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -347,7 +342,7 @@ public:
         TClusterClientCachePtr clusterClientCache)
         : TAsyncExpiringCache(
             std::move(config),
-            Logger.WithTag("Cache: HydraReadOnlyCheck"))
+            Logger().WithTag("Cache: HydraReadOnlyCheck"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -408,11 +403,6 @@ void FormatValue(TStringBuilderBase* builder, const TBundleHealthKey& key, TStri
         key.ClusterKey);
 }
 
-TString ToString(const TBundleHealthKey& key)
-{
-    return ToStringViaBuilder(key);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 DECLARE_REFCOUNTED_CLASS(TNewBundleHealthCache)
@@ -426,7 +416,7 @@ public:
         TClusterClientCachePtr clusterClientCache)
         : TAsyncExpiringCache(
             std::move(config),
-            Logger.WithTag("Cache: BundleHealth"))
+            Logger().WithTag("Cache: BundleHealth"))
         , ClusterClientCache_(std::move(clusterClientCache))
     { }
 
@@ -728,9 +718,31 @@ public:
             return ReplicaLagTime_;
         }
 
-        void SetReplicaLagTime(std::optional<TDuration> replicaLagTime)
+        void SetReplicaLagTime(std::optional<TDuration> replicaLagTime, TInstant now)
         {
-            ReplicaLagTime_ = replicaLagTime;
+            if (!replicaLagTime) {
+                ReplicaLagTime_ = std::nullopt;
+                LastReplicaLagTimeUpdate_ = std::nullopt;
+                YT_LOG_DEBUG("Replica lag time is zero (ReplicaId %v)", Id_);
+                return;
+            }
+
+            TDuration cappedReplicaLagTime = *replicaLagTime;
+            if (LastReplicaLagTimeUpdate_) {
+                TDuration replicaLagTimeThreshold = ReplicaLagTime_
+                    ? *ReplicaLagTime_ + (now - *LastReplicaLagTimeUpdate_)
+                    : TDuration::Max();
+                cappedReplicaLagTime = std::min(*replicaLagTime, replicaLagTimeThreshold);
+            }
+
+            ReplicaLagTime_ = cappedReplicaLagTime;
+            LastReplicaLagTimeUpdate_ = now;
+
+            YT_LOG_DEBUG(
+                "Set replica lag time (ReplicaId %v, LagTime: %v, CappedLagTime: %v)",
+                Id_,
+                *replicaLagTime,
+                cappedReplicaLagTime);
         }
 
         const TCounter& GetReplicaModeSwitchCounter() const
@@ -752,6 +764,9 @@ public:
         bool TrackingEnabled_;
         EReplicaState State_;
         std::optional<TDuration> ReplicaLagTime_;
+        // NB: This variable is added to tackle problem with lag computation in case of rare writes to tablet.
+        // Right after such writes current instant may be much larger than previous replication timestamp.
+        std::optional<TInstant> LastReplicaLagTimeUpdate_;
 
         TFuture<TString> BundleNameFuture_ = MakeFuture<TString>(
             TError("Bundle name has not been fetched yet"));
@@ -1170,16 +1185,16 @@ private:
     TClusterClientCachePtr CreateClusterClientCache() const
     {
         return New<TClusterClientCache>(
-            BIND([weakThis_ = MakeWeak(this)] (TString clusterName) -> TErrorOr<NApi::IClientPtr> {
-                auto tracker = weakThis_.Lock();
-                if (!tracker) {
+            BIND([this, weakThis = MakeWeak(this)] (const TString& clusterName) -> TErrorOr<NApi::IClientPtr> {
+                auto this_ = weakThis.Lock();
+                if (!this_) {
                     return TError("Replicated table tracker was destroyed");
                 }
 
                 YT_LOG_DEBUG("Creating client for (Cluster: %v)",
                     clusterName);
 
-                if (auto client = tracker->Host_->CreateClusterClient(clusterName)) {
+                if (auto client = Host_->CreateClusterClient(clusterName)) {
                     return client;
                 }
 
@@ -1512,11 +1527,12 @@ private:
         }
 
         int updateCount = 0;
+        auto now = TInstant::Now();
         for (auto [replicaId, lagTime] : ReplicaLagTimesOrError_.Value()) {
             auto it = IdToReplica_.find(replicaId);
             if (it != IdToReplica_.end()) {
                 ++updateCount;
-                it->second.SetReplicaLagTime(lagTime);
+                it->second.SetReplicaLagTime(lagTime, now);
             }
         }
 

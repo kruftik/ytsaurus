@@ -32,7 +32,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = BundleControllerLogger;
+static constexpr auto& Logger = BundleControllerLogger;
 static const TYPath TabletCellBundlesPath("//sys/tablet_cell_bundles");
 static const TYPath ChaosCellBundlesPath("//sys/chaos_cell_bundles");
 
@@ -45,6 +45,9 @@ static const TYPath GlobalCellRegistryPath("//sys/global_cell_registry");
 
 static const TYPath BundleAttributeClockClusterTag("options/clock_cluster_tag");
 static const TYPath BundleAttributeMetadataCellIds("metadata_cell_ids");
+
+static const TYPath BundleAttributeMuteTabletCellSnapshotCheck("mute_tablet_cell_snapshots_check");
+static const TYPath BundleAttributeMuteTabletCellsCheck("mute_tablet_cells_check");
 
 static const TString SensorTagInstanceSize = "instance_size";
 
@@ -147,21 +150,17 @@ public:
         : Bootstrap_(bootstrap)
     { }
 
-    IClientPtr Get(const TString& cluster)
+    IClientPtr Get(const TString& clusterName)
     {
-        if (const auto& client = Clients_[cluster]; client) {
+        if (const auto& client = Clients_[clusterName]; client) {
             return client;
         }
 
         auto localConnection = Bootstrap_->GetClient()->GetNativeConnection();
-        auto foreignConnection = localConnection->GetClusterDirectory()->FindConnection(cluster);
-        if (!foreignConnection) {
-            THROW_ERROR_EXCEPTION("Cluster %Qv is not known", cluster);
-        }
-
+        auto foreignConnection = localConnection->GetClusterDirectory()->GetConnectionOrThrow(clusterName);
         // TODO(capone212): Use separate user name NSecurityClient::BundleControllerUserName
         auto client = foreignConnection->CreateClient(TClientOptions::FromUser(NSecurityClient::RootUserName));
-        Clients_[cluster] = client;
+        Clients_[clusterName] = client;
 
         return client;
     }
@@ -279,10 +278,10 @@ private:
             YT_PROFILE_TIMING("/bundle_controller/scan_bundles") {
                 LinkOrchidService();
                 LinkBundleControllerService();
-                DoScanBundles();
+                DoScanTabletBundles();
                 SuccessfulScanBundleCounter_.Increment();
             }
-        } catch (const TErrorException& ex) {
+        } catch (const std::exception& ex) {
             YT_LOG_ERROR(ex, "Scanning tablet cell bundles failed");
             FailedScanBundleCounter_.Increment();
         }
@@ -292,7 +291,7 @@ private:
     {
         try {
             DoScanChaosBundles();
-        } catch (const TErrorException& ex) {
+        } catch (const std::exception& ex) {
             YT_LOG_ERROR(ex, "Scanning chaos cell bundles failed");
             FailedScanBundleCounter_.Increment();
         }
@@ -410,7 +409,7 @@ private:
         return result;
     }
 
-    void DoScanBundles() const
+    void DoScanTabletBundles() const
     {
         VERIFY_INVOKER_AFFINITY(Bootstrap_->GetControlInvoker());
 
@@ -446,6 +445,10 @@ private:
     void DoScanChaosBundles() const
     {
         VERIFY_INVOKER_AFFINITY(Bootstrap_->GetControlInvoker());
+
+        if (!Config_->EnableChaosBundleManagement) {
+            return;
+        }
 
         YT_LOG_DEBUG("Chaos bundles scan started");
 
@@ -514,7 +517,7 @@ private:
         SetInstanceAttributes(transaction, TabletCellBundlesPath, BundleTabletStaticMemoryLimits, mutations.ChangedTabletStaticMemory);
         SetInstanceAttributes(transaction, TabletCellBundlesPath, BundleAttributeShortName, mutations.ChangedBundleShortName);
 
-        SetInstanceAttributes(transaction, TabletCellBundlesPath, BundleAttributeNodeTagFilter, mutations.InitializedNodeTagFilters);
+        SetInstanceAttributes(transaction, TabletCellBundlesPath, BundleAttributeNodeTagFilter, mutations.ChangedNodeTagFilters);
         SetInstanceAttributes(transaction, TabletCellBundlesPath, BundleAttributeTargetConfig, mutations.InitializedBundleTargetConfig);
 
         for (const auto& alert : mutations.AlertsToFire) {
@@ -538,11 +541,23 @@ private:
         ChangedResourceLimitCounter_.Increment(mutations.ChangedTabletStaticMemory.size());
 
         ChangedBundleShortNameCounter_.Increment(mutations.ChangedBundleShortName.size());
-        InitializedNodeTagFilterCounter_.Increment(mutations.InitializedNodeTagFilters.size());
+        InitializedNodeTagFilterCounter_.Increment(mutations.ChangedNodeTagFilters.size());
         InitializedBundleTargetConfigCounter_.Increment(mutations.InitializedBundleTargetConfig.size());
 
         RemoveInstanceCypressNode(transaction, TabletNodesPath, mutations.NodesToCleanup);
         RemoveInstanceCypressNode(transaction, RpcProxiesPath, mutations.ProxiesToCleanup);
+
+        SetInstanceAttributes(
+            transaction,
+            TabletCellBundlesPath,
+            BundleAttributeMuteTabletCellSnapshotCheck,
+            mutations.ChangedMuteTabletCellSnapshotsCheck);
+
+        SetInstanceAttributes(
+            transaction,
+            TabletCellBundlesPath,
+            BundleAttributeMuteTabletCellsCheck,
+            mutations.ChangedMuteTabletCellsCheck);
     }
 
     void Mutate(
@@ -554,6 +569,11 @@ private:
 
         for (const auto& [cellTag, cellInfo] : mutations.CellTagsToRegister) {
             auto path = Format("%v/cell_tags/%v", GlobalCellRegistryPath, cellTag);
+            CypressSetSingleNode(transaction, path, cellInfo);
+        }
+
+        for (const auto& [cellTag, cellInfo] : mutations.AdditionalCellTagsToRegister) {
+            auto path = Format("%v/additional_cell_tags/%v", GlobalCellRegistryPath, cellTag);
             CypressSetSingleNode(transaction, path, cellInfo);
         }
 
@@ -1274,14 +1294,12 @@ private:
         const IClientBasePtr& client,
         const TString& accountName)
     {
-        auto accountPath = Format("//sys/accounts/bundle_system_quotas/%v", NYPath::ToYPathLiteral(accountName));
-
-        TCreateNodeOptions createOptions;
+        TCreateObjectOptions createOptions;
         createOptions.Attributes = CreateEphemeralAttributes();
         createOptions.Attributes->Set("parent_name", "bundle_system_quotas");
         createOptions.Attributes->Set("name", accountName);
 
-        WaitFor(client->CreateNode(accountPath, EObjectType::Account, createOptions))
+        WaitFor(client->CreateObject(EObjectType::Account, createOptions))
             .ThrowOnError();
     }
 

@@ -32,9 +32,12 @@ using namespace NObjectServer;
 using namespace NSecurityServer;
 using namespace NTableClient;
 
+using NYT::ToProto;
+using NYT::FromProto;
+
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ChunkServerLogger;
+static constexpr auto& Logger = ChunkServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -105,8 +108,13 @@ void TChunkOwnerBase::Load(NCellMaster::TLoadContext& context)
     Load(context, UpdateMode_);
     Load(context, Replication_);
     Load(context, PrimaryMediumIndex_);
-    Load(context, SnapshotStatistics_);
-    Load(context, DeltaStatistics_);
+    if (context.GetVersion() >= EMasterReign::SerializationOfDataStatistics) {
+        Load(context, SnapshotStatistics_);
+        Load(context, DeltaStatistics_);
+    } else {
+        SnapshotStatistics_ = FromProto<TChunkOwnerDataStatistics>(Load<NChunkClient::NProto::TDataStatistics>(context));
+        DeltaStatistics_ = FromProto<TChunkOwnerDataStatistics>(Load<NChunkClient::NProto::TDataStatistics>(context));
+    }
     Load(context, CompressionCodec_);
     Load(context, ErasureCodec_);
     Load(context, EnableStripedErasure_);
@@ -255,7 +263,7 @@ void TChunkOwnerBase::EndUpload(const TEndUploadContext& context)
         SetErasureCodec(*context.ErasureCodec);
     }
 
-    std::optional<TDataStatistics> updateStatistics;
+    std::optional<TChunkOwnerDataStatistics> updateStatistics;
     if (!IsExternal() && GetChunkList()->HasAppendableCumulativeStatistics()) {
         updateStatistics = ComputeUpdateStatistics();
     }
@@ -302,16 +310,16 @@ ENodeType TChunkOwnerBase::GetNodeType() const
     return ENodeType::Entity;
 }
 
-TDataStatistics TChunkOwnerBase::ComputeTotalStatistics() const
+TChunkOwnerDataStatistics TChunkOwnerBase::ComputeTotalStatistics() const
 {
     return SnapshotStatistics_ + DeltaStatistics_;
 }
 
-TDataStatistics TChunkOwnerBase::ComputeUpdateStatistics() const
+TChunkOwnerDataStatistics TChunkOwnerBase::ComputeUpdateStatistics() const
 {
     YT_VERIFY(!IsExternal());
 
-    TDataStatistics updateStatistics;
+    TChunkOwnerDataStatistics updateStatistics;
     switch (UpdateMode_) {
         case EUpdateMode::Append:
             if (auto* chunkList = GetDeltaChunkList()) {
@@ -336,7 +344,7 @@ TDataStatistics TChunkOwnerBase::ComputeUpdateStatistics() const
 
 bool TChunkOwnerBase::HasDataWeight() const
 {
-    return !HasInvalidDataWeight(SnapshotStatistics_) && !HasInvalidDataWeight(DeltaStatistics_);
+    return SnapshotStatistics_.IsDataWeightValid() && DeltaStatistics_.IsDataWeightValid();
 }
 
 void TChunkOwnerBase::CheckInvariants(TBootstrap* bootstrap) const
@@ -374,24 +382,24 @@ bool TChunkOwnerBase::IsStatisticsFixNeeded() const
 {
     YT_VERIFY(IsTrunk());
 
-    return DeltaStatistics_ != TDataStatistics();
+    return DeltaStatistics_ != TChunkOwnerDataStatistics();
 }
 
 void TChunkOwnerBase::DoFixStatistics()
 {
     // In this specific order.
     SnapshotStatistics_ = ComputeTotalStatistics();
-    DeltaStatistics_ = TDataStatistics();
+    DeltaStatistics_ = TChunkOwnerDataStatistics();
 }
 
-NSecurityServer::TClusterResources TChunkOwnerBase::GetTotalResourceUsage() const
+TClusterResources TChunkOwnerBase::GetTotalResourceUsage() const
 {
     return TCypressNode::GetTotalResourceUsage() + GetDiskUsage(ComputeTotalStatistics());
 }
 
-NSecurityServer::TClusterResources TChunkOwnerBase::GetDeltaResourceUsage() const
+TClusterResources TChunkOwnerBase::GetDeltaResourceUsage() const
 {
-    TDataStatistics statistics;
+    TChunkOwnerDataStatistics statistics;
     if (IsTrunk()) {
         statistics = DeltaStatistics_ + SnapshotStatistics_;
     } else {
@@ -409,18 +417,18 @@ NSecurityServer::TClusterResources TChunkOwnerBase::GetDeltaResourceUsage() cons
     return TCypressNode::GetDeltaResourceUsage() + GetDiskUsage(statistics);
 }
 
-NSecurityServer::TClusterResources TChunkOwnerBase::GetDiskUsage(const TDataStatistics& statistics) const
+TClusterResources TChunkOwnerBase::GetDiskUsage(const TChunkOwnerDataStatistics& statistics) const
 {
-    NSecurityServer::TClusterResources result;
+    TClusterResources result;
     for (const auto& entry : Replication()) {
         result.SetMediumDiskSpace(
             entry.GetMediumIndex(),
             CalculateDiskSpaceUsage(
                 entry.Policy().GetReplicationFactor(),
-                statistics.regular_disk_space(),
-                statistics.erasure_disk_space()));
+                statistics.RegularDiskSpace,
+                statistics.ErasureDiskSpace));
     }
-    result.SetChunkCount(statistics.chunk_count());
+    result.SetChunkCount(statistics.ChunkCount);
     return result;
 }
 

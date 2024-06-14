@@ -65,7 +65,7 @@ public:
         , Options_(options)
         , Config_(options.Config ? options.Config : New<TJournalReaderConfig>())
         , NodeDirectory_(Client_->GetNativeConnection()->GetNodeDirectory())
-        , Logger(ApiLogger.WithTag("Path: %v, TransactionId: %v",
+        , Logger(ApiLogger().WithTag("Path: %v, TransactionId: %v",
             Path_,
             Options_.TransactionId))
         , ReaderInvoker_(CreateSerializedInvoker(NChunkClient::TDispatcher::Get()->GetReaderInvoker()))
@@ -211,8 +211,11 @@ private:
                 auto codecId = FromProto<NErasure::ECodec>(chunkSpec.erasure_codec());
                 auto replicas = GetReplicasFromChunkSpec(chunkSpec);
 
+                YT_VERIFY(!chunkSpec.use_proxying_data_node_service());
+
                 CurrentChunkReader_ = NJournalClient::CreateChunkReader(
                     Config_,
+                    New<TRemoteReaderOptions>(),
                     TChunkReaderHost::FromClient(Client_),
                     chunkId,
                     codecId,

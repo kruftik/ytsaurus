@@ -49,6 +49,8 @@ struct TTableBase
     NTableClient::TTableSchemaPtr Schema = New<NTableClient::TTableSchema>();
     TGuid SchemaId;
 
+    bool IsFile() const;
+
     void Persist(const TPersistenceContext& context);
 };
 
@@ -75,6 +77,8 @@ struct TInputTable
 
     bool IsForeign() const;
     bool IsPrimary() const;
+    bool IsVersioned() const;
+    bool UseReadViaExecNode() const;
 
     //! Returns true unless teleportation is forbidden by some table options,
     //! e.g. dynamism or renamed columns.
@@ -103,7 +107,7 @@ struct TOutputTable
 
     // Revision of schema that was fetched during GetOutputTablesSchema.
     // Used later to determine which schema to send to master during BeginUploadOutputTables.
-    ui64 OriginalTableSchemaRevision = 0;
+    NHydra::TRevision OriginalTableSchemaRevision = 0;
 
     // Upload transaction id for the native and external cell.
     NTransactionClient::TTransactionId UploadTransactionId;
@@ -137,8 +141,6 @@ struct TOutputTable
     std::vector<NChunkClient::TInputChunkPtr> OutputChunks;
 
     int TableIndex;
-
-    bool IsFile() const;
 
     TOutputStreamDescriptorPtr GetStreamDescriptorTemplate(int tableIndex = -1);
 

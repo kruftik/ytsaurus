@@ -110,7 +110,7 @@ using TYPath = NYPath::TYPath;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ObjectServerLogger;
+static constexpr auto& Logger = ObjectServerLogger;
 static const IObjectTypeHandlerPtr NullTypeHandler;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -355,7 +355,7 @@ private:
         NProto::TReqDestroyObjects* request,
         const TTransactionPrepareOptions& options);
 
-    TFuture<void> DestroySequoiaObjects(NProto::TReqDestroyObjects request);
+    TFuture<void> DestroySequoiaObjects(std::unique_ptr<NProto::TReqDestroyObjects> request);
 
     void DoRemoveObject(TObject* object);
     void SendObjectLifeStageConfirmation(TObjectId objectId);
@@ -717,19 +717,19 @@ TObjectManager::TObjectManager(TBootstrap* bootstrap)
 
     RegisterLoader(
         "ObjectManager.Keys",
-        BIND(&TObjectManager::LoadKeys, Unretained(this)));
+        BIND_NO_PROPAGATE(&TObjectManager::LoadKeys, Unretained(this)));
     RegisterLoader(
         "ObjectManager.Values",
-        BIND(&TObjectManager::LoadValues, Unretained(this)));
+        BIND_NO_PROPAGATE(&TObjectManager::LoadValues, Unretained(this)));
 
     RegisterSaver(
         ESyncSerializationPriority::Keys,
         "ObjectManager.Keys",
-        BIND(&TObjectManager::SaveKeys, Unretained(this)));
+        BIND_NO_PROPAGATE(&TObjectManager::SaveKeys, Unretained(this)));
     RegisterSaver(
         ESyncSerializationPriority::Values,
         "ObjectManager.Values",
-        BIND(&TObjectManager::SaveValues, Unretained(this)));
+        BIND_NO_PROPAGATE(&TObjectManager::SaveValues, Unretained(this)));
 
     RegisterHandler(CreateMasterTypeHandler(Bootstrap_));
 
@@ -909,7 +909,7 @@ TObjectId TObjectManager::GenerateId(EObjectType type, TObjectId hintId)
 
     auto* hydraContext = GetCurrentHydraContext();
     auto version = hydraContext->GetVersion();
-    auto hash = hydraContext->RandomGenerator()->Generate<ui32>();
+    auto entropy = hydraContext->RandomGenerator()->Generate<ui32>();
 
     const auto& multicellManager = Bootstrap_->GetMulticellManager();
     auto cellTag = multicellManager->GetCellTag();
@@ -918,10 +918,10 @@ TObjectId TObjectManager::GenerateId(EObjectType type, TObjectId hintId)
     // externalized transaction ids.
     // NB: System transactions are not externalizeable.
     if (type == EObjectType::Transaction || type == EObjectType::NestedTransaction) {
-        hash &= 0xffff;
+        entropy &= 0xffff;
     }
 
-    auto result = MakeRegularId(type, cellTag, version, hash);
+    auto result = MakeRegularId(type, cellTag, version, entropy);
 
     if (auto* mutationContext = TryGetCurrentMutationContext()) {
         mutationContext->CombineStateHash(result);
@@ -1623,7 +1623,7 @@ void TObjectManager::ConfirmObjectLifeStageToPrimaryMaster(TObject* object)
     multicellManager->PostToPrimaryMaster(request);
 }
 
-void TObjectManager::AdvanceObjectLifeStageAtSecondaryMasters(NYT::NObjectServer::TObject* object)
+void TObjectManager::AdvanceObjectLifeStageAtSecondaryMasters(TObject* object)
 {
     const auto& multicellManager = Bootstrap_->GetMulticellManager();
     YT_VERIFY(multicellManager->IsPrimaryMaster());
@@ -1948,7 +1948,7 @@ void TObjectManager::HydraExecuteFollower(NProto::TReqExecute* request)
 
     auto context = CreateYPathContext(
         std::move(requestMessage),
-        ObjectServerLogger,
+        ObjectServerLogger(),
         NLogging::ELogLevel::Debug);
 
     auto identity = ParseAuthenticationIdentityFromProto(*request);
@@ -1962,17 +1962,17 @@ TFuture<void> TObjectManager::DestroyObjects(std::vector<TObjectId> objectIds)
 {
     const auto& sequoiaConfig = Bootstrap_->GetConfigManager()->GetConfig()->SequoiaManager;
 
-    NProto::TReqDestroyObjects sequoiaRequest;
+    auto sequoiaRequest = std::make_unique<NProto::TReqDestroyObjects>();
     NProto::TReqDestroyObjects nonSequoiaRequest;
     for (auto objectId : objectIds) {
         const auto& handler = GetHandler(TypeFromId(objectId));
         auto* object = handler->FindObject(objectId);
         if (!object) {
-            // Looks ok.
+            // Looks OK.
             continue;
         }
         if (sequoiaConfig->Enable && IsSequoiaId(objectId)) {
-            ToProto(sequoiaRequest.add_object_ids(), objectId);
+            ToProto(sequoiaRequest->add_object_ids(), objectId);
         } else {
             ToProto(nonSequoiaRequest.add_object_ids(), objectId);
         }
@@ -1982,12 +1982,11 @@ TFuture<void> TObjectManager::DestroyObjects(std::vector<TObjectId> objectIds)
     futures.reserve(2);
     if (!nonSequoiaRequest.object_ids().empty()) {
         futures.push_back(CreateDestroyObjectsMutation(nonSequoiaRequest)
-            ->CommitAndLog(Logger)
+            ->CommitAndLog(Logger())
             .AsVoid());
     }
-
-    if (!sequoiaRequest.object_ids().empty()) {
-        futures.push_back(DestroySequoiaObjects(sequoiaRequest));
+    if (!sequoiaRequest->object_ids().empty()) {
+        futures.push_back(DestroySequoiaObjects(std::move(sequoiaRequest)));
     }
 
     return AllSucceeded(std::move(futures))
@@ -2015,13 +2014,13 @@ void TObjectManager::HydraPrepareDestroyObjects(
     DoDestroyObjects(request);
 }
 
-TFuture<void> TObjectManager::DestroySequoiaObjects(NProto::TReqDestroyObjects request)
+TFuture<void> TObjectManager::DestroySequoiaObjects(std::unique_ptr<NProto::TReqDestroyObjects> request)
 {
     return Bootstrap_
         ->GetSequoiaClient()
         ->StartTransaction()
         .Apply(BIND([request = std::move(request), this, this_ = MakeStrong(this)] (const ISequoiaTransactionPtr& transaction) mutable {
-            for (auto protoId : request.object_ids()) {
+            for (const auto& protoId : request->object_ids()) {
                 auto id = FromProto<TObjectId>(protoId);
                 auto type = TypeFromId(id);
                 const auto& handler = GetHandler(type);
@@ -2034,13 +2033,12 @@ TFuture<void> TObjectManager::DestroySequoiaObjects(NProto::TReqDestroyObjects r
 
             transaction->AddTransactionAction(
                 Bootstrap_->GetCellTag(),
-                NTransactionClient::MakeTransactionActionData(request));
+                NTransactionClient::MakeTransactionActionData(*request));
 
             NApi::TTransactionCommitOptions commitOptions{
                 .CoordinatorCellId = Bootstrap_->GetCellId(),
                 .CoordinatorPrepareMode = NApi::ETransactionCoordinatorPrepareMode::Late,
             };
-
             return transaction->Commit(commitOptions);
         }).AsyncVia(EpochAutomatonInvoker_));
 }
@@ -2327,13 +2325,16 @@ void TObjectManager::CheckRemovingObjectRefCounter(TObject* object)
     }
 }
 
-void TObjectManager::CheckObjectLifeStageVoteCount(NYT::NObjectServer::TObject* object)
+void TObjectManager::CheckObjectLifeStageVoteCount(TObject* object)
 {
+    YT_VERIFY(HasMutationContext());
+
     while (true) {
+        const auto& multicellManager = Bootstrap_->GetMulticellManager();
         auto voteCount = object->GetLifeStageVoteCount();
-        const auto& secondaryCellTags = Bootstrap_->GetMulticellManager()->GetSecondaryCellTags();
-        YT_VERIFY(voteCount <= std::ssize(secondaryCellTags) + 1);
-        if (voteCount < std::ssize(secondaryCellTags) + 1) {
+        auto votingCellCount = std::ssize(multicellManager->GetRegisteredMasterCellTags()) + 1;
+        YT_VERIFY(voteCount <= votingCellCount);
+        if (voteCount < votingCellCount) {
             break;
         }
 

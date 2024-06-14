@@ -17,7 +17,7 @@ TGroup::TGroup(
     const NLogging::TLogger& Logger)
     : Id_(id)
     , OnGroupEmptied_(std::move(onGroupEmptied))
-    , Logger(Logger.WithTag("GroupId: %v", Id_))
+    , Logger(Logger().WithTag("GroupId: %v", Id_))
 { }
 
 TMemberPtr TGroup::AddOrUpdateMember(const TMemberInfo& memberInfo, TDuration leaseTimeout)
@@ -47,7 +47,7 @@ TMemberPtr TGroup::AddMember(const TMemberInfo& memberInfo, TDuration leaseTimeo
 {
     VERIFY_WRITER_SPINLOCK_AFFINITY(MembersLock_);
 
-    auto onMemberLeaseExpired = BIND([=, this, memberId = memberInfo.Id, weakThis = MakeWeak(this)] {
+    auto onMemberLeaseExpired = BIND([=, this, weakThis = MakeWeak(this), memberId = memberInfo.Id] {
         auto this_ = weakThis.Lock();
         if (!this_) {
             return;

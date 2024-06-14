@@ -29,6 +29,7 @@ GO_TEST_SRCS(
     fuzz_test.go
     lz4convert_test.go
     lz4sconvert_test.go
+    reader_test.go
     s2_test.go
     writer_test.go
 )

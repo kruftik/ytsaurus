@@ -60,6 +60,10 @@ public:
     {
         YT_UNIMPLEMENTED();
     }
+    const NQueryClient::IExpressionEvaluatorCachePtr& GetExpressionEvaluatorCache() override
+    {
+        YT_UNIMPLEMENTED();
+    }
     const NChunkClient::IBlockCachePtr& GetBlockCache() override
     {
         YT_UNIMPLEMENTED();
@@ -174,7 +178,7 @@ public:
         YT_UNIMPLEMENTED();
     }
 
-    NRpc::IChannelPtr GetQueueAgentChannelOrNull(TStringBuf /*stage*/) const override
+    NRpc::IChannelPtr FindQueueAgentChannel(TStringBuf /*stage*/) const override
     {
         YT_UNIMPLEMENTED();
     }
@@ -190,6 +194,11 @@ public:
     }
 
     std::pair<NApi::NNative::IClientPtr, TString> GetQueryTrackerStage(const TString& /*stage*/) override
+    {
+        YT_UNIMPLEMENTED();
+    }
+
+    NRpc::IChannelPtr GetQueryTrackerChannelOrThrow(const TString& /*stage*/) override
     {
         YT_UNIMPLEMENTED();
     }
@@ -240,6 +249,11 @@ public:
     }
 
     NApi::NNative::IClientPtr CreateNativeClient(const NApi::TClientOptions& /*options*/) override
+    {
+        YT_UNIMPLEMENTED();
+    }
+
+    std::vector<TString> GetDiscoveryServerAddresses() const override
     {
         YT_UNIMPLEMENTED();
     }

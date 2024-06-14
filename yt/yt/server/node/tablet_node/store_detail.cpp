@@ -10,6 +10,7 @@
 #include "hunk_chunk.h"
 #include "tablet_snapshot_store.h"
 #include "versioned_chunk_meta_manager.h"
+#include "serialize.h"
 
 #include <yt/yt/server/lib/tablet_node/proto/tablet_manager.pb.h>
 
@@ -416,7 +417,7 @@ TStoreBase::TStoreBase(
     , ColumnLockCount_(Tablet_->GetColumnLockCount())
     , LockIndexToName_(Tablet_->LockIndexToName())
     , ColumnIndexToLockIndex_(Tablet_->ColumnIndexToLockIndex())
-    , Logger(TabletNodeLogger.WithTag("StoreId: %v, TabletId: %v",
+    , Logger(TabletNodeLogger().WithTag("StoreId: %v, TabletId: %v",
         StoreId_,
         TabletId_))
 {

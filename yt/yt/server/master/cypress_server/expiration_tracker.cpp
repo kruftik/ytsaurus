@@ -25,7 +25,7 @@ using namespace NObjectClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CypressServerLogger;
+static constexpr auto& Logger = CypressServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -49,7 +49,13 @@ void TExpirationTracker::Start()
         expiredNodes.size());
 
     for (auto* trunkNode : expiredNodes) {
-        YT_ASSERT(!trunkNode->GetExpirationTimeIterator() && !trunkNode->GetExpirationTimeoutIterator());
+        if (trunkNode->GetExpirationTimeIterator()) {
+            UnregisterNodeExpirationTime(trunkNode);
+        }
+
+        if (trunkNode->GetExpirationTimeoutIterator()) {
+            UnregisterNodeExpirationTimeout(trunkNode);
+        }
 
         if (auto expirationTime = trunkNode->TryGetExpirationTime()) {
             RegisterNodeExpirationTime(trunkNode, *expirationTime);
@@ -336,7 +342,7 @@ void TExpirationTracker::OnCheck()
         request.node_ids_size());
 
     YT_UNUSED_FUTURE(CreateMutation(hydraManager, request)
-        ->CommitAndLog(Logger));
+        ->CommitAndLog(Logger()));
 }
 
 bool TExpirationTracker::IsRecovery() const

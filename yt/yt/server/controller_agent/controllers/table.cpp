@@ -28,6 +28,11 @@ void TLivePreviewTableBase::Persist(const TPersistenceContext& context)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+bool TTableBase::IsFile() const
+{
+    return Type == EObjectType::File;
+}
+
 void TTableBase::Persist(const TPersistenceContext &context)
 {
     TUserObject::Persist(context);
@@ -47,6 +52,16 @@ bool TInputTable::IsForeign() const
 bool TInputTable::IsPrimary() const
 {
     return !IsForeign();
+}
+
+bool TInputTable::IsVersioned() const
+{
+    return Dynamic && Schema->IsSorted();
+}
+
+bool TInputTable::UseReadViaExecNode() const
+{
+    return Path.GetReadViaExecNode();
 }
 
 bool TInputTable::SupportsTeleportation() const
@@ -71,12 +86,6 @@ TOutputTable::TOutputTable(NYPath::TRichYPath path, EOutputTableType outputType)
     : TTableBase(std::move(path))
     , OutputType(outputType)
 { }
-
-
-bool TOutputTable::IsFile() const
-{
-    return Type == EObjectType::File;
-}
 
 bool TOutputTable::IsBeginUploadCompleted() const
 {

@@ -84,15 +84,17 @@ void TSchedulerElement::UpdateTreeConfig(const TFairShareStrategyTreeConfigPtr& 
     TreeConfig_ = config;
 }
 
-void TSchedulerElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdateContext* context)
+void TSchedulerElement::InitializeUpdate(TInstant /*now*/, const std::optional<NVectorHdrf::TFairShareUpdateContext>& context)
 {
     YT_VERIFY(Mutable_);
 
-    // NB: The order of computation must not be changed.
-    TotalResourceLimits_ = context->TotalResourceLimits;
-    SchedulingTagFilterResourceLimits_ = ComputeSchedulingTagFilterResourceLimits();
     MaybeSpecifiedResourceLimits_ = ComputeMaybeSpecifiedResourceLimits();
-    ResourceLimits_ = ComputeResourceLimits();
+    if (!StrategyHost_->IsFairSharePreUpdateOffloadingEnabled()) {
+        TotalResourceLimits_ = context->TotalResourceLimits;
+        // COMPAT(renadeen) this code will be refactored after we switch hahn to offloaded version of fair share preupdate.
+        SchedulingTagFilterResourceLimits_ = ComputeSchedulingTagFilterResourceLimits(nullptr);
+        ResourceLimits_ = ComputeResourceLimits();
+    }
 
     if (PersistentAttributes_.AppliedSpecifiedResourceLimits != MaybeSpecifiedResourceLimits_) {
         std::vector<TResourceTreeElementPtr> descendantOperationElements;
@@ -108,6 +110,16 @@ void TSchedulerElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdateContext* 
         ResourceTreeElement_->SetSpecifiedResourceLimits(MaybeSpecifiedResourceLimits_, descendantOperationElements);
         PersistentAttributes_.AppliedSpecifiedResourceLimits = MaybeSpecifiedResourceLimits_;
     }
+}
+
+void TSchedulerElement::PreUpdate(TFairSharePreUpdateContext* context)
+{
+    YT_VERIFY(Mutable_);
+
+    // NB: The order of computation must not be changed.
+    TotalResourceLimits_ = context->TotalResourceLimits;
+    SchedulingTagFilterResourceLimits_ = ComputeSchedulingTagFilterResourceLimits(context);
+    ResourceLimits_ = ComputeResourceLimits();
 }
 
 void TSchedulerElement::ComputeSatisfactionRatioAtUpdate()
@@ -510,10 +522,10 @@ bool TSchedulerElement::AreTotalResourceLimitsStable() const
     return now >= connectionTime + timeout;
 }
 
-TJobResources TSchedulerElement::ComputeSchedulingTagFilterResourceLimits() const
+TJobResources TSchedulerElement::ComputeSchedulingTagFilterResourceLimits(TFairSharePreUpdateContext* context) const
 {
     // Shortcut: if the scheduling tag filter is empty then we just use the resource limits for
-    // the tree's nodes filter, which were computed earlier in PreUpdateBottomUp.
+    // the tree's nodes filter, which were computed earlier in PreUpdate.
     if (GetSchedulingTagFilter() == EmptySchedulingTagFilter) {
         return TotalResourceLimits_;
     }
@@ -523,7 +535,21 @@ TJobResources TSchedulerElement::ComputeSchedulingTagFilterResourceLimits() cons
         return TJobResources::Infinite();
     }
 
-    return GetHost()->GetResourceLimits(TreeConfig_->NodesFilter & GetSchedulingTagFilter());
+    auto tagFilter = TreeConfig_->NodesFilter & GetSchedulingTagFilter();
+
+    if (!StrategyHost_->IsFairSharePreUpdateOffloadingEnabled()) {
+        return GetHost()->GetResourceLimits(tagFilter);
+    }
+
+    auto& resourceLimitsByTagFilter = context->ResourceLimitsByTagFilter;
+    auto it = resourceLimitsByTagFilter.find(tagFilter);
+    if (it != resourceLimitsByTagFilter.end()) {
+        return it->second;
+    }
+
+    auto result = GetHost()->GetResourceLimits(tagFilter);
+    EmplaceOrCrash(resourceLimitsByTagFilter, tagFilter, result);
+    return result;
 }
 
 TJobResources TSchedulerElement::GetSchedulingTagFilterResourceLimits() const
@@ -588,39 +614,10 @@ bool TSchedulerElement::AreDetailedLogsEnabled() const
     return false;
 }
 
+// TODO(eshcherbin): Refactor or rename, because limited demand share is not a recursive attribute.
 void TSchedulerElement::UpdateRecursiveAttributes()
 {
     YT_VERIFY(Mutable_);
-
-    if (IsRoot()) {
-        YT_VERIFY(GetSpecifiedFairShareStarvationTolerance());
-        EffectiveFairShareStarvationTolerance_ = *GetSpecifiedFairShareStarvationTolerance();
-
-        YT_VERIFY(GetSpecifiedFairShareStarvationTimeout());
-        EffectiveFairShareStarvationTimeout_ = *GetSpecifiedFairShareStarvationTimeout();
-
-        YT_VERIFY(IsAggressiveStarvationEnabled());
-        EffectiveAggressiveStarvationEnabled_ = *IsAggressiveStarvationEnabled();
-
-        YT_VERIFY(GetSpecifiedNonPreemptibleResourceUsageThresholdConfig());
-        EffectiveNonPreemptibleResourceUsageThresholdConfig_ = GetSpecifiedNonPreemptibleResourceUsageThresholdConfig();
-    } else {
-        YT_VERIFY(Parent_);
-
-        EffectiveFairShareStarvationTolerance_ = GetSpecifiedFairShareStarvationTolerance().value_or(
-            Parent_->GetEffectiveFairShareStarvationTolerance());
-
-        EffectiveFairShareStarvationTimeout_ = GetSpecifiedFairShareStarvationTimeout().value_or(
-            Parent_->GetEffectiveFairShareStarvationTimeout());
-
-        EffectiveAggressiveStarvationEnabled_ = IsAggressiveStarvationEnabled()
-            .value_or(Parent_->GetEffectiveAggressiveStarvationEnabled());
-
-        EffectiveNonPreemptibleResourceUsageThresholdConfig_ = Parent_->EffectiveNonPreemptibleResourceUsageThresholdConfig();
-        if (const auto& specifiedConfig = GetSpecifiedNonPreemptibleResourceUsageThresholdConfig()) {
-            EffectiveNonPreemptibleResourceUsageThresholdConfig_ = specifiedConfig;
-        }
-    }
 
     LimitedDemandShare_ = ComputeLimitedDemandShare();
 }
@@ -731,7 +728,7 @@ void TSchedulerCompositeElement::UpdateTreeConfig(const TFairShareStrategyTreeCo
     updateChildrenConfig(DisabledChildren_);
 }
 
-void TSchedulerCompositeElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdateContext* context)
+void TSchedulerCompositeElement::InitializeUpdate(TInstant now, const std::optional<NVectorHdrf::TFairShareUpdateContext>& context)
 {
     YT_VERIFY(Mutable_);
 
@@ -739,7 +736,7 @@ void TSchedulerCompositeElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdate
     ResourceDemand_ = {};
 
     for (const auto& child : EnabledChildren_) {
-        child->PreUpdateBottomUp(context);
+        child->InitializeUpdate(now, context);
 
         ResourceUsageAtUpdate_ += child->GetResourceUsageAtUpdate();
         ResourceDemand_ += child->GetResourceDemand();
@@ -754,11 +751,21 @@ void TSchedulerCompositeElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdate
             // Yes, but nobody uses this feature yet, so it's not really important.
             // NB(eshcherbin): |child->Attributes().UsageShare| is not calculated at this stage yet, so we do it manually.
             auto usageShare = TResourceVector::FromJobResources(child->GetResourceUsageAtUpdate(), child->GetTotalResourceLimits());
-            child->PersistentAttributes_.HistoricUsageAggregator.UpdateAt(context->Now, MaxComponent(usageShare));
+            child->PersistentAttributes_.HistoricUsageAggregator.UpdateAt(now, MaxComponent(usageShare));
         }
     }
 
-    TSchedulerElement::PreUpdateBottomUp(context);
+    TSchedulerElement::InitializeUpdate(now, context);
+}
+
+void TSchedulerCompositeElement::PreUpdate(TFairSharePreUpdateContext* context)
+{
+    YT_VERIFY(Mutable_);
+    for (const auto& child : EnabledChildren_) {
+        child->PreUpdate(context);
+    }
+
+    TSchedulerElement::PreUpdate(context);
 }
 
 void TSchedulerCompositeElement::BuildSchedulableChildrenLists(TFairSharePostUpdateContext* context)
@@ -1144,22 +1151,6 @@ void TSchedulerCompositeElement::UpdateRecursiveAttributes()
 
     TSchedulerElement::UpdateRecursiveAttributes();
 
-    if (IsRoot()) {
-        YT_VERIFY(GetSpecifiedFifoPoolSchedulingOrder());
-        EffectiveFifoPoolSchedulingOrder_ = *GetSpecifiedFifoPoolSchedulingOrder();
-
-        YT_VERIFY(ShouldUsePoolSatisfactionForScheduling());
-        EffectiveUsePoolSatisfactionForScheduling_ = *ShouldUsePoolSatisfactionForScheduling();
-    } else {
-        YT_VERIFY(Parent_);
-
-        EffectiveFifoPoolSchedulingOrder_ = GetSpecifiedFifoPoolSchedulingOrder().value_or(
-            Parent_->GetEffectiveFifoPoolSchedulingOrder());
-
-        EffectiveUsePoolSatisfactionForScheduling_ = ShouldUsePoolSatisfactionForScheduling().value_or(
-            Parent_->GetEffectiveUsePoolSatisfactionForScheduling());
-    }
-
     for (const auto& child : EnabledChildren_) {
         child->UpdateRecursiveAttributes();
     }
@@ -1360,6 +1351,33 @@ TIntegralResourcesState& TSchedulerPoolElement::IntegralResourcesState()
 ESchedulableStatus TSchedulerPoolElement::GetStatus() const
 {
     return TSchedulerElement::GetStatusImpl(EffectiveFairShareStarvationTolerance_);
+}
+
+void TSchedulerPoolElement::UpdateRecursiveAttributes()
+{
+    YT_VERIFY(Mutable_);
+
+    EffectiveFifoPoolSchedulingOrder_ = GetSpecifiedFifoPoolSchedulingOrder().value_or(
+        Parent_->GetEffectiveFifoPoolSchedulingOrder());
+
+    EffectiveUsePoolSatisfactionForScheduling_ = ShouldUsePoolSatisfactionForScheduling().value_or(
+        Parent_->GetEffectiveUsePoolSatisfactionForScheduling());
+
+    EffectiveFairShareStarvationTolerance_ = GetSpecifiedFairShareStarvationTolerance().value_or(
+        Parent_->GetEffectiveFairShareStarvationTolerance());
+
+    EffectiveFairShareStarvationTimeout_ = GetSpecifiedFairShareStarvationTimeout().value_or(
+        Parent_->GetEffectiveFairShareStarvationTimeout());
+
+    EffectiveAggressiveStarvationEnabled_ = IsAggressiveStarvationEnabled().value_or(
+        Parent_->GetEffectiveAggressiveStarvationEnabled());
+
+    EffectiveNonPreemptibleResourceUsageThresholdConfig_ = Parent_->EffectiveNonPreemptibleResourceUsageThresholdConfig();
+    if (const auto& specifiedConfig = GetSpecifiedNonPreemptibleResourceUsageThresholdConfig()) {
+        EffectiveNonPreemptibleResourceUsageThresholdConfig_ = specifiedConfig;
+    }
+
+    TSchedulerCompositeElement::UpdateRecursiveAttributes();
 }
 
 std::optional<double> TSchedulerPoolElement::GetSpecifiedFairShareStarvationTolerance() const
@@ -1763,18 +1781,18 @@ TSchedulerOperationElement::TSchedulerOperationElement(
 
 std::optional<double> TSchedulerOperationElement::GetSpecifiedFairShareStarvationTolerance() const
 {
-    return std::nullopt;
+    return Spec_->FairShareStarvationTolerance;
 }
 
 std::optional<TDuration> TSchedulerOperationElement::GetSpecifiedFairShareStarvationTimeout() const
 {
-    return std::nullopt;
+    return Spec_->FairShareStarvationTimeout;
 }
 
 void TSchedulerOperationElement::DisableNonAliveElements()
 { }
 
-void TSchedulerOperationElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdateContext* context)
+void TSchedulerOperationElement::InitializeUpdate(TInstant now, const std::optional<NVectorHdrf::TFairShareUpdateContext>& context)
 {
     YT_VERIFY(Mutable_);
 
@@ -1791,7 +1809,7 @@ void TSchedulerOperationElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdate
     Tentative_ = RuntimeParameters_->Tentative;
     StartTime_ = OperationHost_->GetStartTime();
 
-    TSchedulerElement::PreUpdateBottomUp(context);
+    TSchedulerElement::InitializeUpdate(now, context);
 
     // NB(eshcherbin): This is a hotfix, see YT-19127.
     if (Spec_->ApplySpecifiedResourceLimitsToDemand && MaybeSpecifiedResourceLimits_) {
@@ -1802,8 +1820,39 @@ void TSchedulerOperationElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdate
         PendingAllocationCount_ = TotalNeededResources_.GetUserSlots();
     }
 
-    // NB: It was moved from regular fair share update for performing split.
-    // It can be performed in fair share thread as second step of preupdate.
+    if (!StrategyHost_->IsFairSharePreUpdateOffloadingEnabled()) {
+        // NB: It was moved from regular fair share update for performing split.
+        // It can be performed in fair share thread as second step of preupdate.
+        if (context->Now >= PersistentAttributes_.LastBestAllocationShareUpdateTime + TreeConfig_->BestAllocationShareUpdatePeriod &&
+            AreTotalResourceLimitsStable())
+        {
+            auto allocationLimits = GetAdjustedResourceLimits(
+                ResourceDemand_,
+                TotalResourceLimits_,
+                GetHost()->GetExecNodeMemoryDistribution(SchedulingTagFilter_ & TreeConfig_->NodesFilter));
+            PersistentAttributes_.BestAllocationShare = TResourceVector::FromJobResources(allocationLimits, TotalResourceLimits_);
+            PersistentAttributes_.LastBestAllocationShareUpdateTime = context->Now;
+
+            YT_LOG_DEBUG("Updated operation best allocation share (AdjustedResourceLimits: %v, TotalResourceLimits: %v, BestAllocationShare: %.6g)",
+                FormatResources(allocationLimits),
+                FormatResources(TotalResourceLimits_),
+                PersistentAttributes_.BestAllocationShare);
+        }
+    }
+
+    for (const auto& allocationResourcesWithQuota : DetailedMinNeededAllocationResources_) {
+        for (auto [index, _] : allocationResourcesWithQuota.DiskQuota().DiskSpacePerMedium) {
+            DiskRequestMedia_.insert(index);
+        }
+    }
+}
+
+void TSchedulerOperationElement::PreUpdate(TFairSharePreUpdateContext* context)
+{
+    YT_VERIFY(Mutable_);
+
+    TSchedulerElement::PreUpdate(context);
+
     if (context->Now >= PersistentAttributes_.LastBestAllocationShareUpdateTime + TreeConfig_->BestAllocationShareUpdatePeriod &&
         AreTotalResourceLimitsStable())
     {
@@ -1818,12 +1867,6 @@ void TSchedulerOperationElement::PreUpdateBottomUp(NVectorHdrf::TFairShareUpdate
             FormatResources(allocationLimits),
             FormatResources(TotalResourceLimits_),
             PersistentAttributes_.BestAllocationShare);
-    }
-
-    for (const auto& allocationResourcesWithQuota : DetailedMinNeededAllocationResources_) {
-        for (auto [index, _] : allocationResourcesWithQuota.DiskQuota().DiskSpacePerMedium) {
-            DiskRequestMedia_.insert(index);
-        }
     }
 }
 
@@ -1843,19 +1886,30 @@ void TSchedulerOperationElement::UpdateRecursiveAttributes()
 {
     TSchedulerElement::UpdateRecursiveAttributes();
 
-    // TODO(eshcherbin): Consider deleting this option from operation spec, as it is useless.
-    if (auto unpreemptibleAllocationCount = Spec_->MaxUnpreemptibleRunningAllocationCount) {
-        auto effectiveThresholdConfig = EffectiveNonPreemptibleResourceUsageThresholdConfig_->Clone();
-        if (effectiveThresholdConfig->UserSlots) {
-            effectiveThresholdConfig->UserSlots = std::min(
-                *effectiveThresholdConfig->UserSlots,
-                *unpreemptibleAllocationCount);
-        } else {
-            effectiveThresholdConfig->UserSlots = *unpreemptibleAllocationCount;
-        }
-
-        EffectiveNonPreemptibleResourceUsageThresholdConfig_ = std::move(effectiveThresholdConfig);
+    // These attributes can be overwritten in operations, but only if the new values are more conservative.
+    EffectiveFairShareStarvationTolerance_ = Parent_->GetEffectiveFairShareStarvationTolerance();
+    if (const auto& specifiedTolerance = GetSpecifiedFairShareStarvationTolerance()) {
+        EffectiveFairShareStarvationTolerance_ = std::min(EffectiveFairShareStarvationTolerance_, *specifiedTolerance);
     }
+    EffectiveFairShareStarvationTimeout_ = Parent_->GetEffectiveFairShareStarvationTimeout();
+    if (const auto& specifiedTimeout = GetSpecifiedFairShareStarvationTimeout()) {
+        EffectiveFairShareStarvationTimeout_ = std::max(EffectiveFairShareStarvationTimeout_, *specifiedTimeout);
+    }
+    EffectiveNonPreemptibleResourceUsageThresholdConfig_ = Parent_->EffectiveNonPreemptibleResourceUsageThresholdConfig();
+    if (const auto& specifiedThresholdConfig = GetSpecifiedNonPreemptibleResourceUsageThresholdConfig()) {
+        auto newEffectiveConfig = EffectiveNonPreemptibleResourceUsageThresholdConfig_->Clone();
+        TJobResourcesConfig::ForEachResource([&] (auto NVectorHdrf::TJobResourcesConfig::* resourceDataMember, EJobResourceType /*resourceType*/) {
+            auto& effectiveThreshold = newEffectiveConfig.Get()->*resourceDataMember;
+            auto& specifiedThreshold = specifiedThresholdConfig.Get()->*resourceDataMember;
+            if (!effectiveThreshold || (specifiedThreshold && *specifiedThreshold < *effectiveThreshold)) {
+                effectiveThreshold = specifiedThreshold;
+            }
+        });
+        EffectiveNonPreemptibleResourceUsageThresholdConfig_ = std::move(newEffectiveConfig);
+    }
+
+    // These attributes cannot be overwritten in operations.
+    EffectiveAggressiveStarvationEnabled_ = Parent_->GetEffectiveAggressiveStarvationEnabled();
 }
 
 void TSchedulerOperationElement::OnFifoSchedulableElementCountLimitReached(TFairSharePostUpdateContext* context)
@@ -1908,15 +1962,9 @@ TOperationFairShareTreeRuntimeParametersPtr TSchedulerOperationElement::GetRunti
     return RuntimeParameters_;
 }
 
-std::optional<bool> TSchedulerOperationElement::IsAggressiveStarvationEnabled() const
-{
-    // TODO(eshcherbin): There is no way we really want to have this option in operation spec.
-    return Spec_->EnableAggressiveStarvation;
-}
-
 TJobResourcesConfigPtr TSchedulerOperationElement::GetSpecifiedNonPreemptibleResourceUsageThresholdConfig() const
 {
-    return {};
+    return Spec_->NonPreemptibleResourceUsageThreshold;
 }
 
 std::optional<double> TSchedulerOperationElement::GetSpecifiedWeight() const
@@ -2173,9 +2221,9 @@ void TSchedulerOperationElement::DecreaseHierarchicalResourceUsagePrecommit(cons
     TreeElementHost_->GetResourceTree()->IncreaseHierarchicalResourceUsagePrecommit(ResourceTreeElement_, -precommittedResources);
 }
 
-void TSchedulerOperationElement::CommitHierarchicalResourceUsage(const TJobResources& resourceUsage, const TJobResources& precommitedResources)
+void TSchedulerOperationElement::CommitHierarchicalResourceUsage(const TJobResources& resourceUsage, const TJobResources& precommittedResources)
 {
-    TreeElementHost_->GetResourceTree()->CommitHierarchicalResourceUsage(ResourceTreeElement_, resourceUsage, precommitedResources);
+    TreeElementHost_->GetResourceTree()->CommitHierarchicalResourceUsage(ResourceTreeElement_, resourceUsage, precommittedResources);
 }
 
 void TSchedulerOperationElement::ReleaseResources(bool markAsNonAlive)
@@ -2371,7 +2419,7 @@ TSchedulerRootElement::TSchedulerRootElement(const TSchedulerRootElement& other)
     , TSchedulerRootElementFixedState(other)
 { }
 
-void TSchedulerRootElement::PreUpdate(NVectorHdrf::TFairShareUpdateContext* context)
+void TSchedulerRootElement::InitializeFairShareUpdate(TInstant now, const std::optional<NVectorHdrf::TFairShareUpdateContext>& context)
 {
     YT_VERIFY(Mutable_);
 
@@ -2379,7 +2427,7 @@ void TSchedulerRootElement::PreUpdate(NVectorHdrf::TFairShareUpdateContext* cont
 
     DisableNonAliveElements();
 
-    PreUpdateBottomUp(context);
+    InitializeUpdate(now, context);
 }
 
 /// Steps of fair share post update:
@@ -2406,6 +2454,31 @@ void TSchedulerRootElement::PostUpdate(TFairSharePostUpdateContext* postUpdateCo
 
     ComputeSatisfactionRatioAtUpdate();
     BuildPoolSatisfactionDigests(postUpdateContext);
+}
+
+void TSchedulerRootElement::UpdateRecursiveAttributes()
+{
+    YT_VERIFY(Mutable_);
+
+    YT_VERIFY(GetSpecifiedFairShareStarvationTolerance());
+    EffectiveFairShareStarvationTolerance_ = *GetSpecifiedFairShareStarvationTolerance();
+
+    YT_VERIFY(GetSpecifiedFairShareStarvationTimeout());
+    EffectiveFairShareStarvationTimeout_ = *GetSpecifiedFairShareStarvationTimeout();
+
+    YT_VERIFY(IsAggressiveStarvationEnabled());
+    EffectiveAggressiveStarvationEnabled_ = *IsAggressiveStarvationEnabled();
+
+    YT_VERIFY(GetSpecifiedNonPreemptibleResourceUsageThresholdConfig());
+    EffectiveNonPreemptibleResourceUsageThresholdConfig_ = GetSpecifiedNonPreemptibleResourceUsageThresholdConfig();
+
+    YT_VERIFY(GetSpecifiedFifoPoolSchedulingOrder());
+    EffectiveFifoPoolSchedulingOrder_ = *GetSpecifiedFifoPoolSchedulingOrder();
+
+    YT_VERIFY(ShouldUsePoolSatisfactionForScheduling());
+    EffectiveUsePoolSatisfactionForScheduling_ = *ShouldUsePoolSatisfactionForScheduling();
+
+    TSchedulerCompositeElement::UpdateRecursiveAttributes();
 }
 
 const TSchedulingTagFilter& TSchedulerRootElement::GetSchedulingTagFilter() const

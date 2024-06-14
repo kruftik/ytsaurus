@@ -129,9 +129,14 @@ int TLegacyDataSlice::GetRangeIndex() const
 
 TInputChunkPtr TLegacyDataSlice::GetSingleUnversionedChunk() const
 {
+    return GetSingleUnversionedChunkSlice()->GetInputChunk();
+}
+
+TInputChunkSlicePtr TLegacyDataSlice::GetSingleUnversionedChunkSlice() const
+{
     YT_VERIFY(IsTrivial());
 
-    return ChunkSlices[0]->GetInputChunk();
+    return ChunkSlices[0];
 }
 
 bool TLegacyDataSlice::IsTrivial() const
@@ -300,9 +305,11 @@ void Serialize(const TLegacyDataSlicePtr& dataSlice, IYsonConsumer* consumer)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TString ToString(const TLegacyDataSlicePtr& dataSlice)
+void FormatValue(TStringBuilderBase* builder, const TLegacyDataSlicePtr& dataSlice, TStringBuf /*spec*/)
 {
-    return Format("Type: %v, LowerLimit: %v, UpperLimit: %v, ChunkSlices: %v",
+    Format(
+        builder,
+        "Type: %v, LowerLimit: %v, UpperLimit: %v, ChunkSlices: %v",
         dataSlice->Type,
         dataSlice->IsLegacy ? ToString(dataSlice->LegacyLowerLimit()) : ToString(dataSlice->LowerLimit()),
         dataSlice->IsLegacy ? ToString(dataSlice->LegacyUpperLimit()) : ToString(dataSlice->UpperLimit()),

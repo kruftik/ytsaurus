@@ -135,6 +135,17 @@ def build_configs(yt_config, ports_generator, dirs, logs_dir, binary_to_version)
         logs_dir,
         yt_config)
 
+    kafka_proxy_configs = _build_kafka_proxy_configs(
+        deepcopy(master_connection_configs),
+        deepcopy(clock_connection_config),
+        discovery_configs,
+        timestamp_provider_addresses,
+        master_cache_addresses,
+        cypress_proxy_rpc_ports,
+        ports_generator,
+        logs_dir,
+        yt_config)
+
     scheduler_configs = _build_scheduler_configs(
         dirs["scheduler"],
         deepcopy(master_connection_configs),
@@ -253,6 +264,7 @@ def build_configs(yt_config, ports_generator, dirs, logs_dir, binary_to_version)
         "clock": clock_configs,
         "discovery": discovery_configs,
         "queue_agent": queue_agent_configs,
+        "kafka_proxy": kafka_proxy_configs,
         "timestamp_provider": timestamp_provider_configs,
         "cell_balancer": cell_balancer_configs,
         "driver": driver_configs,
@@ -488,7 +500,8 @@ def _build_discovery_server_configs(yt_config, ports_generator, logs_dir):
     ports = []
 
     for i in xrange(yt_config.discovery_server_count):
-        rpc_port, monitoring_port = next(ports_generator), next(ports_generator)
+        rpc_port = yt_config.discovery_server_ports[i] if yt_config.discovery_server_ports else next(ports_generator)
+        monitoring_port = next(ports_generator)
         address = to_yson_type("{0}:{1}".format(yt_config.fqdn, rpc_port))
         server_addresses.append(address)
         ports.append((rpc_port, monitoring_port))
@@ -548,6 +561,48 @@ def _build_queue_agent_configs(master_connection_configs,
         config["monitoring_port"] = next(ports_generator)
 
         set_at(config, "queue_agent/stage", "production")
+
+        configs.append(config)
+
+    return configs
+
+
+def _build_kafka_proxy_configs(master_connection_configs,
+                               clock_connection_config,
+                               discovery_configs,
+                               timestamp_provider_addresses,
+                               master_cache_addresses,
+                               cypress_proxy_rpc_ports,
+                               ports_generator,
+                               logs_dir,
+                               yt_config):
+    configs = []
+    for i in xrange(yt_config.kafka_proxy_count):
+        config = default_config.get_kafka_proxy_config()
+
+        config["port"] = next(ports_generator)
+        config["rpc_port"] = next(ports_generator)
+
+        init_singletons(config, yt_config, i)
+
+        init_jaeger_collector(config, "kafka_proxy", {
+            "kafka_proxy_index": str(i)
+        })
+
+        config["logging"] = _init_logging(logs_dir,
+                                          "kafka-proxy-" + str(i),
+                                          yt_config)
+        config["cluster_connection"] = \
+            _build_cluster_connection_config(
+                yt_config,
+                master_connection_configs,
+                clock_connection_config,
+                discovery_configs,
+                timestamp_provider_addresses,
+                master_cache_addresses,
+                cypress_proxy_rpc_ports)
+
+        config["monitoring_port"] = next(ports_generator)
 
         configs.append(config)
 
@@ -838,6 +893,10 @@ def _build_node_configs(node_dirs,
                 _get_node_job_environment_config(yt_config, index, logs_dir)
             )
 
+        if yt_config.jobs_environment_type == "cri":
+            # Forward variables set in docker image into user job environment.
+            set_at(config, "exec_node/job_proxy/forward_all_environment_variables", True)
+
         if yt_config.use_slot_user_id:
             start_uid = 10000 + config["rpc_port"]
             set_at(config, "exec_node/slot_manager/job_environment/start_uid", start_uid)
@@ -902,19 +961,51 @@ def _build_node_configs(node_dirs,
 
         set_at(
             config,
-            "exec_node/job_proxy/job_proxy_logging",
-            _init_logging(logs_dir, log_name, yt_config)
+            "exec_node/job_proxy/job_proxy_logging/mode",
+            yt_config.job_proxy_logging["mode"]
         )
         set_at(
             config,
-            "exec_node/job_proxy/job_proxy_stderr_path",
+            "exec_node/job_proxy/job_proxy_logging/log_manager_template",
+            _init_logging(logs_dir, log_name, yt_config)
+        )
+
+        # COMPAT
+        for key in config["exec_node"]["job_proxy"]["job_proxy_logging"]["log_manager_template"]:
+            config["exec_node"]["job_proxy"]["job_proxy_logging"][key] = config["exec_node"]["job_proxy"]["job_proxy_logging"]["log_manager_template"][key]
+
+        set_at(
+            config,
+            "exec_node/job_proxy/job_proxy_logging/job_proxy_stderr_path",
             os.path.join(logs_dir, "job_proxy-{0}-stderr-slot-%slot_index%".format(index)),
         )
         set_at(
             config,
-            "exec_node/job_proxy/executor_stderr_path",
+            "exec_node/job_proxy/job_proxy_logging/executor_stderr_path",
             os.path.join(logs_dir, "ytserver_exec-{0}-stderr-slot-%slot_index%".format(index))
         )
+
+        set_at(
+            config,
+            "exec_node/job_proxy_log_manager/directory",
+            os.path.join(logs_dir, "job_proxy-{0}".format(index))
+        )
+        set_at(
+            config,
+            "exec_node/job_proxy_log_manager/sharding_key_length",
+            yt_config.job_proxy_log_manager["sharding_key_length"]
+        )
+        set_at(
+            config,
+            "exec_node/job_proxy_log_manager/logs_storage_period",
+            yt_config.job_proxy_log_manager["logs_storage_period"]
+        )
+        if yt_config.job_proxy_log_manager["directory_traversal_concurrency"] is not None:
+            set_at(
+                config,
+                "exec_node/job_proxy_log_manager/directory_traversal_concurrency",
+                yt_config.job_proxy_log_manager["directory_traversal_concurrency"]
+            )
 
         set_at(config, "tablet_node/hydra_manager", _get_hydra_manager_config(), merge=True)
         set_at(config, "tablet_node/hydra_manager/restart_backoff_time", 100)
@@ -1635,7 +1726,11 @@ def init_logging(path, name,
         "abort_on_alert": abort_on_alert,
         "compression_thread_count": compression_thread_count,
         "rules": [
-            {"min_level": "info", "writers": ["info"]},
+            {
+                "min_level": "info",
+                "writers": ["info"],
+                "family": "plain_text",
+            },
         ],
         "writers": {
             "info": {
@@ -1648,7 +1743,11 @@ def init_logging(path, name,
 
     if log_errors_to_stderr:
         config["rules"].append(
-            {"min_level": "error", "writers": ["stderr"]}
+            {
+                "min_level": "error",
+                "writers": ["stderr"],
+                "family": "plain_text",
+            }
         )
         config["writers"]["stderr"] = {
             "type": "stderr",
@@ -1684,7 +1783,7 @@ def init_logging(path, name,
         config["rules"].append({
             "min_level": "debug",
             "writers": ["json"],
-            "message_format": "structured",
+            "family": "structured",
         })
         config["writers"]["json"] = {
             "type": "file",
@@ -1807,7 +1906,7 @@ def _get_balancing_channel_config():
         "soft_backoff_time": 100,
         "hard_backoff_time": 100,
         "enable_peer_polling": True,
-        "peer_polling_period": 500,
+        "peer_polling_period": 5000,
         "peer_polling_period_splay": 100,
         "peer_polling_request_timeout": 100,
         "rediscover_period": 5000,
@@ -1845,6 +1944,12 @@ def _get_node_resource_limits_config(yt_config):
     return {"memory": memory}
 
 
+def _get_node_base_cgroup(cluster_name, index):
+    if os.path.isdir("/run/systemd/system"):
+        return "/yt.slice/yt-{}_node_{}.slice".format(cluster_name.replace('-', '_'), index)
+    return "/yt/{}_node_{}".format(cluster_name, index)
+
+
 def _get_node_job_environment_config(yt_config, index, logs_dir):
     return {
         "cri": {
@@ -1852,7 +1957,7 @@ def _get_node_job_environment_config(yt_config, index, logs_dir):
             "cri_executor": {
                 "runtime_endpoint": yt_config.cri_endpoint,
                 "image_endpoint": yt_config.cri_endpoint,
-                "base_cgroup": "yt.slice/{}-node-{}.slice".format(yt_config.cluster_name, index),
+                "base_cgroup": _get_node_base_cgroup(yt_config.cluster_name, index),
                 "namespace": "yt--{}-node-{}".format(yt_config.cluster_name, index),
                 "verbose_logging": True,
             },

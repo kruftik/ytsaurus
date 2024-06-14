@@ -87,6 +87,7 @@
 #include <yt/yt/library/containers/instance.h>
 #include <yt/yt/library/containers/instance_limits_tracker.h>
 #include <yt/yt/library/containers/porto_executor.h>
+#include <yt/yt/library/containers/container_devices_checker.h>
 #endif
 
 #include <yt/yt/library/coredumper/coredumper.h>
@@ -108,16 +109,16 @@
 #include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
 
 #include <yt/yt/ytlib/chunk_client/chunk_service_proxy.h>
+#include <yt/yt/ytlib/chunk_client/chunk_replica_cache.h>
 #include <yt/yt/ytlib/chunk_client/client_block_cache.h>
 #include <yt/yt/ytlib/chunk_client/dispatcher.h>
 
 #include <yt/yt/ytlib/hydra/peer_channel.h>
 
+#include <yt/yt/ytlib/hive/cell_directory.h>
 #include <yt/yt/ytlib/hive/cell_directory_synchronizer.h>
 #include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
 
-#include <yt/yt/ytlib/misc/config.h>
-#include <yt/yt/ytlib/misc/memory_reference_tracker.h>
 #include <yt/yt/ytlib/misc/memory_usage_tracker.h>
 
 #include <yt/yt/library/monitoring/http_integration.h>
@@ -184,6 +185,8 @@
 
 #include <yt/yt/core/bus/tcp/dispatcher.h>
 
+#include <util/system/fs.h>
+
 namespace NYT::NClusterNode {
 
 using namespace NAdmin;
@@ -225,7 +228,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static inline const NLogging::TLogger Logger("Bootstrap");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "Bootstrap");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -236,6 +239,7 @@ public:
     DEFINE_SIGNAL_OVERRIDE(void(NNodeTrackerClient::TNodeId nodeId), MasterConnected);
     DEFINE_SIGNAL_OVERRIDE(void(), MasterDisconnected);
     DEFINE_SIGNAL_OVERRIDE(void(std::vector<TError>* alerts), PopulateAlerts);
+    DEFINE_SIGNAL_OVERRIDE(void(const TSecondaryMasterConnectionConfigs& newSecondaryMasterConfigs), ReadyToReportHeartbeatsToNewMasters);
 
 public:
     TBootstrap(TClusterNodeConfigPtr config, INodePtr configNode)
@@ -292,9 +296,9 @@ public:
     }
 
     // IBootstrapBase implementation.
-    const INodeMemoryTrackerPtr& GetMemoryUsageTracker() const override
+    const INodeMemoryTrackerPtr& GetNodeMemoryUsageTracker() const override
     {
-        return MemoryUsageTracker_;
+        return NodeMemoryUsageTracker_;
     }
 
     const TNodeResourceManagerPtr& GetNodeResourceManager() const override
@@ -417,11 +421,6 @@ public:
             : ReplaceCellTagInId(GetCellId(), cellTag);
     }
 
-    const THashSet<TCellTag>& GetMasterCellTags() const override
-    {
-        return MasterConnector_->GetMasterCellTags();
-    }
-
     std::vector<TString> GetMasterAddressesOrThrow(TCellTag cellTag) const override
     {
         // TODO(babenko): handle service discovery.
@@ -499,19 +498,19 @@ public:
         return BlockCache_;
     }
 
-    const INodeMemoryReferenceTrackerPtr& GetNodeMemoryReferenceTracker() const override
+    const IMemoryUsageTrackerPtr& GetRpcMemoryUsageTracker() const override
     {
-        return NodeMemoryReferenceTracker_;
+        return RpcMemoryUsageTracker_;
     }
 
-    const IMemoryReferenceTrackerPtr& GetReadBlockMemoryReferenceTracker() const override
+    const IMemoryUsageTrackerPtr& GetReadBlockMemoryUsageTracker() const override
     {
-        return ReadBlockMemoryReferenceTracker_;
+        return ReadBlockMemoryUsageTracker_;
     }
 
-    const IMemoryReferenceTrackerPtr& GetSystemJobsMemoryReferenceTracker() const override
+    const IMemoryUsageTrackerPtr& GetSystemJobsMemoryUsageTracker() const override
     {
-        return SystemJobsMemoryReferenceTracker_;
+        return SystemJobsMemoryUsageTracker_;
     }
 
     const IChunkMetaManagerPtr& GetChunkMetaManager() const override
@@ -636,6 +635,11 @@ public:
         return TabletNodeBootstrap_.get();
     }
 
+    const NClusterNode::IBootstrap* GetClusterNodeBootstrap() const override
+    {
+        return this;
+    }
+
     bool NeedDataNodeBootstrap() const override
     {
         if (IsDataNode()) {
@@ -667,7 +671,7 @@ private:
 
     IMapNodePtr OrchidRoot_;
 
-    INodeMemoryTrackerPtr MemoryUsageTracker_;
+    INodeMemoryTrackerPtr NodeMemoryUsageTracker_;
     TNodeResourceManagerPtr NodeResourceManager_;
     TBufferedProducerPtr BufferedProducer_;
 
@@ -696,6 +700,9 @@ private:
 
 #ifdef __linux__
     NContainers::TInstanceLimitsTrackerPtr InstanceLimitsTracker_;
+
+    TActionQueuePtr ContainerDevicesCheckerQueue_;
+    NContainers::TContainerDevicesCheckerPtr ContainerDevicesChecker_;
 #endif
 
     TClusterNodeDynamicConfigManagerPtr DynamicConfigManager_;
@@ -711,9 +718,9 @@ private:
 
     IMasterConnectorPtr MasterConnector_;
 
-    INodeMemoryReferenceTrackerPtr NodeMemoryReferenceTracker_;
-    IMemoryReferenceTrackerPtr ReadBlockMemoryReferenceTracker_;
-    IMemoryReferenceTrackerPtr SystemJobsMemoryReferenceTracker_;
+    IMemoryUsageTrackerPtr ReadBlockMemoryUsageTracker_;
+    IMemoryUsageTrackerPtr RpcMemoryUsageTracker_;
+    IMemoryUsageTrackerPtr SystemJobsMemoryUsageTracker_;
 
     IBlockCachePtr BlockCache_;
     IClientBlockCachePtr ClientBlockCache_;
@@ -786,6 +793,7 @@ private:
         connectionOptions.ConnectionInvoker = ConnectionThreadPool_->GetInvoker();
         connectionOptions.BlockCache = GetBlockCache();
         Connection_ = NApi::NNative::CreateConnection(Config_->ClusterConnection, std::move(connectionOptions));
+
         Connection_->GetMasterCellDirectory()->SubscribeCellDirectoryChanged(BIND_NO_PROPAGATE(&TBootstrap::OnMasterCellDirectoryChanged, this));
 
         NativeAuthenticator_ = NApi::NNative::CreateNativeAuthenticator(Connection_);
@@ -793,10 +801,10 @@ private:
         Client_ = Connection_->CreateNativeClient(
             TClientOptions::FromUser(NSecurityClient::RootUserName));
 
-        MemoryUsageTracker_ = CreateNodeMemoryTracker(
+        NodeMemoryUsageTracker_ = CreateNodeMemoryTracker(
             Config_->ResourceLimits->TotalMemory,
             /*limits*/ {},
-            Logger,
+            Logger(),
             ClusterNodeProfiler.WithPrefix("/memory_usage"));
 
         BufferedProducer_ = New<TBufferedProducer>();
@@ -815,14 +823,14 @@ private:
             Config_->InThrottler->TotalLimit = GetNetworkThrottlerLimit(nullptr, {});
             InThrottler_ = New<TFairThrottler>(
                 Config_->InThrottler,
-                ClusterNodeLogger.WithTag("Direction: %v", "In"),
+                ClusterNodeLogger().WithTag("Direction: %v", "In"),
                 ClusterNodeProfiler.WithPrefix("/in_throttler"));
             DefaultInThrottler_ = GetInThrottler("default");
 
             Config_->OutThrottler->TotalLimit = GetNetworkThrottlerLimit(nullptr, {});
             OutThrottler_ = New<TFairThrottler>(
                 Config_->OutThrottler,
-                ClusterNodeLogger.WithTag("Direction: %v", "Out"),
+                ClusterNodeLogger().WithTag("Direction: %v", "Out"),
                 ClusterNodeProfiler.WithPrefix("/out_throttler"));
             DefaultOutThrottler_ = GetOutThrottler("default");
         } else {
@@ -833,14 +841,14 @@ private:
             LegacyRawTotalInThrottler_ = CreateNamedReconfigurableThroughputThrottler(
                 getThrottlerConfig(EDataNodeThrottlerKind::TotalIn),
                 "TotalIn",
-                ClusterNodeLogger,
+                ClusterNodeLogger(),
                 ClusterNodeProfiler.WithPrefix("/throttlers"));
             LegacyTotalInThrottler_ = IThroughputThrottlerPtr(LegacyRawTotalInThrottler_);
 
             LegacyRawTotalOutThrottler_ = CreateNamedReconfigurableThroughputThrottler(
                 getThrottlerConfig(EDataNodeThrottlerKind::TotalOut),
                 "TotalOut",
-                ClusterNodeLogger,
+                ClusterNodeLogger(),
                 ClusterNodeProfiler.WithPrefix("/throttlers"));
             LegacyTotalOutThrottler_ = IThroughputThrottlerPtr(LegacyRawTotalOutThrottler_);
         }
@@ -848,40 +856,39 @@ private:
         RawUserJobContainerCreationThrottler_ = CreateNamedReconfigurableThroughputThrottler(
             New<NConcurrency::TThroughputThrottlerConfig>(),
             "UserJobContainerCreation",
-            ClusterNodeLogger,
+            ClusterNodeLogger(),
             ClusterNodeProfiler.WithPrefix("/user_job_container_creation_throttler"));
         UserJobContainerCreationThrottler_ = IThroughputThrottlerPtr(RawUserJobContainerCreationThrottler_);
 
         RawReadRpsOutThrottler_ = CreateNamedReconfigurableThroughputThrottler(
             Config_->DataNode->ReadRpsOutThrottler,
             "ReadRpsOut",
-            ClusterNodeLogger,
+            ClusterNodeLogger(),
             ClusterNodeProfiler.WithPrefix("/out_read_rps_throttler"));
         ReadRpsOutThrottler_ = IThroughputThrottlerPtr(RawReadRpsOutThrottler_);
 
         RawAnnounceChunkReplicaRpsOutThrottler_ = CreateNamedReconfigurableThroughputThrottler(
             Config_->DataNode->AnnounceChunkReplicaRpsOutThrottler,
             "AnnounceChunkReplicaRpsOut",
-            ClusterNodeLogger,
+            ClusterNodeLogger(),
             ClusterNodeProfiler.WithPrefix("/out_announce_chunk_replica_rps_throttler"));
         AnnounceChunkReplicaRpsOutThrottler_ = IThroughputThrottlerPtr(RawAnnounceChunkReplicaRpsOutThrottler_);
 
-        NodeMemoryReferenceTracker_ = CreateNodeMemoryReferenceTracker(MemoryUsageTracker_);
-        ReadBlockMemoryReferenceTracker_ = NodeMemoryReferenceTracker_->WithCategory(EMemoryCategory::PendingDiskRead);
-        SystemJobsMemoryReferenceTracker_ = NodeMemoryReferenceTracker_->WithCategory(EMemoryCategory::SystemJobs);
+        ReadBlockMemoryUsageTracker_ = NodeMemoryUsageTracker_->WithCategory(EMemoryCategory::PendingDiskRead);
+        SystemJobsMemoryUsageTracker_ = NodeMemoryUsageTracker_->WithCategory(EMemoryCategory::SystemJobs);
+        RpcMemoryUsageTracker_ = NodeMemoryUsageTracker_->WithCategory(EMemoryCategory::Rpc);
 
         BlockCache_ = ClientBlockCache_ = CreateClientBlockCache(
             Config_->DataNode->BlockCache,
             EBlockType::UncompressedData | EBlockType::CompressedData |
                 EBlockType::HashTableChunkIndex | EBlockType::XorFilter | EBlockType::ChunkFragmentsData,
-            MemoryUsageTracker_->WithCategory(EMemoryCategory::BlockCache),
-            NodeMemoryReferenceTracker_,
+            NodeMemoryUsageTracker_->WithCategory(EMemoryCategory::BlockCache),
             DataNodeProfiler.WithPrefix("/block_cache"));
 
         BusServer_ = CreateBusServer(
             Config_->BusServer,
-            GetYTPacketTranscoderFactory(MemoryUsageTracker_->WithCategory(EMemoryCategory::Rpc)),
-            MemoryUsageTracker_->WithCategory(EMemoryCategory::Rpc));
+            GetYTPacketTranscoderFactory(),
+            NodeMemoryUsageTracker_->WithCategory(EMemoryCategory::Rpc));
 
         RpcServer_ = NRpc::NBus::CreateBusServer(BusServer_);
         RpcServer_->Configure(Config_->RpcServer);
@@ -917,7 +924,7 @@ private:
         ChunkMetaManager_ = CreateChunkMetaManager(
             Config_->DataNode,
             GetDynamicConfigManager(),
-            GetMemoryUsageTracker());
+            GetNodeMemoryUsageTracker());
 
         BlobReaderCache_ = CreateBlobReaderCache(
             GetConfig()->DataNode,
@@ -926,7 +933,7 @@ private:
 
         VersionedChunkMetaManager_ = CreateVersionedChunkMetaManager(
             Config_->TabletNode->VersionedChunkMetaCache,
-            GetMemoryUsageTracker()->WithCategory(EMemoryCategory::VersionedChunkMeta));
+            GetNodeMemoryUsageTracker()->WithCategory(EMemoryCategory::VersionedChunkMeta));
 
         NetworkStatistics_ = std::make_unique<TNetworkStatistics>(Config_->DataNode);
 
@@ -958,13 +965,13 @@ private:
         RpcServer_->RegisterService(CreateRestartService(
             RestartManager_,
             GetControlInvoker(),
-            ClusterNodeLogger,
+            ClusterNodeLogger(),
             NativeAuthenticator_));
 
         ObjectServiceCache_ = New<TObjectServiceCache>(
             Config_->CachingObjectService,
-            MemoryUsageTracker_->WithCategory(EMemoryCategory::MasterCache),
-            Logger,
+            NodeMemoryUsageTracker_->WithCategory(EMemoryCategory::MasterCache),
+            Logger(),
             ClusterNodeProfiler.WithPrefix("/object_service_cache"));
 
         InitCachingObjectService(PrimaryMaster_->CellId);
@@ -1004,7 +1011,7 @@ private:
 
             portoExecutor->SubscribeFailed(BIND([=, this] (const TError& error) {
                 YT_LOG_ERROR(error, "Porto executor failed");
-                ExecNodeBootstrap_->GetSlotManager()->Disable(error);
+                ExecNodeBootstrap_->GetSlotManager()->OnPortoExecutorFailed(error);
             }));
 
             auto self = GetSelfPortoInstance(portoExecutor);
@@ -1045,6 +1052,15 @@ private:
                         YT_LOG_ALERT(ex, "Failed to set self memory guarantee (MemoryGuarantee: %v)", memoryGuarantee);
                     }
                 }));
+            }
+
+            if (IsExecNode()) {
+                ContainerDevicesCheckerQueue_ = New<TActionQueue>("ContainerDevicesCheck");
+                ContainerDevicesChecker_ = CreateContainerDevicesChecker(
+                    NFS::CombinePaths(NFs::CurrentWorkingDirectory(), "test_containers"),
+                    New<TPortoExecutorDynamicConfig>(),
+                    ContainerDevicesCheckerQueue_->GetInvoker(),
+                    Logger());
             }
         }
     #endif
@@ -1129,26 +1145,32 @@ private:
 
         Connection_->GetMasterCellDirectorySynchronizer()->Start();
 
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/config",
-            CreateVirtualNode(ConfigNode_));
+        if (Config_->ExposeConfigInOrchid) {
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/config",
+                CreateVirtualNode(ConfigNode_));
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/dynamic_config_manager",
+                CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/cluster_connection",
+                CreateVirtualNode(Connection_->GetOrchidService()));
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/bundle_dynamic_config_manager",
+                CreateVirtualNode(BundleDynamicConfigManager_->GetOrchidService()));
+            SetNodeByYPath(
+                OrchidRoot_,
+                "/connected_secondary_masters",
+                CreateVirtualNode(GetSecondaryMasterConnectionConfigsOrchidService()));
+        }
         SetNodeByYPath(
             OrchidRoot_,
             "/restart_manager",
             CreateVirtualNode(RestartManager_->GetOrchidService()));
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/cluster_connection",
-            CreateVirtualNode(Connection_->GetOrchidService()));
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/dynamic_config_manager",
-            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/bundle_dynamic_config_manager",
-            CreateVirtualNode(BundleDynamicConfigManager_->GetOrchidService()));
         SetNodeByYPath(
             OrchidRoot_,
             "/object_service_cache",
@@ -1157,10 +1179,6 @@ private:
             OrchidRoot_,
             "/node_resource_manager",
             CreateVirtualNode(NodeResourceManager_->GetOrchidService()));
-        SetNodeByYPath(
-            OrchidRoot_,
-            "/connected_secondary_masters",
-            CreateVirtualNode(GetSecondaryMasterConnectionConfigsOrchidService()));
         SetBuildAttributes(
             OrchidRoot_,
             "node");
@@ -1207,6 +1225,14 @@ private:
         RpcServer_->Start();
         HttpServer_->Start();
 
+#ifdef __linux__
+        if (ContainerDevicesChecker_) {
+            ContainerDevicesChecker_->SubscribeCheck(BIND_NO_PROPAGATE(&TSlotManager::OnContainerDevicesCheckFinished, ExecNodeBootstrap_->GetSlotManager())
+                .Via(GetControlInvoker()));
+            ContainerDevicesChecker_->Start();
+        }
+#endif
+
         YT_LOG_INFO("Node started successfully");
     }
 
@@ -1215,8 +1241,11 @@ private:
         VERIFY_THREAD_AFFINITY_ANY();
 
         return IYPathService::FromProducer(BIND([this] (NYson::IYsonConsumer* consumer) {
+            auto secondaryMasterConnectionConfigs = IsConnected()
+                ? GetSecondaryMasterConnectionConfigs()
+                : TSecondaryMasterConnectionConfigs();
             BuildYsonFluently(consumer)
-                .Value(GetSecondaryMasterConnectionConfigs());
+                .Value(secondaryMasterConnectionConfigs);
         }))->Via(GetControlInvoker());
     }
 
@@ -1384,10 +1413,6 @@ private:
 
         IOTracker_->SetConfig(newConfig->IOTracker);
 
-        auto memoryReferenceTrackerConfig = New<TNodeMemoryReferenceTrackerConfig>();
-        memoryReferenceTrackerConfig->EnableMemoryReferenceTracker = newConfig->EnableMemoryReferenceTracker;
-        NodeMemoryReferenceTracker_->Reconfigure(std::move(memoryReferenceTrackerConfig));
-
     #ifdef __linux__
         if (InstanceLimitsTracker_) {
             auto useInstanceLimitsTracker = newConfig->ResourceLimits->UseInstanceLimitsTracker;
@@ -1395,6 +1420,15 @@ private:
                 InstanceLimitsTracker_->Start();
             } else {
                 InstanceLimitsTracker_->Stop();
+            }
+        }
+
+        if (ContainerDevicesChecker_ && newConfig->ExecNode->SlotManager) {
+            auto environmentConfig = NYTree::ConvertTo<TJobEnvironmentConfigPtr>(newConfig->ExecNode->SlotManager->JobEnvironment);
+
+            if (environmentConfig->Type == EJobEnvironmentType::Porto) {
+                auto portoEnvironmentConfig = NYTree::ConvertTo<TPortoJobEnvironmentConfigPtr>(newConfig->ExecNode->SlotManager->JobEnvironment);
+                ContainerDevicesChecker_->OnDynamicConfigChanged(portoEnvironmentConfig->PortoExecutor);
             }
         }
     #endif
@@ -1405,6 +1439,12 @@ private:
         JobResourceManager_->OnDynamicConfigChanged(
             oldConfig->JobResourceManager,
             newConfig->JobResourceManager);
+
+        auto newChunkReplicaCacheConfig = CloneYsonStruct(Config_->ClusterConnection->Dynamic->ChunkReplicaCache);
+        if (const auto& newExpirationTime = newConfig->ChunkReplicaCacheConfig->ExpirationTime; newExpirationTime) {
+            newChunkReplicaCacheConfig->ExpirationTime = *newExpirationTime;
+        }
+        Connection_->GetChunkReplicaCache()->Reconfigure(std::move(newChunkReplicaCacheConfig));
     }
 
     void PopulateAlerts(std::vector<TError>* alerts)
@@ -1412,8 +1452,8 @@ private:
         PopulateAlerts_.Fire(alerts);
 
         // NB: Don't expect IsXXXExceeded helpers to be atomic.
-        auto totalUsed = MemoryUsageTracker_->GetTotalUsed();
-        auto totalLimit = MemoryUsageTracker_->GetTotalLimit();
+        auto totalUsed = NodeMemoryUsageTracker_->GetTotalUsed();
+        auto totalLimit = NodeMemoryUsageTracker_->GetTotalLimit();
 
         if (DynamicConfigManager_->GetConfig()->TotalMemoryLimitExceededThreshold * totalUsed > totalLimit) {
             alerts->push_back(TError("Total memory limit exceeded")
@@ -1426,8 +1466,8 @@ private:
         }
 
         for (auto category : TEnumTraits<EMemoryCategory>::GetDomainValues()) {
-            auto used = MemoryUsageTracker_->GetUsed(category);
-            auto limit = MemoryUsageTracker_->GetLimit(category);
+            auto used = NodeMemoryUsageTracker_->GetUsed(category);
+            auto limit = NodeMemoryUsageTracker_->GetLimit(category);
             if (used > limit * DynamicConfigManager_->GetConfig()->MemoryLimitExceededForCategoryThreshold) {
                 alerts->push_back(TError("Memory limit exceeded for category %Qlv",
                     category)
@@ -1467,11 +1507,11 @@ private:
             CreateMasterChannelForCache(GetConnection(), cellId),
             ObjectServiceCache_,
             cellId,
-            Logger,
+            Logger(),
             ClusterNodeProfiler.WithPrefix("/caching_object_service"),
             NativeAuthenticator_);
         EmplaceOrCrash(CachingObjectServices_, CellTagFromId(cellId), cachingObjectService);
-        if (MasterConnector_->IsConnected()) {
+        if (MasterConnector_->IsRegisteredAtPrimaryMaster()) {
             RpcServer_->RegisterService(std::move(cachingObjectService));
         }
     }
@@ -1490,45 +1530,68 @@ private:
     }
 
     void OnMasterCellDirectoryChanged(
-        const THashSet<TCellTag>& additionalSecondaryTags,
-        const TSecondaryMasterConnectionConfigs& reconfiguredSecondaryMasterConfigs,
-        const THashSet<TCellTag>& removedSecondaryCellTags)
+        const TSecondaryMasterConnectionConfigs& newSecondaryMasterConfigs,
+        const TSecondaryMasterConnectionConfigs& changedSecondaryMasterConfigs,
+        const THashSet<TCellTag>& removedSecondaryMasterCellTags)
     {
         VERIFY_THREAD_AFFINITY_ANY();
 
-        YT_LOG_DEBUG_UNLESS(
-            additionalSecondaryTags.empty(),
-            "Unexpected appearance of master cells in received configuration detected (UnexpectedCellTags: %v)",
-            additionalSecondaryTags);
-        YT_LOG_WARNING_UNLESS(
-            removedSecondaryCellTags.empty(),
-            "Some cells disappeared in received configuration of secondary masters (DisappearedCellTags: %v)",
-            removedSecondaryCellTags);
+        YT_LOG_ALERT_UNLESS(
+            removedSecondaryMasterCellTags.empty(),
+            "Some cells disappeared in received configuration of secondary masters (RemovedCellTags: %v)",
+            removedSecondaryMasterCellTags);
 
-        THashSet<TCellTag> reconfiguredCellTags;
-        reconfiguredCellTags.reserve(reconfiguredSecondaryMasterConfigs.size());
+        THashSet<TCellTag> newSecondaryMasterCellTags;
+        THashSet<TCellTag> changedSecondaryMasterCellTags;
+        newSecondaryMasterCellTags.reserve(newSecondaryMasterConfigs.size());
+        changedSecondaryMasterCellTags.reserve(changedSecondaryMasterConfigs.size());
+
+        auto addMasterCell = [&] (const auto& masterConfig) {
+            InitCachingObjectService(masterConfig->CellId);
+            InitProxyingChunkService(masterConfig);
+            Connection_->GetCellDirectory()->ReconfigureCell(masterConfig);
+        };
+
+        auto reconfigureMasterCell = [&] (const auto& masterConfig) {
+            auto cellTag = CellTagFromId(masterConfig->CellId);
+            // NB: It's necessary to reinitialize only ProxyingChunkServices_, since it uses the config completely,
+            // while in CachingObjectServices_ only the CellId is used - it does not need to be reinitialized.
+            RpcServer_->UnregisterService(ProxyingChunkServices_[cellTag]);
+            InitProxyingChunkService(masterConfig);
+        };
+
+        for (const auto& [cellTag, masterConfig] : newSecondaryMasterConfigs) {
+            addMasterCell(masterConfig);
+            InsertOrCrash(newSecondaryMasterCellTags, cellTag);
+        }
+
+        for (const auto& [cellTag, masterConfig] : changedSecondaryMasterConfigs) {
+            reconfigureMasterCell(masterConfig);
+            InsertOrCrash(changedSecondaryMasterCellTags, cellTag);
+        }
+
+        // For consistency it is important to start reporting heartbeats before update of SecondaryMasterConnectionConfigs_, which is viewable.
+        // But before it is needed to update cell tags set in case if cellar/data/tablet heartbeat report fails and node re-registers at master.
+        MasterConnector_->AddMasterCellTags(newSecondaryMasterCellTags);
+        ReadyToReportHeartbeatsToNewMasters_.Fire(newSecondaryMasterConfigs);
+
         {
             auto guard = WriterGuard(SecondaryMasterConnectionLock_);
-            auto reconfigureMasterCell = [&] (const auto& masterConfig) {
-                auto cellTag = CellTagFromId(masterConfig->CellId);
+            for (const auto& [cellTag, masterConfig] : newSecondaryMasterConfigs) {
+                EmplaceOrCrash(SecondaryMasterConnectionConfigs_, cellTag, masterConfig);
+            }
+            for (const auto& [cellTag, masterConfig] : changedSecondaryMasterConfigs) {
                 auto masterConfigIt = SecondaryMasterConnectionConfigs_.find(cellTag);
                 YT_VERIFY(masterConfigIt != SecondaryMasterConnectionConfigs_.end());
                 masterConfigIt->second = masterConfig;
-                // NB: It's necessary to reinitialize only ProxyingChunkServices_, since it uses the config completely,
-                // while in CachingObjectServices_ only the CellId is used - it does not need to be reinitialized.
-                RpcServer_->UnregisterService(ProxyingChunkServices_[cellTag]);
-                InitProxyingChunkService(masterConfig);
-            };
-
-            for (const auto& [cellTag, masterConfig] : reconfiguredSecondaryMasterConfigs) {
-                reconfigureMasterCell(masterConfig);
-                InsertOrCrash(reconfiguredCellTags, cellTag);
             }
         }
 
-        YT_LOG_INFO(
-            "Received new master cell cluster configuration (ReconfiguredCellTags: %v)",
-            reconfiguredCellTags);
+        YT_LOG_INFO("Received new master cell cluster configuration "
+            "(NewCellTags: %v, ChangedCellTags: %v, RemovedCellTags: %v)",
+            newSecondaryMasterCellTags,
+            changedSecondaryMasterCellTags,
+            removedSecondaryMasterCellTags);
     }
 
     TSecondaryMasterConnectionConfigs GetSecondaryMasterConnectionConfigs() const
@@ -1577,11 +1640,10 @@ TBootstrapBase::TBootstrapBase(IBootstrapBase* bootstrap)
         BIND_NO_PROPAGATE([this] (std::vector<TError>* alerts) {
             PopulateAlerts_.Fire(alerts);
         }));
-}
-
-const INodeMemoryTrackerPtr& TBootstrapBase::GetMemoryUsageTracker() const
-{
-    return Bootstrap_->GetMemoryUsageTracker();
+    Bootstrap_->SubscribeReadyToReportHeartbeatsToNewMasters(
+        BIND_NO_PROPAGATE([this] (const TSecondaryMasterConnectionConfigs& newSecondaryMasterConfigs) {
+            ReadyToReportHeartbeatsToNewMasters_.Fire(newSecondaryMasterConfigs);
+        }));
 }
 
 const TNodeResourceManagerPtr& TBootstrapBase::GetNodeResourceManager() const
@@ -1694,11 +1756,6 @@ TCellId TBootstrapBase::GetCellId(TCellTag cellTag) const
     return Bootstrap_->GetCellId(cellTag);
 }
 
-const THashSet<TCellTag>& TBootstrapBase::GetMasterCellTags() const
-{
-    return Bootstrap_->GetMasterCellTags();
-}
-
 std::vector<TString> TBootstrapBase::GetMasterAddressesOrThrow(TCellTag cellTag) const
 {
     return Bootstrap_->GetMasterAddressesOrThrow(cellTag);
@@ -1754,19 +1811,24 @@ const IBlockCachePtr& TBootstrapBase::GetBlockCache() const
     return Bootstrap_->GetBlockCache();
 }
 
-const INodeMemoryReferenceTrackerPtr& TBootstrapBase::GetNodeMemoryReferenceTracker() const
+const INodeMemoryTrackerPtr& TBootstrapBase::GetNodeMemoryUsageTracker() const
 {
-    return Bootstrap_->GetNodeMemoryReferenceTracker();
+    return Bootstrap_->GetNodeMemoryUsageTracker();
 }
 
-const IMemoryReferenceTrackerPtr& TBootstrapBase::GetReadBlockMemoryReferenceTracker() const
+const IMemoryUsageTrackerPtr& TBootstrapBase::GetRpcMemoryUsageTracker() const
 {
-    return Bootstrap_->GetReadBlockMemoryReferenceTracker();
+    return Bootstrap_->GetRpcMemoryUsageTracker();
 }
 
-const IMemoryReferenceTrackerPtr& TBootstrapBase::GetSystemJobsMemoryReferenceTracker() const
+const IMemoryUsageTrackerPtr& TBootstrapBase::GetReadBlockMemoryUsageTracker() const
 {
-    return Bootstrap_->GetSystemJobsMemoryReferenceTracker();
+    return Bootstrap_->GetReadBlockMemoryUsageTracker();
+}
+
+const IMemoryUsageTrackerPtr& TBootstrapBase::GetSystemJobsMemoryUsageTracker() const
+{
+    return Bootstrap_->GetSystemJobsMemoryUsageTracker();
 }
 
 const IChunkMetaManagerPtr& TBootstrapBase::GetChunkMetaManager() const
@@ -1882,6 +1944,11 @@ NExecNode::IBootstrap* TBootstrapBase::GetExecNodeBootstrap() const
 NChaosNode::IBootstrap* TBootstrapBase::GetChaosNodeBootstrap() const
 {
     return Bootstrap_->GetChaosNodeBootstrap();
+}
+
+const NClusterNode::IBootstrap* TBootstrapBase::GetClusterNodeBootstrap() const
+{
+    return Bootstrap_->GetClusterNodeBootstrap();
 }
 
 NTabletNode::IBootstrap* TBootstrapBase::GetTabletNodeBootstrap() const

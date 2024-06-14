@@ -54,12 +54,15 @@ using namespace NSecurityServer;
 using namespace NObjectServer;
 using namespace NChunkClient;
 
+using NYT::ToProto;
+using NYT::FromProto;
+
 ////////////////////////////////////////////////////////////////////////////////
 
 template <class TChunkOwner>
 TChunkOwnerTypeHandler<TChunkOwner>::TChunkOwnerTypeHandler(NCellMaster::TBootstrap* bootstrap)
     : TBase(bootstrap)
-    , Logger(ChunkServerLogger)
+    , Logger(ChunkServerLogger())
 { }
 
 template <class TChunkOwner>
@@ -635,8 +638,8 @@ void TChunkOwnerTypeHandler<TChunkOwner>::DoBeginCopy(
 
     auto* hunkMedium = chunkManager->GetMediumByIndexOrThrow(node->GetHunkPrimaryMediumIndex());
     Save(*context, hunkMedium);
-
     Save(*context, node->HunkReplication());
+
     context->RegisterExternalCellTag(node->GetExternalCellTag());
 }
 
@@ -655,8 +658,8 @@ void TChunkOwnerTypeHandler<TChunkOwner>::DoEndCopy(
 
     Load(*context, trunkNode->Replication());
 
-    auto snapshotStatistics = Load<NChunkClient::NProto::TDataStatistics>(*context);
-    auto deltaStatistics = Load<NChunkClient::NProto::TDataStatistics>(*context);
+    auto snapshotStatistics = Load<TChunkOwnerDataStatistics>(*context);
+    auto deltaStatistics = Load<TChunkOwnerDataStatistics>(*context);
     trunkNode->SnapshotStatistics() = snapshotStatistics + deltaStatistics;
 
     auto snapshotSecurityTags = Load<NSecurityServer::TInternedSecurityTags>(*context);

@@ -5,11 +5,12 @@ INCLUDE(${ARCADIA_ROOT}/yt/ya_cpp.make.inc)
 ALLOCATOR(YT)
 
 SRCS(
+    misc/test_connection.cpp
+
     chunk_client_fetcher_ut.cpp
     chunk_fragment_read_controller_ut.cpp
     chunk_meta_cache_ut.cpp
     chunk_slice_ut.cpp
-    distributed_query_ut.cpp
     encoding_writer_ut.cpp
     erasure_parts_reader_ut.cpp
     job_resources_ut.cpp
@@ -19,6 +20,7 @@ SRCS(
     parallel_reader_memory_manager_ut.cpp
     partitioner_ut.cpp
     permission_cache_ut.cpp
+    replication_reader_ut.cpp
     row_merger_ut.cpp
     serialize_ut.cpp
     sorted_merging_reader_ut.cpp

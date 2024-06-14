@@ -58,7 +58,7 @@ using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ChunkServerLogger;
+static constexpr auto& Logger = ChunkServerLogger;
 
 static const double ChunkListTombstoneRelativeThreshold = 0.5;
 static const double ChunkListTombstoneAbsoluteThreshold = 16;
@@ -771,10 +771,6 @@ TYsonString DoGetMulticellOwningNodes(
 
     // Request owning nodes from all cells.
     auto requestIdsFromCell = [&] (TCellTag cellTag) {
-        if (cellTag == multicellManager->GetCellTag()) {
-            return;
-        }
-
         auto type = TypeFromId(chunkTreeId);
         if (!IsPhysicalChunkType(type)) {
             return;
@@ -791,8 +787,7 @@ TYsonString DoGetMulticellOwningNodes(
         requestFutures.emplace_back(cellTag, req->Invoke());
     };
 
-    requestIdsFromCell(multicellManager->GetPrimaryCellTag());
-    for (auto cellTag : multicellManager->GetSecondaryCellTags()) {
+    for (auto cellTag : multicellManager->GetRegisteredMasterCellTags()) {
         requestIdsFromCell(cellTag);
     }
 
@@ -1249,7 +1244,7 @@ void SerializeMediumOverrides(
 
 int GetChunkShardIndex(TChunkId chunkId)
 {
-    return TDirectObjectIdHash()(chunkId) % ChunkShardCount;
+    return GetShardIndex<ChunkShardCount>(chunkId);
 }
 
 std::vector<TInstant> GenerateChunkCreationTimeHistogramBucketBounds(TInstant now)
@@ -1290,6 +1285,21 @@ TJobPtr MummifyJob(const TJobPtr& job)
     };
 
     return New<TMummyJob>(*job);
+}
+
+TError SanitizeError(TError error)
+{
+    static const std::vector<TString> ForbiddenAttributes = {
+        "lhs_value",
+        "rhs_value",
+    };
+
+    for (const auto& attribute : ForbiddenAttributes) {
+        if (error.MutableAttributes()->Contains(attribute)) {
+            error.MutableAttributes()->Remove(attribute);
+        }
+    }
+    return error;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

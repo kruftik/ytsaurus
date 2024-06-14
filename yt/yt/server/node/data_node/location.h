@@ -56,6 +56,8 @@ struct TLocationPerformanceCounters
     TEnumIndexedArray<EIODirection, TEnumIndexedArray<EIOCategory, std::atomic<i64>>> PendingIOSize;
     TEnumIndexedArray<EIODirection, TEnumIndexedArray<EIOCategory, NProfiling::TCounter>> CompletedIOSize;
 
+    TEnumIndexedArray<EIODirection, TEnumIndexedArray<EIOCategory, std::atomic<i64>>> UsedMemory;
+
     NProfiling::TCounter ThrottledReads;
     std::atomic<NProfiling::TCpuInstant> LastReadThrottleTime{};
 
@@ -103,6 +105,38 @@ struct TLocationPerformanceCounters
 };
 
 DEFINE_REFCOUNTED_TYPE(TLocationPerformanceCounters)
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TLocationMemoryGuard
+{
+public:
+    TLocationMemoryGuard() = default;
+    TLocationMemoryGuard(TLocationMemoryGuard&& other);
+    ~TLocationMemoryGuard();
+
+    void Release();
+
+    TLocationMemoryGuard& operator=(TLocationMemoryGuard&& other);
+
+    explicit operator bool() const;
+
+private:
+    friend class TChunkLocation;
+
+    TLocationMemoryGuard(
+        EIODirection direction,
+        EIOCategory category,
+        i64 size,
+        TChunkLocationPtr owner);
+
+    void MoveFrom(TLocationMemoryGuard&& other);
+
+    EIODirection Direction_;
+    EIOCategory Category_;
+    i64 Size_ = 0;
+    TChunkLocationPtr Owner_;
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -291,22 +325,39 @@ public:
     i64 GetAvailableSpace() const;
 
     //! Returns the memory tracking for pending reads.
-    const ITypedNodeMemoryTrackerPtr& GetReadMemoryTracker() const;
+    const IMemoryUsageTrackerPtr& GetReadMemoryTracker() const;
 
     //! Returns the memory tracking for pending writes.
-    const ITypedNodeMemoryTrackerPtr& GetWriteMemoryTracker() const;
+    const IMemoryUsageTrackerPtr& GetWriteMemoryTracker() const;
 
     //! Returns the number of bytes pending for disk IO.
     i64 GetPendingIOSize(
         EIODirection direction,
         const TWorkloadDescriptor& workloadDescriptor) const;
 
+    //! Returns the number of used memory.
+    i64 GetUsedMemory(
+        EIODirection direction,
+        const TWorkloadDescriptor& workloadDescriptor) const;
+
+    //! Returns total amount of used memory in given #direction.
+    i64 GetUsedMemory(EIODirection direction) const;
+
     //! Returns the maximum number of bytes pending for disk IO in given #direction.
     i64 GetMaxPendingIOSize(EIODirection direction) const;
 
-    //! Acquires a lock for the given number of bytes to be read or written.
+    //! Returns total amount of of bytes pending for disk IO in given #direction.
+    i64 GetPendingIOSize(EIODirection direction) const;
+
+    //! Acquires a lock IO for the given number of bytes to be read or written.
     TPendingIOGuard AcquirePendingIO(
         TMemoryUsageTrackerGuard memoryGuard,
+        EIODirection direction,
+        const TWorkloadDescriptor& workloadDescriptor,
+        i64 delta);
+
+    //! Acquires a lock memory for the given number of bytes to be read or written.
+    TLocationMemoryGuard AcquireLocationMemory(
         EIODirection direction,
         const TWorkloadDescriptor& workloadDescriptor,
         i64 delta);
@@ -350,9 +401,15 @@ public:
     //! Returns |true| if writes were throttled (within some recent time interval).
     bool IsWriteThrottling() const;
 
+    struct TDiskThrottlingResult
+    {
+        bool Enabled;
+        i64 QueueSize;
+    };
+
     //! Returns whether reads must be throttled
     //! and the total number of bytes to read from disk including those accounted by out throttler.
-    std::tuple<bool, i64> CheckReadThrottling(
+    TDiskThrottlingResult CheckReadThrottling(
         const TWorkloadDescriptor& workloadDescriptor,
         bool incrementCounter = true) const;
 
@@ -377,6 +434,21 @@ public:
 
     //! Returns |true| if location is sick.
     bool IsSick() const;
+
+    //! Returns limit on the maximum IO in bytes used of location reads.
+    i64 GetPendingReadIOLimit() const;
+
+    //! Returns limit on the maximum IO in bytes used of location writes.
+    i64 GetPendingWriteIOLimit() const;
+
+    //! Returns limit on the maximum memory used of location reads.
+    i64 GetReadMemoryLimit() const;
+
+    //! Returns limit on the maximum memory used of location writes.
+    i64 GetWriteMemoryLimit() const;
+
+    //! Returns limit on the maximum count of location write sessions.
+    i64 GetSessionCountLimit() const;
 
     //! If location does not contain files corresponding to given #chunkId, acquires the lock
     //! and returns a non-null guard. Otherwise, returns a null guard.
@@ -411,6 +483,8 @@ protected:
     TAtomicObject<TError> LocationDisabledAlert_;
     TAtomicObject<TError> LocationDiskFailedAlert_;
 
+    TDiskHealthCheckerPtr HealthChecker_;
+
     mutable std::atomic<i64> AvailableSpace_ = 0;
     std::atomic<i64> UsedSpace_ = 0;
     TEnumIndexedArray<ESessionType, std::atomic<int>> PerTypeSessionCount_;
@@ -436,6 +510,7 @@ protected:
     void ResetLocationStatistic();
 
 private:
+    friend class TLocationMemoryGuard;
     friend class TPendingIOGuard;
     friend class TLockedChunkGuard;
 
@@ -446,8 +521,8 @@ private:
 
     TLocationPerformanceCountersPtr PerformanceCounters_;
 
-    const ITypedNodeMemoryTrackerPtr ReadMemoryTracker_;
-    const ITypedNodeMemoryTrackerPtr WriteMemoryTracker_;
+    const IMemoryUsageTrackerPtr ReadMemoryTracker_;
+    const IMemoryUsageTrackerPtr WriteMemoryTracker_;
 
     TAtomicPtr<TChunkLocationConfig, /*EnableAcquireHazard*/ true> RuntimeConfig_;
 
@@ -462,11 +537,13 @@ private:
     NConcurrency::IThroughputThrottlerPtr UnlimitedInThrottler_;
     NConcurrency::IThroughputThrottlerPtr UnlimitedOutThrottler_;
 
+    bool EnableUncategorizedThrottler_;
+    NConcurrency::IReconfigurableThroughputThrottlerPtr ReconfigurableUncategorizedThrottler_;
+    NConcurrency::IThroughputThrottlerPtr UncategorizedThrottler_;
+
     NIO::IDynamicIOEnginePtr DynamicIOEngine_;
     NIO::IIOEngineWorkloadModelPtr IOEngineModel_;
     NIO::IIOEnginePtr IOEngine_;
-
-    TDiskHealthCheckerPtr HealthChecker_;
 
     YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, LockedChunksLock_);
     THashSet<TChunkId> LockedChunkIds_;
@@ -477,6 +554,9 @@ private:
 
     void DecreasePendingIOSize(EIODirection direction, EIOCategory category, i64 delta);
     void UpdatePendingIOSize(EIODirection direction, EIOCategory category, i64 delta);
+
+    void DecreaseUsedMemory(EIODirection direction, EIOCategory category, i64 delta);
+    void UpdateUsedMemory(EIODirection direction, EIOCategory category, i64 delta);
 
     void ValidateWritable();
     void InitializeCellId();

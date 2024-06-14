@@ -439,7 +439,7 @@ TChunkInfo TBlobSession::OnFinished(const TError& error)
 
 TFuture<NIO::TIOCounters> TBlobSession::DoPutBlocks(
     int startBlockIndex,
-    const std::vector<TBlock>& blocks,
+    std::vector<TBlock> blocks,
     bool enableCaching)
 {
     VERIFY_INVOKER_AFFINITY(SessionInvoker_);
@@ -450,18 +450,24 @@ TFuture<NIO::TIOCounters> TBlobSession::DoPutBlocks(
 
     // Make all acquisitions in advance to ensure that this error is retriable.
     const auto& memoryTracker = Location_->GetWriteMemoryTracker();
-    std::vector<TMemoryUsageTrackerGuard> memoryTrackerGuards;
-    memoryTrackerGuards.reserve(blocks.size());
-    for (const auto& block : blocks) {
-        auto guardOrError = TMemoryUsageTrackerGuard::TryAcquire(
-            memoryTracker,
-            block.Size());
-        if (!guardOrError.IsOK()) {
+    std::vector<TLocationMemoryGuard> locationMemoryGuards;
+    for (auto& block : blocks) {
+        if (memoryTracker->IsExceeded()) {
             Location_->ReportThrottledWrite();
             return MakeFuture<NIO::TIOCounters>(
-                TError(guardOrError).SetCode(NChunkClient::EErrorCode::WriteThrottlingActive));
+                TError(
+                    NChunkClient::EErrorCode::WriteThrottlingActive,
+                    "Not enough memory to serve %Qlv acquisition request",
+                    EMemoryCategory::PendingDiskWrite)
+                    << TErrorAttribute("bytes_used", memoryTracker->GetUsed())
+                    << TErrorAttribute("bytes_limit", memoryTracker->GetLimit()));
         }
-        memoryTrackerGuards.push_back(std::move(guardOrError.Value()));
+
+        locationMemoryGuards.push_back(Location_->AcquireLocationMemory(
+            EIODirection::Write,
+            Options_.WorkloadDescriptor,
+            block.Size()));
+        block.Data = TrackMemory(memoryTracker, std::move(block.Data));
     }
 
     // Work around possible livelock. We might consume all memory allocated for blob sessions. That would block
@@ -475,7 +481,7 @@ TFuture<NIO::TIOCounters> TBlobSession::DoPutBlocks(
     }
 
     if (precedingBlockReceivedFutures.empty()) {
-        return DoPerformPutBlocks(startBlockIndex, blocks, std::move(memoryTrackerGuards), enableCaching);
+        return DoPerformPutBlocks(startBlockIndex, std::move(blocks), std::move(locationMemoryGuards), enableCaching);
     }
 
     return AllSucceeded(precedingBlockReceivedFutures)
@@ -490,14 +496,20 @@ TFuture<NIO::TIOCounters> TBlobSession::DoPutBlocks(
 
             return error;
         }))
-        .Apply(BIND(&TBlobSession::DoPerformPutBlocks, MakeStrong(this), startBlockIndex, blocks, Passed(std::move(memoryTrackerGuards)), enableCaching)
+        .Apply(BIND(
+            &TBlobSession::DoPerformPutBlocks,
+            MakeStrong(this),
+            startBlockIndex,
+            Passed(std::move(blocks)),
+            Passed(std::move(locationMemoryGuards)),
+            enableCaching)
             .AsyncVia(SessionInvoker_));
 }
 
 TFuture<NIO::TIOCounters> TBlobSession::DoPerformPutBlocks(
     int startBlockIndex,
-    const std::vector<TBlock>& blocks,
-    std::vector<TMemoryUsageTrackerGuard> memoryTrackerGuards,
+    std::vector<TBlock> blocks,
+    std::vector<TLocationMemoryGuard> locationMemoryGuards,
     bool enableCaching)
 {
     VERIFY_INVOKER_AFFINITY(SessionInvoker_);
@@ -589,8 +601,9 @@ TFuture<NIO::TIOCounters> TBlobSession::DoPerformPutBlocks(
             break;
         }
 
+        slot.LocationMemoryGuard = std::move(locationMemoryGuards[WindowIndex_ - startBlockIndex]);
         slot.PendingIOGuard = Location_->AcquirePendingIO(
-            std::move(memoryTrackerGuards[WindowIndex_ - startBlockIndex]),
+            {},
             EIODirection::Write,
             Options_.WorkloadDescriptor,
             slot.Block.Size());
@@ -660,8 +673,11 @@ void TBlobSession::OnBlocksWritten(int beginBlockIndex, int endBlockIndex, const
 
             // Checking for a state is necessary because the subscriber may trigger after calling slot.WrittenPromise.TrySet().
             if (Options_.DisableSendBlocks && slot.State == ESlotState::Written) {
+                YT_VERIFY(slot.MemoryUsageGuard.GetSize() == 0);
+
                 slot.State = ESlotState::Released;
                 slot.Block = {};
+                slot.LocationMemoryGuard.Release();
                 slot.MemoryUsageGuard.Release();
             }
         }
@@ -700,7 +716,7 @@ TFuture<TDataNodeServiceProxy::TRspPutBlocksPtr> TBlobSession::DoSendBlocks(
     SetRpcAttachedBlocks(req, blocks);
 
     const auto& throttler = Bootstrap_->GetOutThrottler(Options_.WorkloadDescriptor);
-    return throttler->Throttle(requestSize).Apply(BIND([=] () {
+    return throttler->Throttle(requestSize).Apply(BIND([=] {
         return req->Invoke();
     }));
 }
@@ -790,20 +806,21 @@ void TBlobSession::ReleaseBlocks(int flushedBlockIndex)
         YT_VERIFY(slot.State == ESlotState::Written || slot.State == EBlobSessionSlotState::Released);
 
         if (slot.State == ESlotState::Written) {
+            YT_VERIFY(slot.MemoryUsageGuard.GetSize() == 0);
+
             if (delayBeforeFree) {
                 YT_LOG_DEBUG("Simulate delay before blob write session block free (BlockSize: %v, Delay: %v)", slot.Block.Size(), *delayBeforeFree);
 
-                slot.Block = {};
-
-                YT_UNUSED_FUTURE(BIND([=] (TMemoryUsageTrackerGuard guard) {
+                YT_UNUSED_FUTURE(BIND([=] (TBlock block) {
                     TDelayedExecutor::WaitForDuration(*delayBeforeFree);
-                    guard.Release();
+                    block = {};
                 })
                 .AsyncVia(GetCurrentInvoker())
-                .Run(std::move(slot.MemoryUsageGuard)));
+                .Run(std::move(slot.Block)));
             } else {
                 slot.Block = {};
                 slot.MemoryUsageGuard.Release();
+                slot.LocationMemoryGuard.Release();
             }
 
             slot.State = EBlobSessionSlotState::Released;

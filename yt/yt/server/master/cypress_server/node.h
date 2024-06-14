@@ -17,6 +17,8 @@
 
 #include <yt/yt/server/master/transaction_server/public.h>
 
+#include <yt/yt/server/lib/misc/assert_sizeof.h>
+
 #include <yt/yt/ytlib/cypress_client/public.h>
 
 #include <yt/yt/core/misc/property.h>
@@ -180,6 +182,9 @@ struct TCypressNodeDynamicData
     std::optional<TCypressNodeExpirationMap::iterator> ExpirationTimeIterator;
     std::optional<TCypressNodeExpirationMap::iterator> ExpirationTimeoutIterator;
 };
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TCypressNodeDynamicData, 48);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -357,6 +362,9 @@ private:
 };
 
 DEFINE_MASTER_OBJECT_TYPE(TCypressNode)
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TCypressNode, 424);
 
 ////////////////////////////////////////////////////////////////////////////////
 

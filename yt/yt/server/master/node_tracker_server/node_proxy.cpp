@@ -35,6 +35,8 @@
 
 #include <yt/yt/client/chunk_client/public.h>
 
+#include <yt/yt/core/rpc/retrying_channel.h>
+
 #include <yt/yt/core/misc/error.h>
 
 #include <yt/yt/core/ytree/convert.h>
@@ -52,6 +54,7 @@ using namespace NObjectServer;
 using namespace NOrchid;
 using namespace NYTree;
 using namespace NYson;
+using namespace NRpc;
 
 using NYT::FromProto;
 
@@ -439,7 +442,7 @@ private:
                 BuildYsonFluently(consumer)
                     .DoMapFor(node->Cellars(), [] (TFluentMap fluent, const auto& it) {
                         fluent
-                            .Item(CamelCaseToUnderscoreCase(ToString(it.first)))
+                            .Item(FormatEnum(it.first))
                             .Do(BIND(&TClusterNodeProxy::BuildYsonCellar, it.second));
                     });
                 return true;
@@ -759,8 +762,12 @@ private:
         // TODO(max42): make customizable.
         constexpr TDuration timeout = TDuration::Seconds(60);
 
+        auto retryingChannelConfig = New<TRetryingChannelConfig>();
+
         return CreateOrchidYPathService(TOrchidOptions{
-            .Channel = Bootstrap_->GetNodeChannelFactory()->CreateChannel(std::move(nodeAddresses)),
+            .Channel = CreateRetryingChannel(
+                retryingChannelConfig,
+                Bootstrap_->GetNodeChannelFactory()->CreateChannel(std::move(nodeAddresses))),
             .Timeout = timeout,
         });
     }
@@ -772,7 +779,7 @@ private:
                 fluent
                     .Item().BeginMap()
                     .Item("state").Value(slot.PeerState)
-                    .DoIf(slot.Cell, [&](TFluentMap fluent) {
+                    .DoIf(slot.Cell, [&] (TFluentMap fluent) {
                         fluent
                             .Item("cell_id").Value(slot.Cell->GetId())
                             .Item("peer_id").Value(slot.PeerId)

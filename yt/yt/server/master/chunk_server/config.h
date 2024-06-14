@@ -203,6 +203,8 @@ public:
     std::optional<int> MaxChunksPerIteration;
     std::optional<TDuration> DelayBetweenIterations;
 
+    int MaxChunkMeta;
+
     REGISTER_YSON_STRUCT(TDynamicChunkMergerConfig);
 
     static void Register(TRegistrar registrar);
@@ -586,6 +588,9 @@ public:
     //! Deprecated codec names and their alises, used values from yt/core/compression by default.
     std::optional<THashMap<TString, TString>> DeprecatedCodecNameToAlias;
 
+    //! Forbidden erasure codec ids, empty by default.
+    THashSet<NErasure::ECodec> ForbiddenErasureCodecs;
+
     //! The number of oldest part-missing chunks to be remembered by the replicator.
     int MaxOldestPartMissingChunks;
 
@@ -644,6 +649,8 @@ public:
     bool StoreSequoiaReplicasOnMaster;
     bool ProcessRemovedSequoiaReplicasOnMaster;
 
+    bool EnableChunkPurgatory;
+
     //! When set of active chunk replicator shards is changed, no removal jobs
     //! will be scheduled within this period.
     TDuration RemovalJobScheduleDelay;
@@ -660,6 +667,12 @@ public:
     bool EnableChunkSchemas;
 
     bool SchemalessEndUploadPreservesTableSchema;
+
+    //! Forces rack awareness for erasure parts during write targets allocation.
+    bool ForceRackAwarenessForErasureParts;
+
+    bool EnableTwoRandomChoicesWriteTargetAllocation;
+    int NodesToCheckBeforeGivingUpOnWriteTargetAllocation;
 
     REGISTER_YSON_STRUCT(TDynamicChunkManagerConfig);
 

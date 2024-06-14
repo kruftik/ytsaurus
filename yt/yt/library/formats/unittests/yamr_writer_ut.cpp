@@ -35,7 +35,8 @@ protected:
 
     TStringStream OutputStream_;
 
-    TSchemalessWriterForYamrTest() {
+    TSchemalessWriterForYamrTest()
+    {
         NameTable_ = New<TNameTable>();
         KeyId_ = NameTable_->RegisterName("key");
         SubkeyId_ = NameTable_->RegisterName("subkey");
@@ -406,9 +407,9 @@ TEST_F(TSchemalessWriterForYamrTest, Lenval)
 
         "\x04\x00\x00\x00" "key2"
         "\x07\x00\x00\x00" "subkey2"
-        "\x06\x00\x00\x00" "value2"
-        , 2 * (3 * 4 + 4 + 6 + 7) // all i32 + lengths of keys
-    );
+        "\x06\x00\x00\x00" "value2",
+
+        2 * (3 * 4 + 4 + 6 + 7)); // all i32 + lengths of keys
     EXPECT_EQ(output, OutputStream_.Str());
 }
 
@@ -451,10 +452,9 @@ TEST_F(TSchemalessWriterForYamrTest, LenvalWithEmptyFields)
 
         "\x04\x00\x00\x00" "key3"
         "\x07\x00\x00\x00" "subkey3"
-        "\x00\x00\x00\x00" ""
+        "\x00\x00\x00\x00" "",
 
-        , 9 * 4 + (7 + 6) + (4 + 6) + (4 + 7) // all i32 + lengths of keys
-    );
+        9 * 4 + (7 + 6) + (4 + 6) + (4 + 7)); // all i32 + lengths of keys
 
     EXPECT_EQ(output, OutputStream_.Str());
 }
@@ -524,10 +524,9 @@ TEST_F(TSchemalessWriterForYamrTest, LenvalWithKeySwitch)
 
         "\x04\x00\x00\x00" "key3"
         "\x07\x00\x00\x00" "subkey3"
-        "\x06\x00\x00\x00" "value3"
+        "\x06\x00\x00\x00" "value3",
 
-        , 14 * 4 + (4 + 7 + 6) + (4 + 8 + 7) + (4 + 8 + 7) + (4 + 7 + 6) // all i32 + lengths of keys
-    );
+        14 * 4 + (4 + 7 + 6) + (4 + 8 + 7) + (4 + 8 + 7) + (4 + 7 + 6)); // all i32 + lengths of keys
 
     EXPECT_EQ(output, OutputStream_.Str());
 }
@@ -578,8 +577,9 @@ TEST_F(TSchemalessWriterForYamrTest, LenvalWithTableIndex)
         "\xff\xff\xff\xff" "\x17\x00\x00\x00" // 23
 
         "\x04\x00\x00\x00" "key3"
-        "\x06\x00\x00\x00" "value3"
-    , 10 * 4 + 3 * (4 + 6));
+        "\x06\x00\x00\x00" "value3",
+
+        10 * 4 + 3 * (4 + 6));
 
     EXPECT_EQ(output, OutputStream_.Str());
 }
@@ -632,8 +632,9 @@ TEST_F(TSchemalessWriterForYamrTest, LenvalWithRangeAndRowIndex)
         "\x06\x00\x00\x00" "value2"
 
         "\x04\x00\x00\x00" "key3"
-        "\x06\x00\x00\x00" "value3"
-    , 11 * 4 + 3 * (4 + 6));
+        "\x06\x00\x00\x00" "value3",
+
+        11 * 4 + 3 * (4 + 6));
 
     EXPECT_EQ(output, OutputStream_.Str());
 }

@@ -1,5 +1,14 @@
 {
+    "crypta": "crypta/pyproject.toml",
+    "maps/garden/": "maps/garden/pyproject.toml",
+    "maps/sprav/snezhana/": "maps/sprav/snezhana/pyproject.toml",
+    "sprav/mining/": "sprav/mining/pyproject.toml",
+    "taxi/": "taxi/pyproject.toml",
     "taxi/backend-py3/": "taxi/backend-py3/pyproject.toml",
+    "taxi/github/code-linters": "taxi/github/code-linters/pyproject.toml",
+    "taxi/tars": "taxi/tars/pyproject.toml",
+    "taxi/tplatform/uservices/": "taxi/tplatform/uservices/pyproject.toml",
     "taxi/uservices/": "taxi/uservices/pyproject.toml",
-    "taxi/tars": "taxi/tars/pyproject.toml"
+    "intranet/yandex_directory/": "intranet/yandex_directory/pyproject.toml",
+    "games/admin": "games/admin/pyproject.toml"
 }

@@ -96,7 +96,7 @@ using NChunkClient::TDataSliceDescriptor;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ExecNodeLogger;
+static constexpr auto& Logger = ExecNodeLogger;
 static const int TableArtifactBufferRowCount = 10000;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -403,7 +403,7 @@ public:
             artifactDownloadOptions,
             /*bypassArtifactCache*/ false);
 
-        auto Logger = ExecNodeLogger.WithTag("Key: %v, ReadSessionId: %v",
+        auto Logger = ExecNodeLogger().WithTag("Key: %v, ReadSessionId: %v",
             key,
             chunkReadOptions.ReadSessionId);
 
@@ -461,7 +461,7 @@ public:
 
     TFuture<void> RemoveChunksByLocation(const TCacheLocationPtr& location)
     {
-        return BIND([=, this, this_ = MakeStrong(this)] () {
+        return BIND([=, this, this_ = MakeStrong(this)] {
             auto chunks = GetAll();
             for (const auto& chunk : chunks) {
                 if (chunk->GetLocation() == location) {
@@ -523,7 +523,7 @@ private:
 
     void RunBackgroundValidation()
     {
-        Bootstrap_->GetStorageHeavyInvoker()->Invoke(BIND([this_ = MakeStrong(this), this] () {
+        Bootstrap_->GetStorageHeavyInvoker()->Invoke(BIND([this_ = MakeStrong(this), this] {
             // Delay start of background validation to populate chunk cache with useful artifacts.
             TDelayedExecutor::WaitForDuration(Config_->BackgroundArtifactValidationDelay);
 
@@ -630,7 +630,7 @@ private:
         auto chunkId = descriptor.Descriptor.Id;
         const auto& location = descriptor.Location;
 
-        Logger = Logger.WithTag("ChunkId: %v", chunkId);
+        Logger = Logger().WithTag("ChunkId: %v", chunkId);
 
         if (!CanPrepareSingleChunk(key)) {
             YT_LOG_INFO("Skipping validation for multi-chunk artifact");
@@ -970,7 +970,7 @@ private:
         const auto& chunkSpec = key.chunk_specs(0);
         auto seedReplicas = GetReplicasFromChunkSpec(chunkSpec);
 
-        auto Logger = ExecNodeLogger.WithTag("ChunkId: %v, ReadSessionId: %v, Location: %v",
+        auto Logger = ExecNodeLogger().WithTag("ChunkId: %v, ReadSessionId: %v, Location: %v",
             chunkId,
             chunkReadOptions.ReadSessionId,
             location->GetId());
@@ -1186,8 +1186,15 @@ private:
             TBlock block;
             while (reader->ReadBlock(&block)) {
                 if (block.Data.Empty()) {
-                    WaitFor(reader->GetReadyEvent())
-                        .ThrowOnError();
+                    auto error = WaitFor(reader->GetReadyEvent());
+                    if (!error.IsOK()) {
+                        THROW_ERROR_EXCEPTION(
+                            NExecNode::EErrorCode::ArtifactFetchFailed,
+                            "Error while fetching artifact chunks")
+                            << TErrorAttribute("path", key.data_source().path())
+                            << TErrorAttribute("filesystem", FromProto<NControllerAgent::ELayerFilesystem>(key.filesystem()))
+                            << std::move(error);
+                    }
                 } else {
                     output->Write(block.Data.Begin(), block.Size());
                     WaitFor(throttler->Throttle(block.Size()))
@@ -1337,6 +1344,14 @@ private:
             TPipeReaderToWriterOptions options;
             options.BufferRowCount = TableArtifactBufferRowCount;
             options.Throttler = throttler;
+            options.ReaderErrorWrapper = [key] (TError readerError) {
+                return TError(
+                    NExecNode::EErrorCode::ArtifactFetchFailed,
+                    "Error while fetching artifact chunks")
+                    << TErrorAttribute("path", key.data_source().path())
+                    << TErrorAttribute("filesystem", FromProto<NControllerAgent::ELayerFilesystem>(key.filesystem()))
+                    << std::move(readerError);
+            };
             PipeReaderToWriter(
                 reader,
                 writer,

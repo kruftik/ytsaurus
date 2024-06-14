@@ -149,14 +149,15 @@ public:
         bool chaos,
         NCypressClient::TVersionedNodeId nodeId) = 0;
 
-    //! Secondary index management.
+    // Secondary index management.
     virtual TSecondaryIndex* CreateSecondaryIndex(
         NObjectClient::TObjectId hintId,
         ESecondaryIndexKind type,
         TTableNode* table,
-        TTableNode* secondaryIndex) = 0;
+        TTableNode* secondaryIndex,
+        std::optional<TString> predicate) = 0;
 
-    //! Table collocation management.
+    // Table collocation management.
     virtual TTableCollocation* CreateTableCollocation(
         NObjectClient::TObjectId hintId,
         ETableCollocationType type,
@@ -167,23 +168,19 @@ public:
     virtual TTableCollocation* GetTableCollocationOrThrow(TTableCollocationId id) const = 0;
 
     // Queue agent object management.
-
     virtual const THashSet<TTableNode*>& GetQueues() const = 0;
     virtual void RegisterQueue(TTableNode* node) = 0;
     virtual void UnregisterQueue(TTableNode* node) = 0;
 
-    virtual const THashSet<TTableNode*>& GetConsumers() const = 0;
-    virtual void RegisterConsumer(TTableNode* node) = 0;
-    virtual void UnregisterConsumer(TTableNode* node) = 0;
+    virtual const THashSet<TTableNode*>& GetQueueConsumers() const = 0;
+    virtual void RegisterQueueConsumer(TTableNode* node) = 0;
+    virtual void UnregisterQueueConsumer(TTableNode* node) = 0;
+
+    virtual const THashSet<TTableNode*>& GetQueueProducers() const = 0;
+    virtual void RegisterQueueProducer(TTableNode* node) = 0;
+    virtual void UnregisterQueueProducer(TTableNode* node) = 0;
 
     virtual TFuture<NYson::TYsonString> GetQueueAgentObjectRevisionsAsync() const = 0;
-
-    // COMPAT(h0pless): Remove this after schema migration is complete.
-    virtual void TransformForeignSchemaIdsToNative() = 0;
-
-    // COMPAT(h0pless): RecomputeMasterTableSchemaRefCounters
-    virtual void RecomputeMasterTableSchemaExportRefCounters(NLogging::ELogLevel logLevel) = 0;
-    virtual void RecomputeMasterTableSchemaRefCounters(NLogging::ELogLevel logLevel) = 0;
 
     virtual void OnTableCopied(TTableNode* sourceNode, TTableNode* clonedNode) = 0;
 

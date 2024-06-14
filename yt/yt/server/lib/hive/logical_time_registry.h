@@ -15,6 +15,12 @@ namespace NYT::NHiveServer {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct TConsistentState
+{
+    i64 SequenceNumber;
+    int SegmentId;
+};
+
 class TLogicalTimeRegistry
     : public TRefCounted
 {
@@ -32,6 +38,7 @@ public:
 
         DEFINE_SIGNAL(void(TLogicalTime), Tick);
 
+    public:
         TLogicalTime Tick(TLogicalTime externalTime = {});
 
         void Save(NHydra::TSaveContext& context) const;
@@ -41,7 +48,7 @@ public:
 
     TLamportClock* GetClock();
 
-    std::pair<TLogicalTime, i64> GetConsistentState(std::optional<TLogicalTime> logicalTime);
+    std::pair<TLogicalTime, TConsistentState> GetConsistentState(std::optional<TLogicalTime> logicalTime);
 
 private:
     const TLogicalTimeRegistryConfigPtr Config_;
@@ -52,7 +59,7 @@ private:
 
     struct TTimeInfo
     {
-        i64 SequenceNumber;
+        TConsistentState AdjustedState;
         TInstant Timestamp;
     };
     std::map<TLogicalTime, TTimeInfo> TimeInfoMap_;

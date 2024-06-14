@@ -1,20 +1,15 @@
 from .conftest import authors
 from .helpers import TEST_DIR, wait
 
+from yt.wrapper.common import utcnow
 from yt.wrapper.batch_helpers import create_batch_client
 from yt.wrapper.batch_response import apply_function_to_result
 from yt.wrapper.batch_execution import YtBatchRequestFailedError
 
 import yt.wrapper as yt
 
-try:
-    from yt.packages.six.moves import xrange
-except ImportError:
-    from six.moves import xrange
-
 import pytest
 
-import datetime
 import tempfile
 import time
 import os
@@ -115,7 +110,7 @@ class TestBatchExecution(object):
         assert table_type.get_result() == "table"
         assert map_node_type.get_result() == "map_node"
 
-        tables = ["{0}/table_{1}".format(TEST_DIR + "/batch_node_list", str(i)) for i in xrange(10)]
+        tables = ["{0}/table_{1}".format(TEST_DIR + "/batch_node_list", str(i)) for i in range(10)]
         for table in tables:
             client.create("table", table, recursive=True)
         client.commit_batch()
@@ -123,7 +118,23 @@ class TestBatchExecution(object):
         list_result = client.list(TEST_DIR + "/batch_node_list")
         client.commit_batch()
 
-        assert set(list_result.get_result()) == set(("table_" + str(i) for i in xrange(10)))
+        assert set(list_result.get_result()) == set(("table_" + str(i) for i in range(10)))
+
+    @authors("ignat")
+    def test_lock_commands(self):
+        yt.mkdir(TEST_DIR + "/lock_dir", recursive=True)
+
+        with yt.Transaction():
+            client = create_batch_client()
+            lock_rsp = client.lock(TEST_DIR + "/lock_dir", mode="snapshot")
+            client.commit_batch()
+
+            lock_result = lock_rsp.get_result()
+            if yt.config["api_version"] == "v4":
+                assert "lock_id" in lock_result
+                assert "node_id" in lock_result
+            else:
+                assert isinstance(lock_result, str)
 
     @authors("ostyakov")
     def test_acl_commands(self):
@@ -406,7 +417,7 @@ class TestBatchExecutionOperationCommands(object):
             os.chmod(f.name, 0x777)
             op1 = yt.run_map("echo $YT_JOB_ID > {} && cat".format(f.name), table, table, job_count=1, format="json")
             job_id = f.read().strip()
-        after_op1 = datetime.datetime.utcnow()
+        after_op1 = utcnow()
         op2 = yt.run_sort(table, table, sort_by=["x"])
         op3 = yt.run_reduce("cat", table, table, reduce_by=["x"], format="json")
 

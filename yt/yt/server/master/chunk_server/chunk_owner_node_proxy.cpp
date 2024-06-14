@@ -22,6 +22,7 @@
 
 #include <yt/yt/server/master/object_server/object.h>
 
+#include <yt/yt/server/master/table_server/table_manager.h>
 #include <yt/yt/server/master/table_server/master_table_schema.h>
 
 #include <yt/yt/server/master/tablet_server/tablet_manager.h>
@@ -32,8 +33,6 @@
 #include <yt/yt/server/master/security_server/security_tags.h>
 
 #include <yt/yt/server/master/sequoia_server/config.h>
-
-#include <yt/yt/server/master/table_server/table_manager.h>
 
 #include <yt/yt/server/master/transaction_server/proto/transaction_manager.pb.h>
 
@@ -90,14 +89,12 @@ using namespace NTransactionServer;
 using namespace NYson;
 using namespace NYTree;
 
-using NChunkClient::NProto::TDataStatistics;
-
 using NYT::FromProto;
 using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ChunkServerLogger;
+static constexpr auto& Logger = ChunkServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -137,40 +134,19 @@ void CanonizeCellTags(TCellTagList* cellTags)
         cellTags->end());
 }
 
-} // namespace
-
-////////////////////////////////////////////////////////////////////////////////
-
-void BuildChunkSpec(
-    TChunk* chunk,
+void PopulateChunkSpecWithReplicas(
     const TChunkLocationPtrWithReplicaInfoList& chunkReplicas,
-    std::optional<i64> rowIndex,
-    std::optional<int> tabletIndex,
-    const TReadLimit& lowerLimit,
-    const TReadLimit& upperLimit,
-    const TChunkViewModifier* modifier,
     bool fetchParityReplicas,
-    bool fetchAllMetaExtensions,
-    const THashSet<int>& extensionTags,
     NNodeTrackerServer::TNodeDirectoryBuilder* nodeDirectoryBuilder,
-    TBootstrap* bootstrap,
     NChunkClient::NProto::TChunkSpec* chunkSpec)
 {
-    if (rowIndex) {
-        chunkSpec->set_table_row_index(*rowIndex);
-    }
+    TNodePtrWithReplicaAndMediumIndexList replicas;
+    replicas.reserve(chunkReplicas.size());
 
-    if (tabletIndex) {
-        chunkSpec->set_tablet_index(*tabletIndex);
-    }
-
-    auto erasureCodecId = chunk->GetErasureCodec();
+    auto erasureCodecId = FromProto<NErasure::ECodec>(chunkSpec->erasure_codec());
     auto firstInfeasibleReplicaIndex = (erasureCodecId == NErasure::ECodec::None || fetchParityReplicas)
         ? std::numeric_limits<int>::max() // all replicas are feasible
         : NErasure::GetCodec(erasureCodecId)->GetDataPartCount();
-
-    TNodePtrWithReplicaAndMediumIndexList replicas;
-    replicas.reserve(chunkReplicas.size());
 
     auto addReplica = [&] (TChunkLocationPtrWithReplicaInfo replica)  {
         if (replica.GetReplicaIndex() >= firstInfeasibleReplicaIndex) {
@@ -188,6 +164,30 @@ void BuildChunkSpec(
 
     ToProto(chunkSpec->mutable_legacy_replicas(), replicas);
     ToProto(chunkSpec->mutable_replicas(), replicas);
+}
+
+void BuildReplicalessChunkSpec(
+    TBootstrap* bootstrap,
+    TChunk* chunk,
+    std::optional<i64> rowIndex,
+    std::optional<int> tabletIndex,
+    const TReadLimit& lowerLimit,
+    const TReadLimit& upperLimit,
+    const TChunkViewModifier* modifier,
+    bool fetchAllMetaExtensions,
+    const THashSet<int>& extensionTags,
+    NChunkClient::NProto::TChunkSpec* chunkSpec)
+{
+    if (rowIndex) {
+        chunkSpec->set_table_row_index(*rowIndex);
+    }
+
+    if (tabletIndex) {
+        chunkSpec->set_tablet_index(*tabletIndex);
+    }
+
+    auto erasureCodecId = chunk->GetErasureCodec();
+
     ToProto(chunkSpec->mutable_chunk_id(), chunk->GetId());
     chunkSpec->set_erasure_codec(ToProto<int>(erasureCodecId));
     chunkSpec->set_striped_erasure(chunk->GetStripedErasure());
@@ -247,13 +247,50 @@ void BuildChunkSpec(
     }
 }
 
+} // namespace
+
+////////////////////////////////////////////////////////////////////////////////
+
+void BuildChunkSpec(
+    TBootstrap* bootstrap,
+    TChunk* chunk,
+    const TChunkLocationPtrWithReplicaInfoList& chunkReplicas,
+    std::optional<i64> rowIndex,
+    std::optional<int> tabletIndex,
+    const TReadLimit& lowerLimit,
+    const TReadLimit& upperLimit,
+    const TChunkViewModifier* modifier,
+    bool fetchParityReplicas,
+    bool fetchAllMetaExtensions,
+    const THashSet<int>& extensionTags,
+    NNodeTrackerServer::TNodeDirectoryBuilder* nodeDirectoryBuilder,
+    NChunkClient::NProto::TChunkSpec* chunkSpec)
+{
+    BuildReplicalessChunkSpec(
+        bootstrap,
+        chunk,
+        rowIndex,
+        tabletIndex,
+        lowerLimit,
+        upperLimit,
+        modifier,
+        fetchAllMetaExtensions,
+        extensionTags,
+        chunkSpec);
+    PopulateChunkSpecWithReplicas(
+        chunkReplicas,
+        fetchParityReplicas,
+        nodeDirectoryBuilder,
+        chunkSpec);
+}
+
 void BuildDynamicStoreSpec(
+    TBootstrap* bootstrap,
     const TDynamicStore* dynamicStore,
     std::optional<int> tabletIndex,
     const TReadLimit& lowerLimit,
     const TReadLimit& upperLimit,
     NNodeTrackerServer::TNodeDirectoryBuilder* nodeDirectoryBuilder,
-    TBootstrap* bootstrap,
     NChunkClient::NProto::TChunkSpec* chunkSpec)
 {
     const auto& tabletManager = bootstrap->GetTabletManager();
@@ -334,6 +371,8 @@ private:
     TFetchContext FetchContext_;
     const TComparator Comparator_;
 
+    std::vector<TEphemeralObjectPtr<TChunk>> Chunks_;
+
     int CurrentRangeIndex_ = 0;
 
     THashSet<int> ExtensionTags_;
@@ -355,6 +394,44 @@ private:
             FetchContext_.Ranges[CurrentRangeIndex_].LowerLimit(),
             FetchContext_.Ranges[CurrentRangeIndex_].UpperLimit(),
             Comparator_);
+    }
+
+    bool PopulateReplicas()
+    {
+        const auto& chunkManager = Bootstrap_->GetChunkManager();
+
+        // This is context switch, chunks may die.
+        auto replicas = chunkManager->GetChunkReplicas(Chunks_);
+        for (const auto& chunk : Chunks_) {
+            if (!IsObjectAlive(chunk)) {
+                ReplyError(TError("Chunk %v died during replica fetch",
+                    chunk->GetId()));
+                return false;
+            }
+        }
+
+        for (auto& chunkSpec : *RpcContext_->Response().mutable_chunks()) {
+            auto chunkId = FromProto<TChunkId>(chunkSpec.chunk_id());
+            auto it = replicas.find(chunkId);
+            if (it == replicas.end()) {
+                continue;
+            }
+
+            const auto& chunkReplicasOrError = it->second;
+            if (!chunkReplicasOrError.IsOK()) {
+                ReplyError(chunkReplicasOrError);
+                return false;
+            }
+
+            const auto& replicas = chunkReplicasOrError.Value();
+            PopulateChunkSpecWithReplicas(
+                replicas,
+                FetchContext_.FetchParityReplicas,
+                &NodeDirectoryBuilder_,
+                &chunkSpec);
+        }
+
+        return true;
     }
 
     void ReplySuccess()
@@ -388,11 +465,10 @@ private:
         Bootstrap_->VerifyPersistentStateRead();
 
         const auto& configManager = Bootstrap_->GetConfigManager();
-        const auto& chunkManager = Bootstrap_->GetChunkManager();
-
         const auto& dynamicConfig = configManager->GetConfig()->ChunkManager;
         if (RpcContext_->Response().chunks_size() >= dynamicConfig->MaxChunksPerFetch) {
-            ReplyError(TError("Attempt to fetch too many chunks in a single request")
+            ReplyError(TError(NChunkClient::EErrorCode::TooManyChunksToFetch,
+                "Attempt to fetch too many chunks in a single request")
                 << TErrorAttribute("limit", dynamicConfig->MaxChunksPerFetch));
             return false;
         }
@@ -403,43 +479,25 @@ private:
             return false;
         }
 
-        auto ephemeralChunk = TEphemeralObjectPtr<TChunk>(chunk);
-        // This is context switch, chunk may die.
-        auto replicasOrError = chunkManager->GetChunkReplicas(ephemeralChunk);
-        if (!replicasOrError.IsOK()) {
-            ReplyError(replicasOrError);
-            return false;
-        }
-
-        if (!IsObjectAlive(ephemeralChunk)) {
-            ReplyError(TError("Chunk %v died during replica fetch",
-                ephemeralChunk->GetId()));
-            return false;
-        }
-
-        const auto& replicas = replicasOrError.Value();
-
+        Chunks_.push_back(TEphemeralObjectPtr<TChunk>(chunk));
         auto* chunkSpec = RpcContext_->Response().add_chunks();
 
-        BuildChunkSpec(
+        BuildReplicalessChunkSpec(
+            Bootstrap_,
             chunk,
-            replicas,
             rowIndex,
             tabletIndex,
             lowerLimit,
             upperLimit,
             modifier,
-            FetchContext_.FetchParityReplicas,
             RpcContext_->Request().fetch_all_meta_extensions(),
             ExtensionTags_,
-            &NodeDirectoryBuilder_,
-            Bootstrap_,
             chunkSpec);
         chunkSpec->set_range_index(CurrentRangeIndex_);
 
         ValidateChunkFeatures(
             chunk->GetId(),
-            chunkSpec->chunk_meta().features(),
+            FromProto<NChunkClient::EChunkFeatures>(chunkSpec->chunk_meta().features()),
             FetchContext_.SupportedChunkFeatures);
 
         return true;
@@ -500,12 +558,12 @@ private:
         } else {
             auto* chunkSpec = RpcContext_->Response().add_chunks();
             BuildDynamicStoreSpec(
+                Bootstrap_,
                 dynamicStore,
                 tabletIndex,
                 lowerLimit,
                 upperLimit,
                 &NodeDirectoryBuilder_,
-                Bootstrap_,
                 chunkSpec);
             chunkSpec->set_range_index(CurrentRangeIndex_);
         }
@@ -527,7 +585,9 @@ private:
 
         ++CurrentRangeIndex_;
         if (CurrentRangeIndex_ == std::ssize(FetchContext_.Ranges)) {
-            ReplySuccess();
+            if (PopulateReplicas()) {
+                ReplySuccess();
+            }
         } else {
             TraverseCurrentRange();
         }
@@ -680,7 +740,7 @@ bool TChunkOwnerNodeProxy::GetBuiltinAttribute(
 
         case EInternedAttributeKey::ChunkCount:
             BuildYsonFluently(consumer)
-                .Value(statistics.chunk_count());
+                .Value(statistics.ChunkCount);
             return true;
 
         case EInternedAttributeKey::SnapshotStatistics:
@@ -695,17 +755,17 @@ bool TChunkOwnerNodeProxy::GetBuiltinAttribute(
 
         case EInternedAttributeKey::UncompressedDataSize:
             BuildYsonFluently(consumer)
-                .Value(statistics.uncompressed_data_size());
+                .Value(statistics.UncompressedDataSize);
             return true;
 
         case EInternedAttributeKey::CompressedDataSize:
             BuildYsonFluently(consumer)
-                .Value(statistics.compressed_data_size());
+                .Value(statistics.CompressedDataSize);
             return true;
 
         case EInternedAttributeKey::CompressionRatio: {
-            double ratio = statistics.uncompressed_data_size() > 0
-                ? static_cast<double>(statistics.compressed_data_size()) / statistics.uncompressed_data_size()
+            double ratio = statistics.UncompressedDataSize > 0
+                ? static_cast<double>(statistics.CompressedDataSize) / statistics.UncompressedDataSize
                 : 0;
             BuildYsonFluently(consumer)
                 .Value(ratio);
@@ -837,7 +897,7 @@ bool TChunkOwnerNodeProxy::GetBuiltinAttribute(
                 break;
             }
 
-            TDataStatistics extraResourceUsage;
+            TChunkOwnerDataStatistics extraResourceUsage;
             auto* originator = node->GetOriginator()->As<TChunkOwnerBase>();
             switch (node->GetUpdateMode()) {
                 case EUpdateMode::Overwrite:
@@ -1072,6 +1132,7 @@ bool TChunkOwnerNodeProxy::SetBuiltinAttribute(
             }
 
             ValidatePermission(EPermissionCheckScope::This, EPermission::Write);
+            ValidateErasureCodec(value, config->ForbiddenErasureCodecs);
 
             const auto& uninternedKey = key.Unintern();
             auto codec = ConvertTo<NErasure::ECodec>(value);
@@ -1514,22 +1575,10 @@ TMasterTableSchema* TChunkOwnerNodeProxy::CalculateEffectiveMasterTableSchema(
         return tableManager->GetEmptyMasterTableSchema();
     }
 
+    YT_VERIFY(schemaId);
+
     if (schema) {
-        // COMPAT(h0pless): Remove this after schema migration is complete.
-        if (!schemaId) {
-            YT_LOG_ALERT("Created native schema on an external cell tag (NodeId: %v, TransactionId: %v)",
-                node->GetId(),
-                schemaHolder->GetId());
-            return tableManager->GetOrCreateNativeMasterTableSchema(*schema, schemaHolder);
-        }
-
         return tableManager->CreateImportedTemporaryMasterTableSchema(*schema, schemaHolder, schemaId);
-    }
-
-    if (!schemaId) {
-        YT_LOG_ALERT("Used empty native schema on an external cell tag (NodeId: %v)",
-            node->GetId());
-        return tableManager->GetEmptyMasterTableSchema();
     }
 
     return tableManager->GetMasterTableSchema(schemaId);
@@ -1552,7 +1601,7 @@ DEFINE_YPATH_SERVICE_METHOD(TChunkOwnerNodeProxy, Fetch)
     fetchContext.FetchParityReplicas = request->fetch_parity_replicas();
     fetchContext.OmitDynamicStores = request->omit_dynamic_stores();
     fetchContext.ThrowOnChunkViews = request->throw_on_chunk_views();
-    fetchContext.SupportedChunkFeatures = request->supported_chunk_features();
+    fetchContext.SupportedChunkFeatures = FromProto<NChunkClient::EChunkFeatures>(request->supported_chunk_features());
     fetchContext.AddressType = request->has_address_type()
         ? CheckedEnumCast<EAddressType>(request->address_type())
         : EAddressType::InternalRpc;
@@ -1953,7 +2002,7 @@ DEFINE_YPATH_SERVICE_METHOD(TChunkOwnerNodeProxy, EndUpload)
     uploadContext.SchemaMode = CheckedEnumCast<ETableSchemaMode>(request->schema_mode());
 
     if (request->has_statistics()) {
-        uploadContext.Statistics = &request->statistics();
+        uploadContext.Statistics = FromProto<TChunkOwnerDataStatistics>(request->statistics());
     }
 
     if (request->has_optimize_for()) {

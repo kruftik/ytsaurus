@@ -128,14 +128,17 @@ public:
 
         // Warming up. Create at least 1 writer for future use.
         AddWriteTask(TWriteTask(TVector<T>{}, 0));
+        // Wait until warming up is fully complete
+        TaskFutures_.back().GetValueSync();
     }
 
     ~TParallelUnorderedTableWriterBase()
     {
-        // This statement always true
-        // because even in an exceptional situation
-        // owner class call Finish in destructor
-        Y_ABORT_UNLESS(Stopped_ == true);
+        if (Options_.AutoFinish_) {
+            FinishOrDie(this, true, "TParallelUnorderedTableWriterBase");
+        } else {
+            Abort();
+        }
     }
 
     void Abort() override
@@ -157,9 +160,13 @@ public:
 
     void FinishTable(size_t) override
     {
+         Finish();
+    }
+
+    void Finish()
+    {
         if (!Stopped_) {
             Stopped_ = true;
-
             ::NThreading::WaitAll(TaskFutures_).GetValueSync();
             auto writerList = WriterPool_.Finish();
             for (auto&& writer : writerList) {
@@ -220,7 +227,13 @@ protected:
 
                 return writer;
             });
-            task.Process(writer);
+
+            try {
+                task.Process(writer);
+            } catch (const std::exception&) {
+                WriterPool_.Abort(std::current_exception());
+                throw;
+            }
 
             // If exception in Process is thrown parallel writer is going to be aborted.
             // No need to Release writer in this case.
@@ -239,9 +252,11 @@ private:
         TTableWriterPtr<T> Acquire(const std::function<TTableWriterPtr<T>()>& createFunc)
         {
             auto g = Guard(Lock_);
-            Y_ABORT_IF(!Running_);
-            while (WriterPool_.empty() && PoolSize_ >= MaxPoolSize_) {
+            while (!Error_ && WriterPool_.empty() && PoolSize_ >= MaxPoolSize_) {
                 HasWriterCV_.Wait(Lock_);
+            }
+            if (Error_) {
+                std::rethrow_exception(Error_);
             }
             if (!WriterPool_.empty()) {
                 auto writer = std::move(WriterPool_.front());
@@ -258,24 +273,21 @@ private:
         void Release(TTableWriterPtr<T>&& writer)
         {
             auto g = Guard(Lock_);
-            if (!Running_) {
-                return;
-            }
             WriterPool_.push_back(std::move(writer));
             HasWriterCV_.Signal();
         }
 
-        void Abort()
+        void Abort(std::exception_ptr ex)
         {
             auto g = Guard(Lock_);
-            Running_ = false;
+            Error_ = ex;
+            HasWriterCV_.Signal();
         }
 
         std::deque<TTableWriterPtr<T>> Finish()
         {
             auto g = Guard(Lock_);
-            Y_ABORT_IF(!Running_);
-            Running_ = false;
+            Y_ABORT_IF(Error_);
 
             Y_ABORT_IF(WriterPool_.size() != PoolSize_,
                 "Finish is expected to be called after all writers are released, %ld != %ld",
@@ -291,7 +303,7 @@ private:
         TCondVar HasWriterCV_;
         std::deque<TTableWriterPtr<T>> WriterPool_;
         size_t PoolSize_ = 0;
-        bool Running_ = true;
+        std::exception_ptr Error_;
     };
 
 private:

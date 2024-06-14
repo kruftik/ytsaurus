@@ -2,9 +2,17 @@
 
 #include "public.h"
 
+#include <yt/yt/client/object_client/public.h>
+
+#include <yt/yt/ytlib/api/native/public.h>
+
 #include <library/cpp/yt/memory/intrusive_ptr.h>
 
 namespace NYT::NCellMasterClient {
+
+///////////////////////////////////////////////////////////////////////////////
+
+using TSecondaryMasterConnectionConfigs = THashMap<NObjectClient::TCellTag, NApi::NNative::TMasterConnectionConfigPtr>;
 
 ///////////////////////////////////////////////////////////////////////////////
 

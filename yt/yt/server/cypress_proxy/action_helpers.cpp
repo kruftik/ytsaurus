@@ -1,10 +1,14 @@
 #include "private.h"
 #include "action_helpers.h"
+#include "sequoia_service.h"
+
+#include <yt/yt/server/lib/misc/interned_attributes.h>
 
 #include <yt/yt/ytlib/cypress_server/proto/sequoia_actions.pb.h>
 
 #include <yt/yt/ytlib/sequoia_client/helpers.h>
 #include <yt/yt/ytlib/sequoia_client/transaction.h>
+#include <yt/yt/ytlib/sequoia_client/ypath_detail.h>
 
 #include <yt/ytlib/sequoia_client/records/child_node.record.h>
 #include <yt/ytlib/sequoia_client/records/node_id_to_path.record.h>
@@ -13,8 +17,6 @@
 #include <yt/yt/ytlib/transaction_client/action.h>
 
 #include <yt/yt/client/object_client/helpers.h>
-
-#include <yt/yt/core/ypath/helpers.h>
 
 namespace NYT::NCypressProxy {
 
@@ -25,6 +27,7 @@ using namespace NTableClient;
 using namespace NTransactionClient;
 using namespace NYPath;
 using namespace NYson;
+using namespace NYTree;
 
 using namespace NCypressClient::NProto;
 using namespace NCypressServer::NProto;
@@ -32,23 +35,32 @@ using namespace NCypressServer::NProto;
 using NYT::FromProto;
 using NYT::ToProto;
 
-using TYPath = NYPath::TYPath;
-
 ////////////////////////////////////////////////////////////////////////////////
 
 void WriteSequoiaNodeRows(
     TNodeId id,
-    const TYPath& path,
+    TAbsoluteYPathBuf path,
+    const TWriteSequoiaNodeRowsOptions& options,
     const ISequoiaTransactionPtr& transaction)
 {
-    auto [parentPath, childKey] = DirNameAndBaseName(path);
-    transaction->WriteRow(NRecords::TPathToNodeId{
-        .Key = {.Path = MangleSequoiaPath(path)},
-        .NodeId = id,
-    });
+    {
+        auto record = NRecords::TPathToNodeId{
+            .Key = {.Path = path.ToMangledSequoiaPath()},
+            .NodeId = id,
+        };
+
+        if (options.RedirectPath) {
+            YT_VERIFY(TypeFromId(id) == EObjectType::SequoiaLink);
+
+            record.RedirectPath = options.RedirectPath->ToString();
+        }
+
+        transaction->WriteRow(record);
+    }
+
     transaction->WriteRow(NRecords::TNodeIdToPath{
         .Key = {.NodeId = id},
-        .Path = path,
+        .Path = path.ToString(),
     });
 }
 
@@ -84,27 +96,43 @@ void SetNode(
 void CreateNode(
     EObjectType type,
     TNodeId id,
-    const TYPath& path,
+    TAbsoluteYPathBuf path,
+    const IAttributeDictionary* explicitAttributes,
     const ISequoiaTransactionPtr& transaction)
 {
-    WriteSequoiaNodeRows(id, path, transaction);
+    {
+        TWriteSequoiaNodeRowsOptions options;
+        if (type == EObjectType::SequoiaLink) {
+            options.RedirectPath = TAbsoluteYPath(
+                explicitAttributes->Get<TString>(EInternedAttributeKey::TargetPath.Unintern()));
+        }
+        WriteSequoiaNodeRows(id, path, options, transaction);
+    }
+
+    IAttributeDictionaryPtr explicitAttributeHolder;
+    if (!explicitAttributes) {
+        explicitAttributeHolder = CreateEphemeralAttributes();
+        explicitAttributes = explicitAttributeHolder.Get();
+    }
 
     NCypressServer::NProto::TReqCreateNode createNodeRequest;
     createNodeRequest.set_type(ToProto<int>(type));
     ToProto(createNodeRequest.mutable_node_id(), id);
-    createNodeRequest.set_path(path);
+    createNodeRequest.set_path(path.ToString());
+    ToProto(createNodeRequest.mutable_node_attributes(), *explicitAttributes);
     transaction->AddTransactionAction(CellTagFromId(id), MakeTransactionActionData(createNodeRequest));
 }
 
 TNodeId CopyNode(
-    TNodeId sourceNodeId,
-    const TYPath& destinationNodePath,
+    const NRecords::TPathToNodeId& sourceNode,
+    TAbsoluteYPathBuf destinationNodePath,
     const TCopyOptions& options,
     const ISequoiaTransactionPtr& transaction)
 {
     // TypeFromId here might break everything for Cypress->Sequoia copy.
     // Add exception somewhere to not crash all the time.
     // TODO(h0pless): Do that.
+    auto sourceNodeId = sourceNode.NodeId;
     auto sourceNodeType = TypeFromId(sourceNodeId);
     YT_VERIFY(
         sourceNodeType != EObjectType::Rootstock &&
@@ -112,12 +140,18 @@ TNodeId CopyNode(
 
     auto cellTag = CellTagFromId(sourceNodeId);
     auto destinationNodeId = transaction->GenerateObjectId(sourceNodeType, cellTag);
-    WriteSequoiaNodeRows(destinationNodeId, destinationNodePath, transaction);
+    {
+        TWriteSequoiaNodeRowsOptions options;
+        if (sourceNodeType == EObjectType::SequoiaLink) {
+            options.RedirectPath = TAbsoluteYPath(sourceNode.RedirectPath);
+        }
+        WriteSequoiaNodeRows(destinationNodeId, destinationNodePath, options, transaction);
+    }
 
     NCypressServer::NProto::TReqCloneNode cloneNodeRequest;
     ToProto(cloneNodeRequest.mutable_src_id(), sourceNodeId);
     ToProto(cloneNodeRequest.mutable_dst_id(), destinationNodeId);
-    cloneNodeRequest.set_dst_path(destinationNodePath);
+    cloneNodeRequest.set_dst_path(destinationNodePath.ToString());
     ToProto(cloneNodeRequest.mutable_options(), options);
     // TODO(h0pless): Add cypress transaction id here.
 
@@ -143,13 +177,13 @@ void RemoveNode(
 void AttachChild(
     TNodeId parentId,
     TNodeId childId,
-    const TYPath& childKey,
+    const TString& childKey,
     const ISequoiaTransactionPtr& transaction)
 {
     transaction->WriteRow(NRecords::TChildNode{
         .Key = {
             .ParentId = parentId,
-            .ChildKey = ToStringLiteral(childKey),
+            .ChildKey = childKey,
         },
         .ChildId = childId,
     });
@@ -157,7 +191,7 @@ void AttachChild(
     NCypressServer::NProto::TReqAttachChild attachChildRequest;
     ToProto(attachChildRequest.mutable_parent_id(), parentId);
     ToProto(attachChildRequest.mutable_child_id(), childId);
-    attachChildRequest.set_key(ToStringLiteral(childKey));
+    attachChildRequest.set_key(childKey);
     transaction->AddTransactionAction(CellTagFromId(parentId), MakeTransactionActionData(attachChildRequest));
 }
 
@@ -168,24 +202,24 @@ void DetachChild(
 {
     transaction->DeleteRow(NRecords::TChildNodeKey{
         .ParentId = parentId,
-        .ChildKey = ToStringLiteral(childKey),
+        .ChildKey = childKey,
     });
 
     NCypressServer::NProto::TReqDetachChild reqDetachChild;
     ToProto(reqDetachChild.mutable_parent_id(), parentId);
-    reqDetachChild.set_key(ToStringLiteral(childKey));
+    reqDetachChild.set_key(childKey);
     transaction->AddTransactionAction(
         CellTagFromId(parentId),
         MakeTransactionActionData(reqDetachChild));
 }
 
 void LockRowInPathToIdTable(
-    const TYPath& path,
+    TAbsoluteYPathBuf path,
     const ISequoiaTransactionPtr& transaction,
     ELockType lockType)
 {
     NRecords::TPathToNodeIdKey nodeKey{
-        .Path = MangleSequoiaPath(path),
+        .Path = path.ToMangledSequoiaPath(),
     };
     transaction->LockRow(nodeKey, lockType);
 }

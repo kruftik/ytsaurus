@@ -203,12 +203,13 @@ def on_peerdir_ts_resource(unit, *resources):
 
 
 @_with_report_configure_error
-def on_ts_configure(unit, *tsconfig_paths):
-    # type: (Unit, *str) -> None
+def on_ts_configure(unit):
+    # type: (Unit) -> None
     from lib.nots.package_manager.base import PackageJson
     from lib.nots.package_manager.base.utils import build_pj_path
     from lib.nots.typescript import TsConfig
 
+    tsconfig_paths = unit.get("TS_CONFIG_PATH").split()
     # for use in CMD as inputs
     __set_append(
         unit, "TS_CONFIG_FILES", _build_cmd_input_paths(tsconfig_paths, hide=True, disable_include_processor=True)
@@ -252,6 +253,25 @@ def on_ts_configure(unit, *tsconfig_paths):
 
     _setup_eslint(unit)
     _setup_tsc_typecheck(unit, tsconfig_paths)
+
+
+@_with_report_configure_error
+def on_setup_build_env(unit):  # type: (Unit) -> None
+    build_env_var = unit.get("TS_BUILD_ENV")  # type: str
+    if not build_env_var:
+        return
+
+    options = []
+    for name in build_env_var.split(","):
+        options.append("--env")
+        value = unit.get(f"TS_ENV_{name}")
+        if value is None:
+            ymake.report_configure_error(f"Env var '{name}' is provided in a list, but var value is not provided")
+            continue
+        double_quote_escaped_value = value.replace('"', '\\"')
+        options.append(f'"{name}={double_quote_escaped_value}"')
+
+    unit.set(["NOTS_TOOL_BUILD_ENV", " ".join(options)])
 
 
 def __set_append(unit, var_name, value):
@@ -372,11 +392,12 @@ def _setup_eslint(unit):
     if not lint_files:
         return
 
+    mod_dir = unit.get("MODDIR")
+
     unit.on_peerdir_ts_resource("eslint")
     user_recipes = unit.get("TEST_RECIPES_VALUE")
-    unit.on_setup_extract_node_modules_recipe(unit.get("MODDIR"))
+    unit.on_setup_install_node_modules_recipe()
 
-    mod_dir = unit.get("MODDIR")
     lint_files = _resolve_module_files(unit, mod_dir, lint_files)
     deps = _create_pm(unit).get_peers_from_package_json()
     test_record = {
@@ -460,7 +481,7 @@ def _add_test(unit, test_type, test_files, deps=None, test_record=None, test_cwd
         # Key to discover suite (see devtools/ya/test/explore/__init__.py#gen_suite)
         "SCRIPT-REL-PATH": test_type,
         # Test name as shown in PR check, should be unique inside one module
-        "TEST-NAME": test_type.lower(),
+        "TEST-NAME": test_type.lower().replace(".new", ""),
         "TEST-TIMEOUT": unit.get("TEST_TIMEOUT") or "",
         "TEST-ENV": ytest.prepare_env(unit.get("TEST_ENV_VALUE")),
         "TESTED-PROJECT-NAME": os.path.splitext(unit.filename())[0],
@@ -531,7 +552,7 @@ def _select_matching_version(erm_json, resource_name, range_str, dep_is_required
                 resource_name,
                 range_str,
                 ", ".join(map(str, toolchain_versions)),
-                "https://docs.yandex-team.ru/ya-make/manual/typescript/toolchain",
+                "https://docs.yandex-team.ru/frontend-in-arcadia/_generated/toolchain",
                 str(error),
             )
         )
@@ -539,20 +560,39 @@ def _select_matching_version(erm_json, resource_name, range_str, dep_is_required
 
 @_with_report_configure_error
 def on_prepare_deps_configure(unit):
-    # Originally this peerdir was in .conf file
-    # but it kept taking default value of NPM_CONTRIBS_PATH
-    # before it was updated by CUSTOM_CONTRIB_TYPESCRIPT()
-    # so I moved it here.
-    unit.onpeerdir(unit.get("NPM_CONTRIBS_PATH"))
+    contrib_path = unit.get("NPM_CONTRIBS_PATH")
+    if contrib_path == '-':
+        unit.on_prepare_deps_configure_no_contrib()
+        return
+    unit.onpeerdir(contrib_path)
     pm = _create_pm(unit)
     pj = pm.load_package_json_from_dir(pm.sources_path)
     has_deps = pj.has_dependencies()
     ins, outs = pm.calc_prepare_deps_inouts(unit.get("_TARBALLS_STORE"), has_deps)
 
-    if pj.has_dependencies():
+    if has_deps:
         unit.onpeerdir(pm.get_local_peers_from_package_json())
         __set_append(unit, "_PREPARE_DEPS_INOUTS", _build_directives("input", ["hide"], sorted(ins)))
         __set_append(unit, "_PREPARE_DEPS_INOUTS", _build_directives("output", ["hide"], sorted(outs)))
+
+    else:
+        __set_append(unit, "_PREPARE_DEPS_INOUTS", _build_directives("output", [], sorted(outs)))
+        unit.set(["_PREPARE_DEPS_CMD", "$_PREPARE_NO_DEPS_CMD"])
+
+
+@_with_report_configure_error
+def on_prepare_deps_configure_no_contrib(unit):
+    pm = _create_pm(unit)
+    pj = pm.load_package_json_from_dir(pm.sources_path)
+    has_deps = pj.has_dependencies()
+    ins, outs, resources = pm.calc_prepare_deps_inouts_and_resources(unit.get("_TARBALLS_STORE"), has_deps)
+
+    if has_deps:
+        unit.onpeerdir(pm.get_local_peers_from_package_json())
+        __set_append(unit, "_PREPARE_DEPS_INOUTS", _build_directives("input", ["hide"], sorted(ins)))
+        __set_append(unit, "_PREPARE_DEPS_INOUTS", _build_directives("output", ["hide"], sorted(outs)))
+        unit.set(["_PREPARE_DEPS_RESOURCES", " ".join([f'${{resource:"{uri}"}}' for uri in sorted(resources)])])
+        unit.set(["_PREPARE_DEPS_USE_RESOURCES_FLAG", "--resource-root $(RESOURCE_ROOT)"])
 
     else:
         __set_append(unit, "_PREPARE_DEPS_INOUTS", _build_directives("output", [], sorted(outs)))
@@ -574,20 +614,6 @@ def on_node_modules_configure(unit):
             __set_append(unit, "_NODE_MODULES_INOUTS", _build_directives("output", ["hide"], sorted(outs)))
 
         if pj.get_use_prebuilder():
-            lf = pm.load_lockfile_from_dir(pm.sources_path)
-            is_valid, invalid_keys = lf.validate_has_addons_flags()
-
-            if not is_valid:
-                ymake.report_configure_error(
-                    "Project is configured to use @yatool/prebuilder. \n"
-                    + "Some packages in the pnpm-lock.yaml are misconfigured.\n"
-                    + "Run `ya tool nots update-lockfile` to fix lockfile.\n"
-                    + "All packages with `requiresBuild:true` have to be marked with `hasAddons:true/false`.\n"
-                    + "Misconfigured keys: \n"
-                    + "  - "
-                    + "\n  - ".join(invalid_keys)
-                )
-
             unit.on_peerdir_ts_resource("@yatool/prebuilder")
             unit.set(
                 [
@@ -595,6 +621,39 @@ def on_node_modules_configure(unit):
                     "--yatool-prebuilder-path $YATOOL_PREBUILDER_ROOT/node_modules/@yatool/prebuilder",
                 ]
             )
+
+            # YATOOL_PREBUILDER_0_7_0_RESOURCE_GLOBAL
+            prebuilder_major = unit.get("YATOOL_PREBUILDER-ROOT-VAR-NAME").split("_")[2]
+            logger.info(f"Detected prebuilder \033[0;32mv{prebuilder_major}.x.x\033[0;49m")
+
+            if prebuilder_major == "0":
+                # TODO: FBP-1408
+                lf = pm.load_lockfile_from_dir(pm.sources_path)
+                is_valid, invalid_keys = lf.validate_has_addons_flags()
+
+                if not is_valid:
+                    ymake.report_configure_error(
+                        "Project is configured to use @yatool/prebuilder. \n"
+                        + "Some packages in the pnpm-lock.yaml are misconfigured.\n"
+                        + "Run \033[0;32m`ya tool nots update-lockfile`\033[0;49m to fix lockfile.\n"
+                        + "All packages with `requiresBuild:true` have to be marked with `hasAddons:true/false`.\n"
+                        + "Misconfigured keys: \n"
+                        + "  - "
+                        + "\n  - ".join(invalid_keys)
+                    )
+            else:
+                lf = pm.load_lockfile_from_dir(pm.sources_path)
+                requires_build_packages = lf.get_requires_build_packages()
+                is_valid, validation_messages = pj.validate_prebuilds(requires_build_packages)
+
+                if not is_valid:
+                    ymake.report_configure_error(
+                        "Project is configured to use @yatool/prebuilder. \n"
+                        + "Some packages are misconfigured.\n"
+                        + "Run \033[0;32m`ya tool nots update-lockfile`\033[0;49m to fix pnpm-lock.yaml and package.json.\n"
+                        + "Validation details: \n"
+                        + "\n".join(validation_messages)
+                    )
 
 
 @_with_report_configure_error
@@ -675,6 +734,17 @@ def on_ts_files(unit, *files):
     if all_cmds:
         new_cmds.insert(0, all_cmds)
     unit.set(["_TS_FILES_COPY_CMD", " && ".join(new_cmds)])
+
+
+@_with_report_configure_error
+def on_ts_package_check_files(unit):
+    ts_files = unit.get("_TS_FILES_COPY_CMD")
+    if ts_files == "":
+        ymake.report_configure_error(
+            "\n"
+            "In the TS_PACKAGE module, you should define at least one file using the TS_FILES() macro.\n"
+            "Docs: https://docs.yandex-team.ru/frontend-in-arcadia/references/TS_PACKAGE#ts-files."
+        )
 
 
 @_with_report_configure_error

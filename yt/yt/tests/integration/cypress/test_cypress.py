@@ -64,7 +64,7 @@ def not_implemented_in_sequoia(func):
 
 
 class TestCypress(YTEnvSetup):
-    NUM_TEST_PARTITIONS = 12
+    NUM_TEST_PARTITIONS = 3
 
     NUM_MASTERS = 3
     NUM_NODES = 0
@@ -81,7 +81,11 @@ class TestCypress(YTEnvSetup):
             set("a", 20)
 
         # path starting with single /
-        with raises_yt_error("Expected \"slash\" in YPath but found \"literal\""):
+        if self.USE_SEQUOIA:
+            error_message = "Path \"/a\" does not start with a valid root-designator"
+        else:
+            error_message = "Expected \"slash\" in YPath but found \"literal\""
+        with raises_yt_error(error_message):
             set("/a", 20)
 
         # empty path
@@ -90,7 +94,7 @@ class TestCypress(YTEnvSetup):
 
         # empty token in path
         # TODO(h0pless): Maybe make sure the error doesn't change.
-        if self.USE_SEQUOIA:
+        if self.ENABLE_TMP_ROOTSTOCK:
             error_message = "Expected \"literal\" in YPath but found \"slash\" token \"/\""
         else:
             error_message = "Unexpected \"slash\" token \"/\" in YPath"
@@ -556,7 +560,7 @@ class TestCypress(YTEnvSetup):
 
     @authors("babenko", "ignat")
     def test_copy_simple6a(self):
-        error_message = "Scion cannot be cloned" if self.USE_SEQUOIA else "Cannot copy or move a node to itself"
+        error_message = "Scion cannot be cloned" if self.ENABLE_TMP_ROOTSTOCK else "Cannot copy or move a node to itself"
         with raises_yt_error(error_message):
             copy("//tmp", "//tmp/a")
 
@@ -577,7 +581,6 @@ class TestCypress(YTEnvSetup):
             copy("#" + tx, "//tmp/t")
 
     @authors("babenko", "ignat")
-    @not_implemented_in_sequoia
     def test_copy_simple8(self):
         create("map_node", "//tmp/a")
         create("table", "//tmp/a/t")
@@ -716,7 +719,7 @@ class TestCypress(YTEnvSetup):
 
     @authors("babenko", "ignat")
     def test_copy_unexisting_path(self):
-        if self.USE_SEQUOIA:
+        if self.ENABLE_TMP_ROOTSTOCK:
             error_message = "Scion cannot be cloned"
         else:
             error_message = "Node //tmp has no child with key \"x\""
@@ -1017,7 +1020,7 @@ class TestCypress(YTEnvSetup):
 
     @authors("babenko")
     def test_move_force4(self):
-        error_message = "//tmp is not a local object" if self.USE_SEQUOIA else "Node / cannot be replaced"
+        error_message = "//tmp is not a local object" if self.ENABLE_TMP_ROOTSTOCK else "Node / cannot be replaced"
         with raises_yt_error(error_message):
             copy("//tmp", "/", force=True)
 
@@ -1275,7 +1278,7 @@ class TestCypress(YTEnvSetup):
     @authors("babenko")
     def test_create_ignore_existing_fail(self):
         create("map_node", "//tmp/a/b", recursive=True)
-        existing_type = "sequoia_map_node" if self.USE_SEQUOIA else "map_node"
+        existing_type = "sequoia_map_node" if self.ENABLE_TMP_ROOTSTOCK else "map_node"
         with raises_yt_error(f"//tmp/a/b already exists and has type \"{existing_type}\" while node of \"table\" type is about to be created"):
             create("table", "//tmp/a/b", ignore_existing=True)
 
@@ -1338,8 +1341,7 @@ class TestCypress(YTEnvSetup):
             remove_user("u", sync=False)
         remove_user("u", force=True)
 
-    @authors("babenko", "s-v-m")
-    @not_implemented_in_sequoia
+    @authors("babenko", "s-v-m", "danilalexeev")
     def test_link1(self):
         set("//tmp/a", 1)
         link("//tmp/a", "//tmp/b")
@@ -1347,22 +1349,20 @@ class TestCypress(YTEnvSetup):
         remove("//tmp/a")
         assert get("//tmp/b&/@broken")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link2(self):
         set("//tmp/t1", 1)
         link("//tmp/t1", "//tmp/t2")
         assert get("//tmp/t2") == 1
-        assert get("//tmp/t2/@type") == "int64_node"
+        wait(lambda: get("//tmp/t2/@type") == "int64_node")
         assert get("//tmp/t1/@id") == get("//tmp/t2/@id")
-        assert get("//tmp/t2&/@type") == "link"
+        assert get("//tmp/t2&/@type") == "link" if not self.ENABLE_TMP_ROOTSTOCK else "sequoia_link"
         assert not get("//tmp/t2&/@broken")
 
         set("//tmp/t1", 2)
         assert get("//tmp/t2") == 2
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link3(self):
         set("//tmp/t1", 1)
         link("//tmp/t1", "//tmp/t2")
@@ -1386,16 +1386,14 @@ class TestCypress(YTEnvSetup):
         with pytest.raises(YtError):
             read_table("//tmp/t2")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link5(self):
         set("//tmp/t1", 1)
         set("//tmp/t2", 2)
         with pytest.raises(YtError):
             link("//tmp/t1", "//tmp/t2")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link6(self):
         create("table", "//tmp/a")
         link("//tmp/a", "//tmp/b")
@@ -1403,7 +1401,7 @@ class TestCypress(YTEnvSetup):
         assert exists("//tmp/a")
         assert exists("//tmp/b")
         assert exists("//tmp/b&")
-        assert exists("//tmp/b/@id")
+        wait(lambda: exists("//tmp/b/@id"))
         assert exists("//tmp/b/@row_count")
         assert exists("//tmp/b&/@target_path")
         assert not exists("//tmp/b/@x")
@@ -1446,18 +1444,16 @@ class TestCypress(YTEnvSetup):
         assert not get("//tmp/link1&/@broken")
         assert not get("//tmp/link2&/@broken")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_existing_fail(self):
         id1 = create("table", "//tmp/t1")
         create("table", "//tmp/t2")
         link("//tmp/t1", "//tmp/l")
-        assert get("//tmp/l/@id") == id1
+        wait(lambda: get("//tmp/l/@id") == id1)
         with pytest.raises(YtError):
             link("//tmp/t2", "//tmp/l")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_ignore_existing(self):
         id1 = create("table", "//tmp/t1")
         create("table", "//tmp/t2")
@@ -1465,47 +1461,42 @@ class TestCypress(YTEnvSetup):
         link("//tmp/t2", "//tmp/l", ignore_existing=True)
         assert get("//tmp/l/@id") == id1
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_force1(self):
         id1 = create("table", "//tmp/t1")
         id2 = create("table", "//tmp/t2")
         link("//tmp/t1", "//tmp/l")
         link("//tmp/t2", "//tmp/l", force=True)
         assert get("//tmp/t1/@id") == id1
-        assert get("//tmp/l/@id") == id2
+        wait(lambda: get("//tmp/l/@id") == id2)
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_force2(self):
         create("table", "//tmp/t1")
         id2 = create("table", "//tmp/t2")
         link("//tmp/t1", "//tmp/l")
         remove("//tmp/t1")
-        assert get("//tmp/l&/@broken")
+        wait(lambda: get("//tmp/l&/@broken"))
         link("//tmp/t2", "//tmp/l", force=True)
-        assert get("//tmp/l/@id") == id2
+        wait(lambda: get("//tmp/l/@id") == id2, ignore_exceptions=True)
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_ignore_existing_force_fail(self):
         create("table", "//tmp/t")
         with pytest.raises(YtError):
             link("//tmp/t", "//tmp/l", ignore_existing=True, force=True)
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_to_link(self):
         id = create("table", "//tmp/t")
         link("//tmp/t", "//tmp/l1")
         link("//tmp/l1", "//tmp/l2")
-        assert get("//tmp/l2/@id") == id
+        wait(lambda: get("//tmp/l2/@id") == id)
         assert not get("//tmp/l2&/@broken")
         remove("//tmp/l1")
         assert get("//tmp/l2&/@broken")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_as_copy_target_fail(self):
         create("table", "//tmp/t1")
         create("table", "//tmp/t2")
@@ -1513,18 +1504,16 @@ class TestCypress(YTEnvSetup):
         with pytest.raises(YtError):
             copy("//tmp/t2", "//tmp/l")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_as_copy_target_success(self):
         id1 = create("table", "//tmp/t1")
         create("table", "//tmp/t2")
         link("//tmp/t1", "//tmp/l")
         copy("//tmp/t2", "//tmp/l", force=True)
-        assert get("//tmp/l/@type") == "table"
+        wait(lambda: get("//tmp/l/@type") == "table")
         assert get("//tmp/t1/@id") == id1
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_as_move_target_fail(self):
         create("table", "//tmp/t1")
         create("table", "//tmp/t2")
@@ -1532,19 +1521,17 @@ class TestCypress(YTEnvSetup):
         with pytest.raises(YtError):
             move("//tmp/t2", "//tmp/l")
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_link_as_move_target_success(self):
         id1 = create("table", "//tmp/t1")
         create("table", "//tmp/t2")
         link("//tmp/t1", "//tmp/l")
         move("//tmp/t2", "//tmp/l", force=True)
-        assert get("//tmp/l/@type") == "table"
+        wait(lambda: get("//tmp/l/@type") == "table")
         assert not exists("//tmp/t2")
         assert get("//tmp/t1/@id") == id1
 
-    @authors("h0pless")
-    @not_implemented_in_sequoia
+    @authors("h0pless", "danilalexeev")
     def test_cyclic_link(self):
         create("map_node", "//tmp/a/b/c", recursive=True)
         link("//tmp/a/b/c", "//tmp/a/l1")
@@ -1564,8 +1551,7 @@ class TestCypress(YTEnvSetup):
             create("link", "//tmp/a/b/c/d/e", attributes={"target_path": "//tmp/a/b/c/d/e"}, recursive=True, force=True)
 
     # Test for YTADMINREQ-29192 issue.
-    @authors("h0pless")
-    @not_implemented_in_sequoia
+    @authors("h0pless", "danilalexeev")
     def test_non_cyclic_link_to_link(self):
         create("table", "//tmp/t1")
         link("//tmp/t1", "//tmp/l1")
@@ -1589,16 +1575,16 @@ class TestCypress(YTEnvSetup):
         assert not exists("//tmp/b/x")
         assert get("//tmp/b/y") == 1
 
-    @authors("babenko")
-    @not_implemented_in_sequoia
+    @authors("babenko", "danilalexeev")
     def test_resolve_suppress_via_object_id_yt_6694(self):
         create("map_node", "//tmp/a")
         link("//tmp/a", "//tmp/b")
         id = get("//tmp/b&/@id")
-        assert get("//tmp/b/@type") == "map_node"
-        assert get("//tmp/b&/@type") == "link"
+        wait(lambda: get("//tmp/b/@type") == "map_node")
+        expected_type = "link" if not self.ENABLE_TMP_ROOTSTOCK else "sequoia_link"
+        assert get("//tmp/b&/@type") == expected_type
         assert get("#{0}/@type".format(id)) == "map_node"
-        assert get("#{0}&/@type".format(id)) == "link"
+        assert get("#{0}&/@type".format(id)) == expected_type
 
     @authors("kiselyovp")
     def test_escaped_symbols(self):
@@ -3803,6 +3789,9 @@ class TestCypress(YTEnvSetup):
             set("//tmp/t1/@compression_codec", "gzip_normal")
         remove("//tmp/t1")
 
+        with pytest.raises(YtError):
+            create("table", "//tmp/t1", attributes={"compression_codec": "gzip_normal"})
+
         set("//sys/@config/chunk_manager/deprecated_codec_ids", [])
         create("table", "//tmp/t1")
         remove("//tmp/t1")
@@ -3814,6 +3803,39 @@ class TestCypress(YTEnvSetup):
         create("table", "//tmp/t1")
         set("//tmp/t1/@compression_codec", "gzip_normal")
         remove("//tmp/t1")
+
+    @authors("abogutskiy")
+    @not_implemented_in_sequoia
+    def test_forbidden_erasure_codecs(self):
+        create("map_node", "//tmp/ec1", attributes={"erasure_codec": "reed_solomon_6_3"})
+
+        set("//sys/@config/chunk_manager/forbidden_erasure_codecs", [1])  # forbid reed_solomon_6_3
+        create("table", "//tmp/t1")
+        with pytest.raises(YtError):
+            set("//tmp/t1/@erasure_codec", "reed_solomon_6_3")
+        set("//tmp/t1/@erasure_codec", "reed_solomon_3_3")
+        remove("//tmp/t1")
+
+        with pytest.raises(YtError):
+            create("table", "//tmp/t1", attributes={"erasure_codec": "reed_solomon_6_3"})
+
+        with pytest.raises(YtError):
+            create("map_node", "//tmp/ec2", attributes={"erasure_codec": "reed_solomon_6_3"})
+
+        create("table", "//tmp/t1", attributes={"erasure_codec": "reed_solomon_3_3"})
+        remove("//tmp/t1")
+
+        set("//sys/@config/chunk_manager/forbidden_erasure_codecs", [])
+        create("table", "//tmp/t1", attributes={"erasure_codec": "reed_solomon_6_3"})
+        remove("//tmp/t1")
+
+        create("table", "//tmp/ec1/t1")
+        remove("//tmp/ec1/t1")
+
+        create("table", "//tmp/t1")
+        set("//tmp/t1/@erasure_codec", "reed_solomon_6_3")
+        remove("//tmp/t1")
+        remove("//tmp/ec1")
 
     @authors("cookiedoth")
     @pytest.mark.parametrize(
@@ -4175,6 +4197,24 @@ class TestCypressShardedTxCTxS(TestCypressShardedTx):
     }
 
 
+class TestCypressMirroredTx(TestCypressShardedTxCTxS):
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+    NUM_CYPRESS_PROXIES = 1
+    NUM_TEST_PARTITIONS = 6
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    DELTA_DYNAMIC_MASTER_CONFIG = {
+        "transaction_manager": {
+            "forbid_transaction_actions_for_cypress_transactions": True,
+        }
+    }
+
+
 class TestCypressNoLocalReadExecutor(TestCypress):
     def setup_method(self, method):
         super(TestCypressNoLocalReadExecutor, self).setup_method(method)
@@ -4208,9 +4248,33 @@ class TestCypressLeaderSwitch(YTEnvSetup):
         old_leader_rpc_address = get_active_primary_master_leader_address(self)
         new_leader_rpc_address = get_active_primary_master_follower_address(self)
         cell_id = get("//sys/@cell_id")
-        switch_leader(cell_id, new_leader_rpc_address)
-        wait(lambda: is_active_primary_master_leader(new_leader_rpc_address))
-        wait(lambda: is_active_primary_master_follower(old_leader_rpc_address))
+        self._do_switch_leader(cell_id, old_leader_rpc_address, new_leader_rpc_address)
+
+    def _switch_leader_back_and_forth(self):
+        old_leader_rpc_address = get_active_primary_master_leader_address(self)
+        new_leader_rpc_address = get_active_primary_master_follower_address(self)
+        cell_id = get("//sys/@cell_id")
+        self._do_switch_leader(cell_id, old_leader_rpc_address, new_leader_rpc_address)
+        self._do_switch_leader(cell_id, new_leader_rpc_address, old_leader_rpc_address)
+
+    def _do_switch_leader(self, cell_id, old_leader_address, new_leader_address):
+        # Currently, there's no way to force balancing channel and/or peer discovery
+        # to refresh peers. Thus, attempting to switch leader again immediately after
+        # having switched it once will result in a transient error.
+        def switch_leader_with_retries():
+            try:
+                switch_leader(cell_id, new_leader_address)
+            except YtError as error:
+                if error.contains_text("Peer is not leading"):
+                    return False
+                else:
+                    raise
+            return True
+
+        wait(lambda: switch_leader_with_retries())
+
+        wait(lambda: is_active_primary_master_leader(new_leader_address))
+        wait(lambda: is_active_primary_master_follower(old_leader_address))
 
     @authors("shakurov")
     @flaky(max_runs=3)
@@ -4221,6 +4285,42 @@ class TestCypressLeaderSwitch(YTEnvSetup):
 
         time.sleep(2.0)
         assert not exists("//tmp/t")
+
+    @authors("shakurov")
+    @flaky(max_runs=3)
+    def test_expiration_time_and_timeout_leader_switch(self):
+        set("//sys/@config/object_manager/enable_gc", False)
+        expiration_time = str(get_current_time() + timedelta(milliseconds=5000))
+        # The disappearance of this node is used as an indicator of the expiration time having been reached.
+        create(
+            "table",
+            "//tmp/t0",
+            attributes={
+                "expiration_time": expiration_time,
+            },
+        )
+        create(
+            "table",
+            "//tmp/t1",
+            attributes={
+                "expiration_timeout": 400,
+                "expiration_time": expiration_time,
+            },
+        )
+        time.sleep(0.6)
+        # By now, the node should've been zombified (but not destroyed).
+        assert not exists("//tmp/t1")
+
+        self._switch_leader_back_and_forth()
+        set("//sys/@config/object_manager/enable_gc", True)
+
+        # Wait for the node to be destroyed.
+        gc_collect()
+
+        # More importantly, master should not crash when the expiration *time* is reached.
+        wait(lambda: not exists("//tmp/t0"))
+
+        time.sleep(1.0)
 
 
 ##################################################################

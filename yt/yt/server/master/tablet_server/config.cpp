@@ -124,6 +124,10 @@ void TDynamicCellHydraPersistenceSynchronizerConfig::Register(TRegistrar registr
     registrar.Parameter("max_cell_acl_updates_per_iteration", &TThis::MaxCellAclUpdatesPerIteration)
         .GreaterThanOrEqual(0)
         .Default(20);
+    registrar.Parameter("list_alive_cells_request_size_limit", &TThis::ListAliveCellsRequestSizeLimit)
+        .GreaterThanOrEqual(0)
+        .Default(50000)
+        .DontSerializeDefault();
     registrar.Parameter("hydra_persistence_file_id_update_period", &TThis::HydraPersistenceFileIdUpdatePeriod)
         .Default(TDuration::Seconds(1));
     registrar.Parameter("max_hydra_persistence_file_id_updates_per_iteration", &TThis::MaxHydraPersistenceFileIdUpdatesPerIteration)
@@ -239,7 +243,7 @@ void TDynamicTabletManagerConfig::Register(TRegistrar registrar)
         .DontSerializeDefault();
 
     registrar.Parameter("max_table_collocation_size", &TThis::MaxTableCollocationSize)
-        .Default(200);
+        .Default(500);
 
     registrar.Parameter("add_perf_counters_to_tablets_attribute", &TThis::AddPerfCountersToTabletsAttribute)
         .Default(true);

@@ -14,10 +14,12 @@ from yt_helpers import profiler_factory
 import pytest
 
 import os
+import re
 import sys
 import time
 import tempfile
 
+from builtins import set as Set
 from collections import Counter
 
 
@@ -69,22 +71,45 @@ class TestLayers(TestLayersBase):
 
     @authors("ilpauzner")
     def test_disabled_layer_locations(self):
+        for node in self.Env.configs["node"]:
+            for layer_location in node["data_node"]["volume_manager"]["layer_locations"]:
+                try:
+                    disabled_path = layer_location["path"]
+                    os.mkdir(layer_location["path"])
+                except OSError:
+                    pass
+                with open(layer_location["path"] + "/disabled", "w"):
+                    pass
+
         with Restarter(self.Env, NODES_SERVICE):
-            disabled_path = None
-            for node in self.Env.configs["node"][:1]:
-                for layer_location in node["data_node"]["volume_manager"]["layer_locations"]:
-                    try:
-                        disabled_path = layer_location["path"]
-                        os.mkdir(layer_location["path"])
-                    except OSError:
-                        pass
-                    with open(layer_location["path"] + "/disabled", "w"):
-                        pass
+            pass
 
         wait_for_nodes()
 
+        nodes = ls("//sys/cluster_nodes")
+
+        def check_layer_cache_disable():
+            for node in nodes:
+                alerts = get("//sys/cluster_nodes/{}/@alerts".format(node))
+                return any([alert["message"] == "Layer cache is disabled" for alert in alerts]) and \
+                    any([alert["message"] == "Layer location disabled" for alert in alerts])
+
+        wait(lambda: check_layer_cache_disable())
+
+        for node in nodes:
+            wait(lambda: get("//sys/cluster_nodes/{0}/@resource_limits/user_slots".format(node)) == 0)
+
+        for node in self.Env.configs["node"]:
+            for layer_location in node["data_node"]["volume_manager"]["layer_locations"]:
+                try:
+                    disabled_path = layer_location["path"]
+                    os.unlink(disabled_path + "/disabled")
+                except OSError:
+                    pass
+
         with Restarter(self.Env, NODES_SERVICE):
-            os.unlink(disabled_path + "/disabled")
+            pass
+
         wait_for_nodes()
 
         time.sleep(5)
@@ -652,6 +677,66 @@ class TestCriDockerImage(TestLayersBase):
         with raises_yt_error('Porto layers are not supported in CRI job environment'):
             self.run_map(layer_paths=["//tmp/empty_layer"])
 
+    @authors("khlebnikov")
+    @pytest.mark.timeout(180)
+    def test_environment_variables(self):
+        self.create_tables()
+        map(
+            in_=self.INPUT_TABLE,
+            out=self.OUTPUT_TABLE,
+            spec={
+                "mapper": {
+                    "command": 'printenv | sed -E \'s#"#\\\\"#g;s#([^=]*)=(.*)#{name="\\1"; value="\\2";};#\'',
+                    "environment": {
+                        "MY_VARIABLE_A": "MY_VALUE_A",
+                        "MY_VARIABLE_B": "MY_VALUE_B",
+                    },
+                },
+                "secure_vault": {
+                    "MY_SECRET_A": "SECRET_VALUE_A",
+                    "MY_SECRET_B": "SECRET_VALUE_B",
+                },
+                "max_failed_job_count": 1,
+            },
+        )
+        output = read_table(self.OUTPUT_TABLE)
+        env = {row["name"]: row["value"] for row in output}
+        assert len(output) == len(env)
+
+        guid_regex = r'^[0-9a-fA-F]{1,8}-[0-9a-fA-F]{1,8}-[0-9a-fA-F]{1,8}-[0-9a-fA-F]{1,8}$'
+        is_guid = lambda x: re.match(guid_regex, x) is not None  # noqa
+        expected = {
+            # set by job environment
+            "USER": lambda x: re.match(r'^[a-z][-a-z0-9]*$', x) is not None,
+            "LOGNAME": lambda x: x == env["USER"],
+            # set by ytserver-exec
+            "SHELL": lambda x: x == "/bin/bash",
+            # set by docker image
+            "PATH": lambda x: Set(x.split(':')).issuperset({"/bin", "/usr/bin", "/usr/local/bin"}),
+            # set by default docker image
+            "PYTHON_VERSION": lambda x: x,
+            # set by bash
+            "PWD": lambda x: x == env["HOME"],
+            # set by controller agent to $(SandboxPath) and expanded by job proxy
+            "HOME": lambda x: x[0] == "/",
+            "TMPDIR": lambda x: x == env["HOME"],
+            # set by controller agent
+            "YT_OPERATION_ID": is_guid,
+            "YT_JOB_ID": is_guid,
+            "YT_JOB_INDEX": lambda x: x == "0",
+            "YT_TASK_JOB_INDEX": lambda x: x == "0",
+            "YT_JOB_COOKIE": lambda x: x == "0",
+            # set by operation spec
+            "MY_VARIABLE_A": lambda x: x == "MY_VALUE_A",
+            "MY_VARIABLE_B": lambda x: x == "MY_VALUE_B",
+            "YT_SECURE_VAULT_MY_SECRET_A": lambda x: x == "SECRET_VALUE_A",
+            "YT_SECURE_VAULT_MY_SECRET_B": lambda x: x == "SECRET_VALUE_B",
+            "YT_SECURE_VAULT": lambda x: x == '{"MY_SECRET_A"="SECRET_VALUE_A";"MY_SECRET_B"="SECRET_VALUE_B";}',
+        }
+        for name, test in expected.items():
+            assert name in env
+            assert test(env[name]), "Failed test for {}={}".format(name, env[name])
+
 
 @authors("psushin")
 class TestTmpfsLayerCache(YTEnvSetup):
@@ -750,15 +835,124 @@ class TestTmpfsLayerCache(YTEnvSetup):
         assert b"static-bin" in op.read_stderr(job_id)
 
         job = get_job(op.id, job_id)
+
         regular_cache_hits = profiler_factory().at_node(job["address"]).get("exec_node/layer_cache/tmpfs_cache_hits", {"cache_name": "regular"})
         nirvana_cache_hits = profiler_factory().at_node(job["address"]).get("exec_node/layer_cache/tmpfs_cache_hits", {"cache_name": "nirvana"})
-
         assert regular_cache_hits > 0 or nirvana_cache_hits > 0
+
+        regular_tmpfs_layer_hits = profiler_factory().at_node(job["address"]).get("exec_node/layer_cache/tmpfs_layer_hits", {"cache_name": "regular", "cypress_path": "//tmp/layer1"})
+        nirvanta_tmpfs_layer_hits = profiler_factory().at_node(job["address"]).get("exec_node/layer_cache/tmpfs_layer_hits", {"cache_name": "nirvana", "cypress_path": "//tmp/layer1"})
+        assert regular_tmpfs_layer_hits > 0 or nirvanta_tmpfs_layer_hits > 0
 
         remove("//tmp/cached_layers/layer1")
         for node in ls("//sys/cluster_nodes"):
             wait(lambda: get("//sys/cluster_nodes/{0}/{1}/regular_tmpfs_cache/layer_count".format(node, orchid_path)) == 0)
             wait(lambda: get("//sys/cluster_nodes/{0}/{1}/nirvana_tmpfs_cache/layer_count".format(node, orchid_path)) == 0)
+
+
+@authors("yuryalekseev")
+class TestTmpfsLayers(YTEnvSetup):
+    NUM_SCHEDULERS = 1
+    NUM_NODES = 1
+    DELTA_NODE_CONFIG = {
+        "exec_node": {
+            "job_proxy": {
+                "test_root_fs": True,
+            },
+            "slot_manager": {
+                "job_environment": {
+                    "type": "porto",
+                },
+            },
+        },
+        "data_node": {
+            "volume_manager": {
+                "regular_tmpfs_layer_cache": {
+                    "capacity": 10 * 1024 * 1024,
+                    "layers_update_period": 100,
+                },
+                "nirvana_tmpfs_layer_cache": {
+                    "capacity": 10 * 1024 * 1024,
+                    "layers_update_period": 100,
+                }
+            }
+        },
+    }
+
+    USE_PORTO = True
+
+    def setup_files(self):
+        create("file", "//tmp/upper_layer", attributes={"replication_factor": 1})
+        file_name = "layers/upper.tgz"
+        write_file("//tmp/upper_layer", open(file_name, "rb").read())
+
+        create("file", "//tmp/lower_layer", attributes={"replication_factor": 1})
+        file_name = "layers/lower.tgz"
+        write_file("//tmp/lower_layer", open(file_name, "rb").read())
+
+        create("file", "//tmp/static_cat", attributes={"replication_factor": 1})
+        file_name = "layers/static_cat"
+        write_file("//tmp/static_cat", open(file_name, "rb").read())
+
+        set("//tmp/static_cat/@executable", True)
+
+    def test_trusted_overlay_opaque_extended_attributes(self):
+        self.setup_files()
+
+        orchid_path = "orchid/exec_node/slot_manager/root_volume_manager"
+
+        for node in ls("//sys/cluster_nodes"):
+            assert get("//sys/cluster_nodes/{0}/{1}/regular_tmpfs_cache/layer_count".format(node, orchid_path)) == 0
+            assert get("//sys/cluster_nodes/{0}/{1}/nirvana_tmpfs_cache/layer_count".format(node, orchid_path)) == 0
+
+        create("map_node", "//tmp/cached_layers")
+        link("//tmp/upper_layer", "//tmp/cached_layers/upper_layer")
+
+        with Restarter(self.Env, NODES_SERVICE):
+            # First we create cypress map node for cached layers,
+            # and then add it to node config with node restart.
+            # Otherwise environment starter will consider node as dead, since
+            # it will not be able to initialize tmpfs layer cache and will
+            # report zero user job slots.
+            for i, config in enumerate(self.Env.configs["node"]):
+                config["data_node"]["volume_manager"]["regular_tmpfs_layer_cache"]["layers_directory_path"] = "//tmp/cached_layers"
+                config["data_node"]["volume_manager"]["nirvana_tmpfs_layer_cache"]["layers_directory_path"] = "//tmp/cached_layers"
+                config_path = self.Env.config_paths["node"][i]
+                with open(config_path, "wb") as fout:
+                    yson.dump(config, fout)
+
+        wait_for_nodes()
+        for node in ls("//sys/cluster_nodes"):
+            # After node restart we must wait for async root volume manager initialization.
+            wait(lambda: exists("//sys/cluster_nodes/{0}/{1}".format(node, orchid_path)))
+            wait(lambda: get("//sys/cluster_nodes/{0}/{1}/regular_tmpfs_cache/layer_count".format(node, orchid_path)) == 1)
+            wait(lambda: get("//sys/cluster_nodes/{0}/{1}/nirvana_tmpfs_cache/layer_count".format(node, orchid_path)) == 1)
+
+        create("table", "//tmp/t_in", attributes={"replication_factor": 1})
+        create("table", "//tmp/t_out", attributes={"replication_factor": 1})
+
+        write_table("//tmp/t_in", [{"k": 0, "u": 1, "v": 2}])
+        op = map(
+            in_="//tmp/t_in",
+            out="//tmp/t_out",
+            command="./static_cat; ls $YT_ROOT_FS/dir 1>&2",
+            file="//tmp/static_cat",
+            spec={
+                "max_failed_job_count": 1,
+                "mapper": {
+                    "layer_paths": ["//tmp/upper_layer", "//tmp/lower_layer"],
+                },
+            },
+        )
+
+        job_ids = op.list_jobs()
+        assert len(job_ids) == 1
+        job_id = job_ids[0]
+        job_stderr = op.read_stderr(job_id)
+        # The trusted.overlay.opaque xattr is set on dir so ls should see upper file
+        # from the upper layer and should not see lower file from the lower layer.
+        assert b"upper" in job_stderr
+        assert b"lower" not in job_stderr
 
 
 @authors("ignat")
@@ -945,6 +1139,38 @@ class TestLocalSquashFSLayers(YTEnvSetup):
         set("//tmp/squashfs.img/@access_method", "local")
         set("//tmp/squashfs.img/@filesystem", "squashfs")
 
+        create("file", "//tmp/empty_squashfs.img")
+        set("//tmp/squashfs.img/@access_method", "local")
+        set("//tmp/squashfs.img/@filesystem", "squashfs")
+
+    @authors("yuryalekseev")
+    def test_empty_squashfs_layer(self):
+        self.setup_files()
+
+        create("table", "//tmp/t_in")
+        create("table", "//tmp/t_out")
+
+        write_table("//tmp/t_in", [{"k": 0, "u": 1, "v": 2}])
+
+        with pytest.raises(YtError) as err:
+            map(
+                in_="//tmp/t_in",
+                out="//tmp/t_out",
+                command="ls $YT_ROOT_FS/dir 1>&2",
+                spec={
+                    "max_failed_job_count": 1,
+                    "mapper": {
+                        "layer_paths": ["//tmp/empty_squashfs.img"],
+                    },
+                },
+            )
+
+        assert "empty" in str(err)
+
+        # YT-14186: Empty user layer should not disable jobs on node.
+        for node in ls("//sys/cluster_nodes"):
+            assert len(get("//sys/cluster_nodes/{}/@alerts".format(node))) == 0
+
     @authors("yuryalekseev")
     def test_squashfs_layer(self):
         self.setup_files()
@@ -1052,7 +1278,7 @@ class TestNbdSquashFSLayers(YTEnvSetup):
     NUM_SCHEDULERS = 1
     NUM_NODES = 1
 
-    DELTA_MASTER_CONFIG = {
+    DELTA_DYNAMIC_MASTER_CONFIG = {
         "cypress_manager": {
             "default_table_replication_factor": 1,
             "default_file_replication_factor": 1,
@@ -1241,7 +1467,7 @@ class TestNbdConnectionFailuresWithSquashFSLayers(YTEnvSetup):
     NUM_SCHEDULERS = 1
     NUM_NODES = 1
 
-    DELTA_MASTER_CONFIG = {
+    DELTA_DYNAMIC_MASTER_CONFIG = {
         "cypress_manager": {
             "default_table_replication_factor": 1,
             "default_file_replication_factor": 1,
@@ -1453,7 +1679,7 @@ class TestFailOperationAfterSuccessiveJobAbortsOnPrepareVolume(YTEnvSetup):
     NUM_SCHEDULERS = 1
     NUM_NODES = 1
 
-    DELTA_MASTER_CONFIG = {
+    DELTA_DYNAMIC_MASTER_CONFIG = {
         "cypress_manager": {
             "default_table_replication_factor": NUM_NODES,
             "default_file_replication_factor": NUM_NODES,
@@ -1469,6 +1695,14 @@ class TestFailOperationAfterSuccessiveJobAbortsOnPrepareVolume(YTEnvSetup):
                 "job_environment": {
                     "type": "porto",
                 },
+            },
+        }
+    }
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "controller_agent": {
+            "max_job_aborts_until_operation_failure": {
+                "root_volume_preparation_failed": 2,
             },
         }
     }
@@ -1505,6 +1739,8 @@ class TestFailOperationAfterSuccessiveJobAbortsOnPrepareVolume(YTEnvSetup):
                     },
                 },
                 "volume_manager": {
+                    "abort_on_operation_with_volume_failed": True,
+                    "abort_on_operation_with_layer_failed": True,
                     "throw_on_prepare_volume": True,
                 },
             },

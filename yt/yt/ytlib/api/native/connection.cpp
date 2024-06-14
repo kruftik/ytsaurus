@@ -39,6 +39,7 @@
 
 #include <yt/yt/library/query/engine_api/column_evaluator.h>
 #include <yt/yt/library/query/engine_api/evaluator.h>
+#include <yt/yt/library/query/engine_api/expression_evaluator.h>
 
 #include <yt/yt/ytlib/query_client/functions_cache.h>
 
@@ -51,6 +52,7 @@
 
 #include <yt/yt/ytlib/discovery_client/discovery_client.h>
 #include <yt/yt/ytlib/discovery_client/member_client.h>
+#include <yt/yt/ytlib/discovery_client/request_session.h>
 
 #include <yt/yt/ytlib/node_tracker_client/channel.h>
 #include <yt/yt/ytlib/node_tracker_client/node_addresses_provider.h>
@@ -79,6 +81,8 @@
 #include <yt/yt/client/api/sticky_transaction_pool.h>
 
 #include <yt/yt/client/object_client/helpers.h>
+
+#include <yt/yt/client/sequoia_client/public.h>
 
 #include <yt/yt/client/transaction_client/config.h>
 #include <yt/yt/client/transaction_client/noop_timestamp_provider.h>
@@ -118,6 +122,7 @@ using namespace NNodeTrackerClient;
 using namespace NObjectClient;
 using namespace NProfiling;
 using namespace NQueryClient;
+using namespace NQueryTrackerClient;
 using namespace NQueueClient;
 using namespace NScheduler;
 using namespace NSecurityClient;
@@ -166,7 +171,7 @@ public:
             TGuid::Create(),
             StaticConfig_->ConnectionName))
         , ClusterId_(MakeConnectionClusterId(StaticConfig_))
-        , Logger(ApiLogger.WithRawTag(LoggingTag_))
+        , Logger(ApiLogger().WithRawTag(LoggingTag_))
         , Profiler_(TProfiler("/connection").WithTag("connection_name", StaticConfig_->ConnectionName))
         , TabletSyncReplicaCache_(New<TTabletSyncReplicaCache>())
         , BannedReplicaTrackerCache_(CreateBannedReplicaTrackerCache(StaticConfig_->BannedReplicaTrackerCache, Logger))
@@ -177,6 +182,10 @@ public:
         , ColumnEvaluatorCache_(BIND([this] {
             auto config = Config_.Acquire();
             return CreateColumnEvaluatorCache(config->ColumnEvaluatorCache);
+        }))
+        , ExpressionEvaluatorCache_(BIND([this] {
+            auto config = Config_.Acquire();
+            return CreateExpressionEvaluatorCache(config->ExpressionEvaluatorCache);
         }))
         , MemoryTracker_(std::move(memoryTracker))
         , ClusterDirectoryOverride_(std::move(clusterDirectoryOverride))
@@ -311,8 +320,7 @@ public:
             BlockCache_ = CreateClientBlockCache(
                 config->BlockCache,
                 EBlockType::CompressedData | EBlockType::UncompressedData,
-                /*memoryTracker*/ nullptr,
-                /*blockTracker*/ nullptr,
+                GetNullMemoryUsageTracker(),
                 Profiler_.WithPrefix("/block_cache"));
         }
 
@@ -321,6 +329,7 @@ public:
         } else if (config->ChunkMetaCache) {
             ChunkMetaCache_ = CreateClientChunkMetaCache(
                 config->ChunkMetaCache,
+                GetNullMemoryUsageTracker(),
                 Profiler_.WithPrefix("/chunk_meta_cache"));
         } else {
             ChunkMetaCache_ = nullptr;
@@ -350,7 +359,15 @@ public:
             MakeStrong(this),
             NodeDirectory_);
 
-        ChunkReplicaCache_ = CreateChunkReplicaCache(this);
+        ChunkReplicaCache_ = CreateChunkReplicaCache(
+            this,
+            Profiler_.WithPrefix("/chunk_replica_cache"));
+
+        if (config->DiscoveryConnection) {
+            DiscoveryServerAddressPool_ = New<TServerAddressPool>(
+                Logger,
+                config->DiscoveryConnection);
+        }
 
         SetupTvmIdSynchronization();
     }
@@ -556,7 +573,7 @@ public:
         return WrapChaosChannel(ReplicationCardChannelFactory_->CreateChannel(replicationCardId, peerKind));
     }
 
-    IChannelPtr GetQueueAgentChannelOrNull(TStringBuf stage) const override
+    IChannelPtr FindQueueAgentChannel(TStringBuf stage) const override
     {
         auto it = QueueAgentChannels_.find(stage);
         if (it == QueueAgentChannels_.end()) {
@@ -612,6 +629,11 @@ public:
     const IColumnEvaluatorCachePtr& GetColumnEvaluatorCache() override
     {
         return ColumnEvaluatorCache_.Value();
+    }
+
+    const IExpressionEvaluatorCachePtr& GetExpressionEvaluatorCache() override
+    {
+        return ExpressionEvaluatorCache_.Value();
     }
 
     const NCellMasterClient::ICellDirectoryPtr& GetMasterCellDirectory() override
@@ -699,6 +721,17 @@ public:
             this,
             cellId,
             options);
+    }
+
+    std::vector<TString> GetDiscoveryServerAddresses() const override
+    {
+        if (!DiscoveryServerAddressPool_) {
+            THROW_ERROR_EXCEPTION("Missing discovery server address pool");
+        }
+        if (!DiscoveryServerAddressPool_->GetReadyEvent().IsSet()) {
+            THROW_ERROR_EXCEPTION("Discovery server address pool is not ready");
+        }
+        return DiscoveryServerAddressPool_->GetProbationAddresses();
     }
 
     NDiscoveryClient::IDiscoveryClientPtr CreateDiscoveryClient(
@@ -811,6 +844,7 @@ public:
         SyncReplicaCache_->Reconfigure(StaticConfig_->SyncReplicaCache->ApplyDynamic(dynamicConfig->SyncReplicaCache));
         TableMountCache_->Reconfigure(StaticConfig_->TableMountCache->ApplyDynamic(dynamicConfig->TableMountCache));
         ClockManager_->Reconfigure(StaticConfig_->ClockManager->ApplyDynamic(dynamicConfig->ClockManager));
+        ChunkReplicaCache_->Reconfigure(dynamicConfig->ChunkReplicaCache);
 
         Config_.Store(dynamicConfig);
     }
@@ -841,6 +875,7 @@ private:
 
     const TLazyIntrusivePtr<IEvaluator> QueryEvaluator_;
     const TLazyIntrusivePtr<IColumnEvaluatorCache> ColumnEvaluatorCache_;
+    const TLazyIntrusivePtr<IExpressionEvaluatorCache> ExpressionEvaluatorCache_;
 
     // NB: There're also CellDirectory_ and CellDirectorySynchronizer_, which are completely different from these.
     NCellMasterClient::ICellDirectoryPtr MasterCellDirectory_;
@@ -890,6 +925,8 @@ private:
 
     IReplicationCardChannelFactoryPtr ReplicationCardChannelFactory_;
     IChaosCellChannelFactoryPtr ChaosCellChannelFactory_;
+
+    TServerAddressPoolPtr DiscoveryServerAddressPool_;
 
     std::atomic<bool> Terminated_ = false;
 
@@ -978,7 +1015,16 @@ private:
             ChannelFactory_,
             std::move(endpointDescription),
             std::move(endpointAttributes));
-        channel = CreateRetryingChannel(config, std::move(channel));
+        channel = CreateRetryingChannel(
+            config,
+            std::move(channel),
+            BIND([] (const TError& error) {
+                if (error.GetCode() == NSequoiaClient::EErrorCode::SequoiaRetriableError) {
+                    return true;
+                }
+
+                return NRpc::IsRetriableError(error);
+            }));
         channel = CreateDefaultTimeoutChannel(std::move(channel), config->RpcTimeout);
         CypressProxyChannel_ = std::move(channel);
     }
@@ -1025,6 +1071,27 @@ private:
             std::move(endpointAttributes));
     }
 
+    IChannelPtr CreateQueryTrackerChannel(TQueryTrackerChannelConfigPtr config) const
+    {
+        if (!config) {
+            THROW_ERROR_EXCEPTION("Missing \"channel\" parameter in query tracker connection configuration");
+        }
+
+        auto endpointDescription = "QueryTracker";
+        auto endpointAttributes = ConvertToAttributes(BuildYsonStringFluently()
+            .BeginMap()
+                .Item("query_tracker").Value(true)
+            .EndMap());
+
+        auto channel = CreateBalancingChannel(
+            config,
+            ChannelFactory_,
+            std::move(endpointDescription),
+            std::move(endpointAttributes));
+
+        return CreateDefaultTimeoutChannel(channel, config->Timeout);
+    }
+
     void SetupTvmIdSynchronization()
     {
         auto config = Config_.Acquire();
@@ -1040,7 +1107,7 @@ private:
         }
         ClusterDirectory_->SubscribeOnClusterUpdated(
             BIND_NO_PROPAGATE([tvmService] (const TString& name, INodePtr nativeConnectionConfig) {
-                static const auto& Logger = TvmSynchronizerLogger;
+                static constexpr auto& Logger = TvmSynchronizerLogger;
 
                 NNative::TConnectionDynamicConfigPtr config;
                 try {
@@ -1057,10 +1124,9 @@ private:
             }));
     }
 
-    //! Returns a pair consisting of the client for the Query Tracker cluster and the path to the Query Tracker root in Cypress.
-    std::pair<IClientPtr, TString> GetQueryTrackerStage(const TString& stage) override
+    std::pair<IClientPtr, TQueryTrackerStageConfigPtr> FindQueryTrackerStage(const TString& stage)
     {
-        auto findStage = [&stage, this] (const TString& cluster) -> std::pair<IClientPtr, TString> {
+        auto findStage = [&stage, this] (const TString& cluster) -> std::pair<IClientPtr, TQueryTrackerStageConfigPtr> {
             auto clusterConnection = FindRemoteConnection(MakeStrong(this), cluster);
             YT_VERIFY(clusterConnection);
 
@@ -1069,13 +1135,13 @@ private:
             if (auto iter = stages.find(stage); iter != stages.end()) {
                 const auto& stage = iter->second;
                 auto client = NNative::CreateClient(clusterConnection, TClientOptions::FromUser(stage->User));
-                return {client, stage->Root};
+                return {client, stage};
             }
 
-            return {nullptr, ""};
+            return {nullptr, nullptr};
         };
 
-        std::pair<IClientPtr, TString> resultStage;
+        std::pair<IClientPtr, TQueryTrackerStageConfigPtr> resultStage;
         TString resultCluster;
         for (const auto& cluster: GetClusterDirectory()->GetClusterNames()) {
             if (auto existingStage = findStage(cluster); existingStage.first) {
@@ -1086,11 +1152,23 @@ private:
                 resultCluster = cluster;
             }
         }
-        if (resultStage.first) {
-            return resultStage;
-        } else {
+
+        if (!resultStage.first) {
             THROW_ERROR_EXCEPTION("Query tracker stage %Qv is not found in cluster directory", stage);
         }
+        return resultStage;
+    }
+
+    //! Returns a pair consisting of the client for the Query Tracker cluster and the path to the Query Tracker root in Cypress.
+    std::pair<IClientPtr, TString> GetQueryTrackerStage(const TString& stage) override
+    {
+        auto resultStage = FindQueryTrackerStage(stage);
+        return {resultStage.first, resultStage.second->Root};
+    }
+
+    IChannelPtr GetQueryTrackerChannelOrThrow(const TString& stage) override
+    {
+        return CreateQueryTrackerChannel(FindQueryTrackerStage(stage).second->Channel);
     }
 
     IChannelPtr WrapChaosChannel(IChannelPtr channel)

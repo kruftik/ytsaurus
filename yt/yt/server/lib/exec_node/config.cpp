@@ -1,5 +1,7 @@
 #include "config.h"
 
+#include <yt/yt/library/tracing/jaeger/sampler.h>
+
 #include <yt/yt/core/misc/config.h>
 
 #include <yt/yt/core/ytree/convert.h>
@@ -82,9 +84,6 @@ void TPortoJobEnvironmentConfig::Register(TRegistrar registrar)
     registrar.Parameter("use_exec_from_layer", &TThis::UseExecFromLayer)
         .Default(false);
 
-    registrar.Parameter("allow_mount_fuse_device", &TThis::AllowMountFuseDevice)
-        .Default(true);
-
     registrar.Parameter("container_destruction_backoff", &TThis::ContainerDestructionBackoff)
         .Default(TDuration::Seconds(60));
 }
@@ -112,12 +111,16 @@ void TSlotLocationConfig::Register(TRegistrar registrar)
     registrar.Parameter("disk_quota", &TThis::DiskQuota)
         .Default()
         .GreaterThan(0);
+
     registrar.Parameter("disk_usage_watermark", &TThis::DiskUsageWatermark)
         .Default(10_GB)
         .GreaterThanOrEqual(0);
 
     registrar.Parameter("medium_name", &TThis::MediumName)
         .Default(NChunkClient::DefaultSlotsMediumName);
+
+    registrar.Parameter("enable_disk_quota", &TThis::EnableDiskQuota)
+        .Default(true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -212,7 +215,7 @@ void TSlotManagerDynamicConfig::Register(TRegistrar registrar)
         .Default(false);
 
     registrar.Parameter("enable_job_environment_resurrection", &TThis::EnableJobEnvironmentResurrection)
-        .Default(false);
+        .Default(true);
 
     registrar.Parameter("max_consecutive_gpu_job_failures", &TThis::MaxConsecutiveGpuJobFailures)
         .Default(50);
@@ -231,13 +234,19 @@ void TSlotManagerDynamicConfig::Register(TRegistrar registrar)
         .Default(TDuration::Minutes(20));
 
     registrar.Parameter("abort_on_free_volume_synchronization_failed", &TThis::AbortOnFreeVolumeSynchronizationFailed)
-        .Default(true);
+        .Default(false);
 
     registrar.Parameter("abort_on_free_slot_synchronization_failed", &TThis::AbortOnFreeSlotSynchronizationFailed)
-        .Default(true);
+        .Default(false);
 
     registrar.Parameter("abort_on_jobs_disabled", &TThis::AbortOnJobsDisabled)
         .Default(false);
+
+    registrar.Parameter("enable_container_device_checker", &TThis::EnableContainerDeviceChecker)
+        .Default(true);
+
+    registrar.Parameter("restart_container_after_failed_device_check", &TThis::RestartContainerAfterFailedDeviceCheck)
+        .Default(true);
 
     registrar.Parameter("job_environment", &TThis::JobEnvironment)
         .DefaultCtor([] { return ConvertToNode(New<TSimpleJobEnvironmentConfig>()); });
@@ -254,10 +263,10 @@ void TVolumeManagerDynamicConfig::Register(TRegistrar registrar)
         .Default(true);
 
     registrar.Parameter("abort_on_operation_with_volume_failed", &TThis::AbortOnOperationWithVolumeFailed)
-        .Default(true);
+        .Default(false);
 
     registrar.Parameter("abort_on_operation_with_layer_failed", &TThis::AbortOnOperationWithLayerFailed)
-        .Default(true);
+        .Default(false);
 
     registrar.Parameter("throw_on_prepare_volume", &TThis::ThrowOnPrepareVolume)
         .Default(false);
@@ -284,7 +293,7 @@ void TUserJobSensor::Register(TRegistrar registrar)
 
     registrar.Postprocessor([] (TThis* config) {
         if (config->Source == EUserJobSensorSource::Statistics && !config->Path) {
-            THROW_ERROR_EXCEPTION("Parameter \"path\" is required for sensor with %lv source",
+            THROW_ERROR_EXCEPTION("Parameter \"path\" is required for sensor with %Qlv source",
                 config->Source);
         }
     });
@@ -296,6 +305,12 @@ const THashMap<TString, TUserJobSensorPtr>& TUserJobMonitoringDynamicConfig::Get
 {
     static const auto DefaultSensors = ConvertTo<THashMap<TString, TUserJobSensorPtr>>(BuildYsonStringFluently()
         .BeginMap()
+            .Item("cpu/burst").BeginMap()
+                .Item("path").Value("/user_job/cpu/burst")
+                .Item("type").Value("counter")
+                .Item("source").Value("statistics")
+                .Item("profiling_name").Value("/user_job/cpu/burst")
+            .EndMap()
             .Item("cpu/user").BeginMap()
                 .Item("path").Value("/user_job/cpu/user")
                 .Item("type").Value("counter")
@@ -319,6 +334,12 @@ const THashMap<TString, TUserJobSensorPtr>& TUserJobMonitoringDynamicConfig::Get
                 .Item("type").Value("counter")
                 .Item("source").Value("statistics")
                 .Item("profiling_name").Value("/user_job/cpu/throttled")
+            .EndMap()
+            .Item("cpu/cfs_throttled").BeginMap()
+                .Item("path").Value("/user_job/cpu/cfs_throttled")
+                .Item("type").Value("counter")
+                .Item("source").Value("statistics")
+                .Item("profiling_name").Value("/user_job/cpu/cfs_throttled")
             .EndMap()
             .Item("cpu/context_switches").BeginMap()
                 .Item("path").Value("/user_job/cpu/context_switches")
@@ -495,6 +516,9 @@ void THeartbeatReporterDynamicConfigBase::Register(TRegistrar registrar)
 
     registrar.Parameter("enable_tracing", &TThis::EnableTracing)
         .Default(false);
+
+    registrar.Parameter("tracing_sampler", &TThis::TracingSampler)
+        .DefaultNew();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -535,6 +559,23 @@ void TSchedulerConnectorDynamicConfig::Register(TRegistrar registrar)
         "send_heartbeat_on_job_finished",
         &TSchedulerConnectorDynamicConfig::SendHeartbeatOnJobFinished)
         .Default(true);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TJobInputCacheDynamicConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("enabled", &TThis::Enabled)
+        .Default(false);
+    registrar.Parameter("job_count_threshold", &TThis::JobCountThreshold)
+        .Default();
+    registrar.Parameter("block_cache", &TThis::BlockCache)
+        .DefaultNew();
+    registrar.Parameter("meta_cache", &TThis::MetaCache)
+        .DefaultNew();
+    registrar.Parameter("fallback_timeout_fraction", &TThis::FallbackTimeoutFraction)
+        .InRange(0.0, 1.0)
+        .Default(0.8);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -692,8 +733,16 @@ void TJobControllerDynamicConfig::Register(TRegistrar registrar)
         });
 
     // Make it greater than interrupt preemption timeout.
-    registrar.Parameter("waiting_jobs_timeout", &TThis::WaitingJobsTimeout)
+    registrar.Parameter("waiting_for_resources_timeout", &TThis::WaitingForResourcesTimeout)
+        .Alias("waiting_jobs_timeout")
         .Default(TDuration::Seconds(30));
+
+    // COMPAT(arkady-e1ppa): This option can be set to false when
+    // sched and CA are updated to the fitting version of 24.1
+    // which has protocol version 28 in controller_agent_tracker_serive_proxy.h.
+    // Remove when everyone is 24.2.
+    registrar.Parameter("disable_legacy_allocation_preparation", &TThis::DisableLegacyAllocationPreparation)
+        .Default(false);
 
     registrar.Parameter("cpu_overdraft_timeout", &TThis::CpuOverdraftTimeout)
         .Default(TDuration::Minutes(10));
@@ -734,6 +783,15 @@ void TJobControllerDynamicConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("profiling_period", &TThis::ProfilingPeriod)
         .Default(TDuration::Seconds(5));
+
+    registrar.Parameter("profile_job_proxy_process_exit", &TThis::ProfileJobProxyProcessExit)
+        .Default(false);
+
+    registrar.Parameter("test_resource_acquisition_delay", &TThis::TestResourceAcquisitionDelay)
+        .Default();
+
+    registrar.Parameter("job_proxy_log_manager", &TThis::JobProxyLogManager)
+        .Default();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -764,6 +822,23 @@ void TNbdConfig::Register(TRegistrar registrar)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void TJobProxyLoggingConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("mode", &TThis::Mode)
+        .Default();
+
+    registrar.Parameter("log_manager_template", &TThis::LogManagerTemplate)
+        .DefaultNew();
+
+    registrar.Parameter("job_proxy_stderr_path", &TThis::JobProxyStderrPath)
+        .Default();
+
+    registrar.Parameter("executor_stderr_path", &TThis::ExecutorStderrPath)
+        .Default();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 void TJobProxyConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("job_proxy_logging", &TThis::JobProxyLogging)
@@ -780,12 +855,6 @@ void TJobProxyConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("core_watcher", &TThis::CoreWatcher)
         .DefaultNew();
-
-    registrar.Parameter("job_proxy_stderr_path", &TThis::JobProxyStderrPath)
-        .Default();
-
-    registrar.Parameter("executor_stderr_path", &TThis::ExecutorStderrPath)
-        .Default();
 
     registrar.Parameter("supervisor_rpc_timeout", &TThis::SupervisorRpcTimeout)
         .Default(TDuration::Seconds(30));
@@ -807,6 +876,36 @@ void TJobProxyConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("always_abort_on_memory_reserve_overdraft", &TThis::AlwaysAbortOnMemoryReserveOverdraft)
         .Default(false);
+
+    registrar.Parameter("forward_all_environment_variables", &TThis::ForwardAllEnvironmentVariables)
+        .Default(false);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TJobProxyLogManagerConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("directory", &TThis::Directory);
+
+    registrar.Parameter("sharding_key_length", &TThis::ShardingKeyLength)
+        .GreaterThan(0);
+
+    registrar.Parameter("logs_storage_period", &TThis::LogsStoragePeriod);
+
+    registrar.Parameter("directory_traversal_concurrency", &TThis::DirectoryTraversalConcurrency)
+        .Default()
+        .GreaterThan(0);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TJobProxyLogManagerDynamicConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("logs_storage_period", &TThis::LogsStoragePeriod)
+        .Default(TDuration::Days(7));
+
+    registrar.Parameter("directory_traversal_concurrency", &TThis::DirectoryTraversalConcurrency)
+        .Default();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -827,6 +926,17 @@ void TExecNodeConfig::Register(TRegistrar registrar)
 
     registrar.Parameter("job_proxy", &TThis::JobProxy)
         .DefaultNew();
+
+    registrar.Parameter("job_proxy_log_manager", &TThis::JobProxyLogManager)
+        .Default();
+
+    registrar.Postprocessor([] (TExecNodeConfig* config) {
+        if (config->JobProxy->JobProxyLogging->Mode == EJobProxyLoggingMode::PerJobDirectory &&
+            config->JobProxyLogManager == nullptr)
+        {
+                THROW_ERROR_EXCEPTION("\"per_job_directory\" logging mode requires \"job_proxy_log_manager\" to be set");
+        }
+    });
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -861,6 +971,9 @@ void TExecNodeDynamicConfig::Register(TRegistrar registrar)
         .DefaultNew();
 
     registrar.Parameter("chunk_cache", &TThis::ChunkCache)
+        .DefaultNew();
+
+    registrar.Parameter("job_input_cache", &TThis::JobInputCache)
         .DefaultNew();
 
     registrar.Parameter("nbd", &TThis::Nbd)

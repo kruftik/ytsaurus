@@ -4,15 +4,14 @@ namespace NYT::NQueryClient {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-Y_WEAK std::pair<TConstFrontQueryPtr, std::vector<TConstQueryPtr>> CoordinateQuery(
-    const TConstQueryPtr& /*query*/,
-    const std::vector<TRefiner>& /*refiners*/)
+Y_WEAK std::pair<TConstFrontQueryPtr, TConstQueryPtr> GetDistributedQueryPattern(
+    const TConstQueryPtr& /*query*/)
 {
     // Proper implementation resides in yt/yt/library/query/engine/coordinator.cpp.
     YT_ABORT();
 }
 
-Y_WEAK TRowRanges GetPrunedRanges(
+Y_WEAK TSharedRange<TRowRange> GetPrunedRanges(
     const TConstExpressionPtr& /*predicate*/,
     const TTableSchemaPtr& /*tableSchema*/,
     const TKeyColumns& /*keyColumns*/,
@@ -28,7 +27,7 @@ Y_WEAK TRowRanges GetPrunedRanges(
     YT_ABORT();
 }
 
-Y_WEAK TRowRanges GetPrunedRanges(
+Y_WEAK TSharedRange<TRowRange> GetPrunedRanges(
     const TConstQueryPtr& /*query*/,
     NObjectClient::TObjectId /*tableId*/,
     const TSharedRange<TRowRange>& /*ranges*/,
@@ -42,11 +41,11 @@ Y_WEAK TRowRanges GetPrunedRanges(
 }
 
 Y_WEAK TQueryStatistics CoordinateAndExecute(
-    const TConstQueryPtr& /*query*/,
-    const IUnversionedRowsetWriterPtr& /*writer*/,
-    const std::vector<TRefiner>& /*ranges*/,
-    std::function<TEvaluateResult(const TConstQueryPtr&, int)> /*evaluateSubquery*/,
-    std::function<TQueryStatistics(const TConstFrontQueryPtr&, const ISchemafulUnversionedReaderPtr&, const IUnversionedRowsetWriterPtr&)> /*evaluateTop*/)
+    bool /*ordered*/,
+    bool /*prefetch*/,
+    int /*splitCount*/,
+    std::function<TEvaluateResult()> /*evaluateSubQuery*/,
+    std::function<TQueryStatistics(const ISchemafulUnversionedReaderPtr&)> /*evaluateTopQuery*/)
 {
     // Proper implementation resides in yt/yt/library/query/engine/coordinator.cpp.
     YT_ABORT();

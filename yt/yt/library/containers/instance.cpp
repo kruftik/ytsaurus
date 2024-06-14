@@ -122,6 +122,7 @@ const THashMap<EStatField, TPortoStatRule> PortoStatRules = {
     {EStatField::CpuSystemUsage, {"cpu_usage_system", LongExtractor}},
     {EStatField::CpuWait, {"cpu_wait", LongExtractor}},
     {EStatField::CpuThrottled, {"cpu_throttled", LongExtractor}},
+    {EStatField::CpuCfsThrottled, {"cpu.stat", GetStatByKeyExtractor("h_throttled_time")}},
     {EStatField::ThreadCount, {"thread_count", LongExtractor}},
     {EStatField::CpuLimit, {"cpu_limit_bound", CoreNsPerSecondExtractor}},
     {EStatField::CpuGuarantee, {"cpu_guarantee_bound", CoreNsPerSecondExtractor}},
@@ -202,7 +203,7 @@ class TPortoInstanceLauncher
 public:
     TPortoInstanceLauncher(const TString& name, IPortoExecutorPtr executor)
         : Executor_(std::move(executor))
-        , Logger(ContainersLogger.WithTag("Container: %v", name))
+        , Logger(ContainersLogger().WithTag("Container: %v", name))
     {
         Spec_.Name = name;
         Spec_.CGroupControllers = {
@@ -281,6 +282,11 @@ public:
         Spec_.Isolate = isolate;
     }
 
+    void SetEnableFuse(bool enableFuse) override
+    {
+        Spec_.EnableFuse = enableFuse;
+    }
+
     void EnableMemoryTracking() override
     {
         Spec_.CGroupControllers.push_back("memory");
@@ -348,7 +354,24 @@ public:
             return GetPortoInstance(Executor_, Spec_.Name);
         };
 
-        return Executor_->CreateContainer(Spec_, /* start */ true)
+        return Executor_->CreateContainer(Spec_, /*start*/ true)
+            .Apply(BIND(onContainerCreated));
+    }
+
+    TFuture<IInstancePtr> LaunchMeta(const THashMap<TString, TString>& env) override
+    {
+        Spec_.Env = env;
+
+        auto onContainerCreated = [this, this_ = MakeStrong(this)] (const TError& error) -> IInstancePtr {
+            if (!error.IsOK()) {
+                THROW_ERROR_EXCEPTION(EErrorCode::FailedToStartContainer, "Unable to create container")
+                    << error;
+            }
+
+            return GetPortoInstance(Executor_, Spec_.Name);
+        };
+
+        return Executor_->CreateContainer(Spec_, /*start*/ true)
             .Apply(BIND(onContainerCreated));
     }
 
@@ -762,7 +785,7 @@ private:
     TPortoInstance(TString name, IPortoExecutorPtr executor)
         : Name_(std::move(name))
         , Executor_(std::move(executor))
-        , Logger(ContainersLogger.WithTag("Container: %v", Name_))
+        , Logger(ContainersLogger().WithTag("Container: %v", Name_))
     { }
 
     void SetProperty(const TString& key, const TString& value)

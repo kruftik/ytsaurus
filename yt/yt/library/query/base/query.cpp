@@ -41,7 +41,7 @@ TLogicalTypePtr ToQLType(const NTableClient::TLogicalTypePtr& columnType)
 {
     if (IsV1Type(columnType)) {
         const auto wireType = GetWireType(columnType);
-        return MakeLogicalType(GetLogicalType(wireType), false);
+        return MakeLogicalType(GetLogicalType(wireType), /*required*/ false);
     } else {
         return columnType;
     }
@@ -54,7 +54,7 @@ TExpression::TExpression(NTableClient::TLogicalTypePtr type)
 { }
 
 TExpression::TExpression(EValueType type)
-    : LogicalType(MakeLogicalType(GetLogicalType(type), false))
+    : LogicalType(MakeLogicalType(GetLogicalType(type), /*required*/ false))
 { }
 
 EValueType TExpression::GetWireType() const
@@ -804,7 +804,7 @@ std::vector<size_t> GetJoinGroups(
 
 NLogging::TLogger MakeQueryLogger(TGuid queryId)
 {
-    return QueryClientLogger.WithTag("FragmentId: %v", queryId);
+    return QueryClientLogger().WithTag("FragmentId: %v", queryId);
 }
 
 NLogging::TLogger MakeQueryLogger(TConstBaseQueryPtr query)
@@ -847,7 +847,7 @@ void ToProto(NProto::TExpression* serialized, const TConstExpressionPtr& origina
     serialized->set_type(static_cast<int>(wireType));
 
     if (!IsV1Type(original->LogicalType) ||
-        *original->LogicalType != *MakeLogicalType(GetLogicalType(wireType), false))
+        *original->LogicalType != *MakeLogicalType(GetLogicalType(wireType), /*required*/ false))
     {
         ToProto(serialized->mutable_logical_type(), original->LogicalType);
     }
@@ -984,7 +984,7 @@ void FromProto(TConstExpressionPtr* original, const NProto::TExpression& seriali
         FromProto(&type, serialized.logical_type());
     } else {
         auto wireType = CheckedEnumCast<EValueType>(serialized.type());
-        type = MakeLogicalType(GetLogicalType(wireType), false);
+        type = MakeLogicalType(GetLogicalType(wireType), /*required*/ false);
     }
 
     auto kind = CheckedEnumCast<EExpressionKind>(serialized.kind());
@@ -1519,7 +1519,12 @@ void FromProto(TQueryOptions* original, const NProto::TQueryOptions& serialized)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-void ToProto(NProto::TDataSource* serialized, const TDataSource& original)
+void ToProto(
+    NProto::TDataSource* serialized,
+    const TDataSource& original,
+    TRange<NTableClient::TLogicalTypePtr> schema,
+    bool lookupSupported,
+    size_t keyWidth)
 {
     ToProto(serialized->mutable_object_id(), original.ObjectId);
     ToProto(serialized->mutable_cell_id(), original.CellId);
@@ -1534,7 +1539,7 @@ void ToProto(NProto::TDataSource* serialized, const TDataSource& original)
 
     if (original.Keys) {
         std::vector<TColumnSchema> columns;
-        for (auto type : original.Schema) {
+        for (auto type : schema) {
             columns.emplace_back("", type);
         }
 
@@ -1544,8 +1549,10 @@ void ToProto(NProto::TDataSource* serialized, const TDataSource& original)
         keysWriter->WriteSchemafulRowset(original.Keys);
         ToProto(serialized->mutable_keys(), MergeRefsToString(keysWriter->Finish()));
     }
-    serialized->set_lookup_supported(original.LookupSupported);
-    serialized->set_key_width(original.KeyWidth);
+
+    // COMPAT(lukyan)
+    serialized->set_lookup_supported(lookupSupported);
+    serialized->set_key_width(keyWidth);
 }
 
 void FromProto(
@@ -1581,8 +1588,6 @@ void FromProto(
         auto schemaData = keysReader->GetSchemaData(schema, NTableClient::TColumnFilter());
         original->Keys = keysReader->ReadSchemafulRowset(schemaData, true);
     }
-    original->LookupSupported = serialized.lookup_supported();
-    original->KeyWidth = serialized.key_width();
 }
 
 ////////////////////////////////////////////////////////////////////////////////

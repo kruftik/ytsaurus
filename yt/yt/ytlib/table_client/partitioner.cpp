@@ -30,7 +30,7 @@ public:
         : KeySetReader_(wirePivots)
         , Comparator_(comparator)
     {
-        PartitionLowerBounds_.push_back(TOwningKeyBound::MakeUniversal(/*isUpper*/false));
+        PartitionLowerBounds_.push_back(TOwningKeyBound::MakeUniversal(/*isUpper*/ false));
 
         for (const auto& key : KeySetReader_->GetKeys()) {
             PartitionLowerBounds_.push_back(
@@ -67,8 +67,7 @@ public:
             key,
             [this] (const TKey& key, const TKeyBound& partitionLowerBound) {
                 return !Comparator_.TestKey(key, partitionLowerBound);
-            }
-        );
+            });
 
         YT_VERIFY(partitionsIt != PartitionLowerBounds_.begin());
         return partitionsIt - PartitionLowerBounds_.begin() - 1;

@@ -134,7 +134,7 @@ public:
         return ChunkReplica_;
     }
 
-    void SetConnection(
+    void InitializeSession(
         int index,
         IChannelPtr channel,
         TChunkLocationUuid targetLocationUuid)
@@ -200,9 +200,9 @@ private:
     bool Finished_ = false;
 };
 
-TString ToString(const TNodePtr& node)
+void FormatValue(TStringBuilderBase* builder, const TNodePtr& node, TStringBuf spec)
 {
-    return node->GetDefaultAddress();
+    FormatValue(builder, node->GetDefaultAddress(), spec);
 }
 
 DEFINE_REFCOUNTED_TYPE(TNode)
@@ -280,7 +280,7 @@ public:
         , Throttler_(std::move(throttler))
         , BlockCache_(std::move(blockCache))
         , TrafficMeter_(std::move(trafficMeter))
-        , Logger(ChunkClientLogger.WithTag("ChunkId: %v", SessionId_))
+        , Logger(ChunkClientLogger().WithTag("ChunkId: %v", SessionId_))
         , Networks_(Client_->GetNativeConnection()->GetNetworks())
         , WindowSlots_(New<TAsyncSemaphore>(Config_->SendWindowSize))
         , UploadReplicationFactor_(Config_->UploadReplicationFactor)
@@ -880,7 +880,7 @@ private:
 
         YT_LOG_DEBUG("Write session started (Address: %v)", address);
 
-        node->SetConnection(
+        node->InitializeSession(
             Nodes_.size(),
             channel,
             targetLocationUuid);
@@ -970,7 +970,7 @@ private:
         *req->mutable_chunk_meta() = *ChunkMeta_;
 
         auto memoryUsageGuard = TMemoryUsageTrackerGuard::Acquire(
-            Options_->MemoryTracker,
+            Options_->MemoryUsageTracker,
             req->mutable_chunk_meta()->ByteSize());
 
         req->set_block_count(BlockCount_);

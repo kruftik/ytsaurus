@@ -21,51 +21,40 @@ using TJobStartInfo = TControllerAgentConnectorPool::TControllerAgentConnector::
 
 namespace {
 
-NClusterNode::TJobResources BuildJobResources(
-    NClusterNode::TJobResources baseJobResourcesResources,
-    const TJobSpecExt* jobSpecExt,
+NClusterNode::TJobResources PatchJobResources(
+    NClusterNode::TJobResources initial,
+    const TAllocationAttributes& attributes,
     i64 minRequiredDiskSpace)
 {
-    const auto* userJobSpec = jobSpecExt && jobSpecExt->has_user_job_spec()
-        ? &jobSpecExt->user_job_spec()
-        : nullptr;
+    const auto& diskRequest = attributes.DiskRequest;
 
-    baseJobResourcesResources.DiskSpaceRequest = minRequiredDiskSpace;
-    if (userJobSpec) {
-        // COMPAT(ignat)
-        if (userJobSpec->has_disk_space_limit()) {
-            baseJobResourcesResources.DiskSpaceRequest = userJobSpec->disk_space_limit();
-        }
+    initial.DiskSpaceRequest = diskRequest.DiskSpace.value_or(minRequiredDiskSpace);
+    initial.InodeRequest = diskRequest.InodeCount.value_or(0);
 
-        if (userJobSpec->has_disk_request()) {
-            baseJobResourcesResources.DiskSpaceRequest = userJobSpec->disk_request().disk_space();
-            baseJobResourcesResources.InodeRequest = userJobSpec->disk_request().inode_count();
-        }
-    }
-
-    return baseJobResourcesResources;
+    return initial;
 }
 
-NClusterNode::TJobResourceAttributes BuildJobResourceAttributes(const TJobSpecExt* jobSpecExt)
+TAllocationAttributes BuildAttributesFromJobSpec(const TJobSpecExt* jobSpecExt)
 {
-    const auto* userJobSpec = jobSpecExt && jobSpecExt->has_user_job_spec()
-        ? &jobSpecExt->user_job_spec()
-        : nullptr;
-
-    TJobResourceAttributes resourceAttributes;
-    resourceAttributes.AllowIdleCpuPolicy = jobSpecExt->allow_idle_cpu_policy();
-
-    if (userJobSpec) {
-        if (userJobSpec->has_disk_request() && userJobSpec->disk_request().has_medium_index()) {
-            resourceAttributes.MediumIndex = userJobSpec->disk_request().medium_index();
-        }
-
-        if (userJobSpec->has_cuda_toolkit_version()) {
-            resourceAttributes.CudaToolkitVersion = userJobSpec->cuda_toolkit_version();
-        }
+    const auto& userJobSpec = jobSpecExt->user_job_spec();
+    TAllocationAttributes attributes{
+        .DiskRequest = {
+            .InodeCount = userJobSpec.disk_request().inode_count(),
+        },
+        .AllowIdleCpuPolicy = jobSpecExt->allow_idle_cpu_policy(),
+        .PortCount = userJobSpec.port_count(),
+    };
+    if (userJobSpec.disk_request().has_medium_index()) {
+        attributes.DiskRequest.MediumIndex = userJobSpec.disk_request().medium_index();
     }
 
-    return resourceAttributes;
+    if (userJobSpec.has_cuda_toolkit_version()) {
+        attributes.CudaToolkitVersion = userJobSpec.cuda_toolkit_version();
+    }
+    if (jobSpecExt->has_waiting_job_timeout()) {
+        attributes.WaitingForResourcesOnNodeTimeout = FromProto<TDuration>(jobSpecExt->waiting_job_timeout());
+    }
+    return attributes;
 }
 
 } // namespace
@@ -76,22 +65,25 @@ TAllocation::TAllocation(
     TAllocationId id,
     TOperationId operationId,
     const NClusterNode::TJobResources& resourceDemand,
+    std::optional<NScheduler::TAllocationAttributes> attributes,
     TControllerAgentDescriptor agentDescriptor,
     IBootstrap* bootstrap)
-    : TResourceHolder(
+    : TResourceOwner(
+        id.Underlying(),
         bootstrap->GetJobResourceManager().Get(),
         EResourcesConsumerType::SchedulerAllocation,
-        ExecNodeLogger.WithTag(
-            "AllocationId: %v, OperationId: %v",
-            id,
-            operationId),
         resourceDemand)
     , Bootstrap_(bootstrap)
     , Id_(id)
     , OperationId_(operationId)
+    , Logger(ExecNodeLogger().WithTag(
+        "AllocationId: %v, OperationId: %v",
+        id,
+        operationId))
     , RequestedGpu_(resourceDemand.Gpu)
     , RequestedCpu_(resourceDemand.Cpu)
     , RequestedMemory_(resourceDemand.UserMemory)
+    , Attributes_(std::move(attributes))
     , ControllerAgentDescriptor_(std::move(agentDescriptor))
     , ControllerAgentConnector_(
         Bootstrap_->GetControllerAgentConnectorPool()->GetControllerAgentConnector(ControllerAgentDescriptor_))
@@ -111,13 +103,6 @@ TAllocationId TAllocation::GetId() const noexcept
     VERIFY_THREAD_AFFINITY_ANY();
 
     return Id_;
-}
-
-TGuid TAllocation::GetIdAsGuid() const noexcept
-{
-    VERIFY_THREAD_AFFINITY_ANY();
-
-    return Id_.Underlying();
 }
 
 TOperationId TAllocation::GetOperationId() const noexcept
@@ -166,6 +151,10 @@ void TAllocation::Start()
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
+    if (Attributes_) {
+        PrepareAllocationFromAttributes(*Attributes_);
+    }
+
     SettleJob();
 }
 
@@ -182,7 +171,7 @@ TJobPtr TAllocation::EvictJob()
 
     YT_VERIFY(Job_);
 
-    YT_LOG_DEBUG("Job evicted from allcation (JobId: %v)", Job_->GetId());
+    YT_LOG_DEBUG("Job evicted from allocation (JobId: %v)", Job_->GetId());
 
     Job_->OnEvictedFromAllocation();
 
@@ -235,25 +224,15 @@ const TControllerAgentDescriptor& TAllocation::GetControllerAgentDescriptor() co
     return ControllerAgentDescriptor_;
 }
 
-NClusterNode::TJobResources TAllocation::GetResourceUsage() const noexcept
+NClusterNode::TJobResources TAllocation::GetResourceUsage(bool excludeReleasing) const noexcept
 {
     VERIFY_THREAD_AFFINITY(JobThread);
 
-    return TResourceHolder::GetResourceUsage();
-}
+    if (ResourceHolder_) {
+        return ResourceHolder_->GetResourceUsage(excludeReleasing);
+    }
 
-const NClusterNode::ISlotPtr& TAllocation::GetUserSlot() const noexcept
-{
-    VERIFY_THREAD_AFFINITY(JobThread);
-
-    return UserSlot_;
-}
-
-const std::vector<NClusterNode::ISlotPtr>& TAllocation::GetGpuSlots() const noexcept
-{
-    VERIFY_THREAD_AFFINITY(JobThread);
-
-    return GpuSlots_;
+    return {};
 }
 
 void TAllocation::Abort(TError error)
@@ -272,7 +251,7 @@ void TAllocation::Abort(TError error)
     FinishError_ = std::move(error);
 
     if (Job_) {
-        TransferResourcesTo(*Job_);
+        TransferResourcesToJob();
         auto job = EvictJob();
         job->Abort(FinishError_);
     } else {
@@ -296,7 +275,7 @@ void TAllocation::Complete()
     State_ = EAllocationState::Finished;
 
     if (Job_) {
-        TransferResourcesTo(*Job_);
+        TransferResourcesToJob();
         EvictJob();
     }
 
@@ -335,6 +314,7 @@ void TAllocation::Preempt(
         return;
     }
 
+    Job_->PrepareResourcesRelease();
     Job_->Interrupt(
         timeout,
         EInterruptReason::Preemption,
@@ -344,7 +324,7 @@ void TAllocation::Preempt(
 
 bool TAllocation::IsResourceUsageOverdraftOccurred() const
 {
-    return TResourceHolder::GetResourceUsage().UserMemory > GetRequestedMemory();
+    return ResourceHolder_->GetResourceUsage().UserMemory > GetRequestedMemory();
 }
 
 bool TAllocation::IsEmpty() const noexcept
@@ -393,40 +373,22 @@ void TAllocation::OnSettledJobReceived(
 
     auto& jobInfo = jobInfoOrError.Value();
 
-    if (State_ != EAllocationState::Waiting) {
+    if (State_ == EAllocationState::Finished) {
         // Job will be aborted by controller agent in this case.
-
-        YT_VERIFY(State_ == EAllocationState::Finished);
 
         YT_LOG_INFO("Received settled job for aborted allocation; ignore it (JobId: %v)", jobInfo.JobId);
         return;
     }
 
-    auto jobSpecExtId = TJobSpecExt::job_spec_ext;
+    // NB(arkady-e1ppa): Waiting is legacy. Remove when
+    // sched and CA are updated to 24.2.
+    YT_VERIFY(
+        State_ == EAllocationState::Waiting ||
+        State_ == EAllocationState::Running);
 
-    YT_VERIFY(jobInfo.JobSpec.HasExtension(jobSpecExtId));
-
-    auto jobControllerConfig = Bootstrap_->GetJobController()->GetDynamicConfig();
-    auto* jobSpecExt = &jobInfo.JobSpec.GetExtension(jobSpecExtId);
-
-    auto resources = BuildJobResources(
-        GetResourceUsage(),
-        jobSpecExt,
-        jobControllerConfig->MinRequiredDiskSpace);
-    auto resourceAttributes = BuildJobResourceAttributes(jobSpecExt);
-
-    UpdateResourceDemand(
-        resources,
-        resourceAttributes,
-        jobInfo.JobSpec.GetExtension(TJobSpecExt::job_spec_ext).user_job_spec().port_count());
-
-    // TODO(pogorelov): Rename this config.
-    auto waitingJobTimeout = Bootstrap_->GetJobController()->GetDynamicConfig()->WaitingJobsTimeout;
-    if (jobSpecExt->has_waiting_job_timeout()) {
-        waitingJobTimeout = FromProto<TDuration>(jobSpecExt->waiting_job_timeout());
+    if (!Attributes_.has_value()) {
+        LegacyPrepareAllocationFromStartInfo(jobInfo);
     }
-
-    AllocationPrepared_.Fire(MakeStrong(this), waitingJobTimeout);
 
     try {
         CreateAndSettleJob(jobInfo.JobId, std::move(jobInfo.JobSpec));
@@ -471,6 +433,13 @@ void TAllocation::CreateAndSettleJob(
 
     YT_VERIFY(!std::exchange(Job_, std::move(job)));
 
+    // COMPAT(arkady-e1ppa): Non-legacy version
+    // always has state == Running at this point.
+    // Remove branch when sched and CA are 24.2.
+    if (State_ == EAllocationState::Running) {
+        Job_->Start();
+    }
+
     JobSettled_.Fire(Job_);
 
     YT_LOG_INFO(
@@ -486,7 +455,23 @@ void TAllocation::OnResourcesAcquired() noexcept
     YT_LOG_INFO("Resources acquired; starting job");
 
     State_ = EAllocationState::Running;
-    Job_->Start();
+
+    // NB(arkady-e1ppa): In non-legacy version of
+    // allocation preparation resources are acquired
+    // immediately. That is, before the spec
+    // was received and job created. Thus,
+    // we will simply start the job when it
+    // is created.
+    if (Job_) {
+        Job_->Start();
+    }
+}
+
+const NJobAgent::TResourceHolderPtr& TAllocation::GetResourceHolder() const noexcept
+{
+    VERIFY_THREAD_AFFINITY(JobThread);
+
+    return ResourceHolder_;
 }
 
 void TAllocation::OnAllocationFinished()
@@ -512,10 +497,52 @@ void TAllocation::OnJobFinished(TJobPtr job)
     JobFinished_.Fire(std::move(job));
 }
 
+void TAllocation::TransferResourcesToJob()
+{
+    VERIFY_THREAD_AFFINITY(JobThread);
+
+    ResourceHolder_.Reset();
+}
+
+void TAllocation::PrepareAllocationFromAttributes(
+    const NScheduler::TAllocationAttributes& attributes)
+{
+    VERIFY_THREAD_AFFINITY(JobThread);
+
+    auto jobControllerConfig = Bootstrap_->GetJobController()->GetDynamicConfig();
+    auto resources = PatchJobResources(
+        GetResourceUsage(),
+        attributes,
+        jobControllerConfig->MinRequiredDiskSpace);
+
+    ResourceHolder_->UpdateResourceDemand(
+        resources,
+        attributes);
+
+    AllocationPrepared_.Fire(
+        MakeStrong(this),
+        attributes
+            .WaitingForResourcesOnNodeTimeout
+            .value_or(jobControllerConfig->WaitingForResourcesTimeout));
+}
+
+void TAllocation::LegacyPrepareAllocationFromStartInfo(TJobStartInfo& jobInfo)
+{
+    VERIFY_THREAD_AFFINITY(JobThread);
+
+    auto jobSpecExtId = TJobSpecExt::job_spec_ext;
+    YT_VERIFY(jobInfo.JobSpec.HasExtension(jobSpecExtId));
+    auto* jobSpecExt = &jobInfo.JobSpec.GetExtension(jobSpecExtId);
+
+    auto attributes = BuildAttributesFromJobSpec(jobSpecExt);
+    PrepareAllocationFromAttributes(attributes);
+}
+
 TAllocationPtr CreateAllocation(
     TAllocationId id,
     TOperationId operationId,
     const NClusterNode::TJobResources& resourceUsage,
+    std::optional<NScheduler::TAllocationAttributes> attributes,
     TControllerAgentDescriptor agentDescriptor,
     IBootstrap* bootstrap)
 {
@@ -524,6 +551,7 @@ TAllocationPtr CreateAllocation(
         id,
         operationId,
         resourceUsage,
+        std::move(attributes),
         std::move(agentDescriptor),
         bootstrap);
 }

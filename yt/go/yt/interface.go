@@ -670,6 +670,7 @@ type OperationStatus struct {
 	State             OperationState             `yson:"state"`
 	Result            *OperationResult           `yson:"result"`
 	Type              OperationType              `yson:"type"`
+	BriefProgress     OperationBriefProgress     `yson:"brief_progress"`
 	BriefSpec         map[string]any             `yson:"brief_spec"`
 	FullSpec          yson.RawValue              `yson:"full_spec"`
 	StartTime         yson.Time                  `yson:"start_time"`
@@ -677,6 +678,16 @@ type OperationStatus struct {
 	Suspend           bool                       `yson:"suspend"`
 	AuthenticatedUser string                     `yson:"authenticated_user"`
 	RuntimeParameters OperationRuntimeParameters `yson:"runtime_parameters"`
+}
+
+type OperationBriefProgress struct {
+	TotalJobCounter *TotalJobCounter `yson:"total_job_counter"`
+}
+
+type TotalJobCounter struct {
+	Total     int64 `yson:"total"`
+	Completed int64 `yson:"completed"`
+	Running   int64 `yson:"running"`
 }
 
 type OperationStartClient interface {
@@ -798,6 +809,14 @@ type RemoveMemberOptions struct {
 	*MutatingOptions
 	*PrerequisiteOptions
 }
+
+type SetUserPasswordOptions struct{}
+
+type IssueTokenOptions struct{}
+
+type RevokeTokenOptions struct{}
+
+type ListUserTokensOptions struct{}
 
 type AddMaintenanceOptions struct {
 }
@@ -1510,6 +1529,46 @@ type GenerateTimestampOptions struct{}
 
 type GetInSyncReplicasOptions struct{}
 
+type AuthClient interface {
+	// http:verb:"set_user_password"
+	// http:params:"user","new_password_sha256","current_password_sha256"
+	SetUserPassword(
+		ctx context.Context,
+		user string,
+		newPassword string,
+		currentPassword string,
+		options *SetUserPasswordOptions,
+	) (err error)
+
+	// http:verb:"issue_token"
+	// http:params:"user","password_sha256"
+	IssueToken(
+		ctx context.Context,
+		user string,
+		password string,
+		options *IssueTokenOptions,
+	) (token string, err error)
+
+	// http:verb:"revoke_token"
+	// http:params:"user","password_sha256","token_sha256"
+	RevokeToken(
+		ctx context.Context,
+		user string,
+		password string,
+		token string,
+		options *RevokeTokenOptions,
+	) error
+
+	// http:verb:"list_user_tokens"
+	// http:params:"user","password_sha256"
+	ListUserTokens(
+		ctx context.Context,
+		user string,
+		password string,
+		options *ListUserTokensOptions,
+	) (tokens []string, err error)
+}
+
 type Client interface {
 	CypressClient
 	FileClient
@@ -1542,6 +1601,7 @@ type Client interface {
 	LowLevelSchedulerClient
 
 	AdminClient
+	AuthClient
 
 	QueryTrackerClient
 

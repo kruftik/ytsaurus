@@ -27,7 +27,7 @@ using namespace NTransactionClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CellMasterLogger;
+static constexpr auto& Logger = CellMasterLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -47,11 +47,11 @@ public:
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "EpochHistoryManager",
-            BIND(&TEpochHistoryManager::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TEpochHistoryManager::Save, Unretained(this)));
 
         RegisterLoader(
             "EpochHistoryManager",
-            BIND(&TEpochHistoryManager::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TEpochHistoryManager::Load, Unretained(this)));
 
         RegisterMethod(BIND_NO_PROPAGATE(&TEpochHistoryManager::HydraStoreMutationTime, Unretained(this)));
 
@@ -113,7 +113,7 @@ private:
         TReqStoreMutationTime request;
         const auto& hydraManager = Bootstrap_->GetHydraFacade()->GetHydraManager();
         YT_UNUSED_FUTURE(CreateMutation(hydraManager, request)
-            ->CommitAndLog(Logger));
+            ->CommitAndLog(Logger()));
     }
 
     void OnDynamicConfigChanged(TDynamicClusterConfigPtr /*oldConfig*/)

@@ -17,7 +17,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CellarAgentLogger;
+static constexpr auto& Logger = CellarAgentLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -36,7 +36,7 @@ public:
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
-        Bootstrap_->SubscribePopulateAlerts(BIND(&TCellarManager::PopulateAlerts, MakeWeak(this)));
+        Bootstrap_->SubscribePopulateAlerts(BIND_NO_PROPAGATE(&TCellarManager::PopulateAlerts, MakeWeak(this)));
 
         for (const auto& [type, config] : Config_->Cellars) {
             auto cellar = CreateCellar(type, config, Bootstrap_);

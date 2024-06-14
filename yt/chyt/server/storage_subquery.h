@@ -4,9 +4,7 @@
 
 #include "subquery_spec.h"
 
-#include <Storages/IStorage.h>
-
-#include <string>
+#include <Storages/IStorage_fwd.h>
 
 namespace NYT::NClickHouseServer {
 

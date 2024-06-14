@@ -36,7 +36,7 @@ using namespace NConcurrency;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = DataNodeLogger;
+static constexpr auto& Logger = DataNodeLogger;
 static const auto ProfilingPeriod = TDuration::Seconds(1);
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -72,9 +72,9 @@ public:
         return Bootstrap_->GetMasterEpoch();
     }
 
-    INodeMemoryTrackerPtr GetMemoryUsageTracker() override
+    INodeMemoryTrackerPtr GetNodeMemoryUsageTracker() override
     {
-        return Bootstrap_->GetMemoryUsageTracker();
+        return Bootstrap_->GetNodeMemoryUsageTracker();
     }
 
     void CancelLocationSessions(const TChunkLocationPtr& location) override
@@ -189,7 +189,8 @@ void TChunkStore::UpdateConfig(const TDataNodeDynamicConfigPtr& config)
 
 TFuture<void> TChunkStore::InitializeLocation(const TStoreLocationPtr& location)
 {
-    return location->RegisterAction(BIND([=, this, this_ = MakeStrong(this)] () {
+    return location->RegisterAction(
+        BIND([=, this, this_ = MakeStrong(this)] {
             auto descriptors = location->Scan();
 
             location->InitializeIds();
@@ -204,8 +205,7 @@ TFuture<void> TChunkStore::InitializeLocation(const TStoreLocationPtr& location)
             }
 
             location->Start();
-        })
-        .AsyncVia(location->GetAuxPoolInvoker()));
+        }).AsyncVia(location->GetAuxPoolInvoker()));
 }
 
 void TChunkStore::RegisterNewChunk(
@@ -521,7 +521,8 @@ void TChunkStore::UpdateExistingChunk(const IChunkPtr& chunk)
 
         oldChunkEntry = DoFindExistingChunk(chunk);
         if (!oldChunkEntry.Chunk) {
-            YT_LOG_DEBUG("Journal chunk no longer exists and will not be updated (ChunkId: %v)",
+            YT_LOG_DEBUG(
+                "Journal chunk no longer exists and will not be updated (ChunkId: %v, Version: %v, JournalChunkSealed: %v, JournalChunkActive: %v)",
                 journalChunk->GetId(),
                 version,
                 journalChunk->IsSealed(),
@@ -637,7 +638,7 @@ TFuture<void> TChunkStore::RemoveChunk(const IChunkPtr& chunk, std::optional<TDu
     return chunk
         ->GetLocation()
         ->RegisterAction(
-            BIND([=, this, this_ = MakeStrong(this)] () {
+            BIND([=, this, this_ = MakeStrong(this)] {
                 ChunkRemovalScheduled_.Fire(chunk);
 
                 if (startRemoveDelay) {
@@ -729,6 +730,10 @@ bool TChunkStore::CanStartNewSession(
     }
 
     if (location->GetMediumDescriptor().Index != mediumIndex) {
+        return false;
+    }
+
+    if (location->GetSessionCount() >= location->GetSessionCountLimit()) {
         return false;
     }
 

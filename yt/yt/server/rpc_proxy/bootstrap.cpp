@@ -32,6 +32,8 @@
 #include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/helpers.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/transaction_client/config.h>
 
 #include <yt/yt/ytlib/queue_client/registration_manager.h>
@@ -45,7 +47,6 @@
 
 #include <yt/yt/ytlib/orchid/orchid_service.h>
 
-#include <yt/yt/ytlib/misc/memory_reference_tracker.h>
 #include <yt/yt/ytlib/misc/memory_usage_tracker.h>
 
 #include <yt/yt/ytlib/program/helpers.h>
@@ -102,7 +103,7 @@ using namespace NLogging;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = RpcProxyLogger;
+static constexpr auto& Logger = RpcProxyLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -114,9 +115,9 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
     , HttpPoller_(CreateThreadPoolPoller(1, "HttpPoller"))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 
     if (!Config_->ClusterConnection) {
@@ -147,12 +148,10 @@ void TBootstrap::DoRun()
     MemoryUsageTracker_ = CreateNodeMemoryTracker(
         *Config_->MemoryLimits->Total,
         /*limits*/ {},
-        Logger,
+        Logger(),
         RpcProxyProfiler.WithPrefix("/memory_usage"));
 
     ReconfigureMemoryLimits(Config_->MemoryLimits);
-
-    MemoryReferenceTracker_ = CreateNodeMemoryReferenceTracker(MemoryUsageTracker_);
 
     NApi::NNative::TConnectionOptions connectionOptions;
     connectionOptions.ConnectionInvoker = GetWorkerInvoker();
@@ -166,6 +165,7 @@ void TBootstrap::DoRun()
     Connection_->GetClusterDirectorySynchronizer()->Start();
     Connection_->GetNodeDirectorySynchronizer()->Start();
     Connection_->GetQueueConsumerRegistrationManager()->StartSync();
+    Connection_->GetMasterCellDirectorySynchronizer()->Start();
 
     NativeAuthenticator_ = NApi::NNative::CreateNativeAuthenticator(Connection_);
 
@@ -202,7 +202,10 @@ void TBootstrap::DoRun()
         Connection_,
         DynamicConfigManager_);
 
-    BusServer_ = CreateBusServer(Config_->BusServer);
+    BusServer_ = CreateBusServer(
+        Config_->BusServer,
+        GetYTPacketTranscoderFactory(),
+        MemoryUsageTracker_->WithCategory(EMemoryCategory::Rpc));
     if (Config_->TvmOnlyRpcPort) {
         auto busConfigCopy = CloneYsonStruct(Config_->BusServer);
         busConfigCopy->Port = Config_->TvmOnlyRpcPort;
@@ -232,7 +235,7 @@ void TBootstrap::DoRun()
     DiskChangeChecker_ = New<TDiskChangeChecker>(
         DiskInfoProvider_,
         GetControlInvoker(),
-        Logger);
+        Logger());
 
     NYTree::IMapNodePtr orchidRoot;
     NMonitoring::Initialize(
@@ -242,22 +245,24 @@ void TBootstrap::DoRun()
         &orchidRoot);
     NProfiling::TSolomonRegistry::Get()->SetDynamicTags({NProfiling::TTag{"proxy_role", DefaultRpcProxyRole}});
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
-    SetNodeByYPath(
-        orchidRoot,
-        "/dynamic_config_manager",
-        CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
-    SetNodeByYPath(
-        orchidRoot,
-        "/bundle_dynamic_config_manager",
-        CreateVirtualNode(BundleDynamicConfigManager_->GetOrchidService()));
-    SetNodeByYPath(
-        orchidRoot,
-        "/cluster_connection",
-        CreateVirtualNode(Connection_->GetOrchidService()));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+        SetNodeByYPath(
+            orchidRoot,
+            "/dynamic_config_manager",
+            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        SetNodeByYPath(
+            orchidRoot,
+            "/bundle_dynamic_config_manager",
+            CreateVirtualNode(BundleDynamicConfigManager_->GetOrchidService()));
+        SetNodeByYPath(
+            orchidRoot,
+            "/cluster_connection",
+            CreateVirtualNode(Connection_->GetOrchidService()));
+    }
     SetNodeByYPath(
         orchidRoot,
         "/disk_monitoring",
@@ -278,7 +283,7 @@ void TBootstrap::DoRun()
     auto securityManager = CreateSecurityManager(
         Config_->ApiService->SecurityManager,
         Connection_,
-        Logger);
+        Logger());
 
     auto createApiService = [&] (const NAuth::IAuthenticationManagerPtr& authenticationManager) {
         return CreateApiService(
@@ -291,10 +296,9 @@ void TBootstrap::DoRun()
             AccessChecker_,
             securityManager,
             TraceSampler_,
-            RpcProxyLogger,
+            RpcProxyLogger(),
             RpcProxyProfiler,
-            MemoryUsageTracker_,
-            MemoryReferenceTracker_);
+            MemoryUsageTracker_);
     };
 
     ApiService_ = createApiService(AuthenticationManager_);
@@ -356,7 +360,7 @@ void TBootstrap::DoRun()
     RpcServer_->RegisterService(CreateRestartService(
         restartManager,
         GetControlInvoker(),
-        RpcProxyLogger,
+        RpcProxyLogger(),
         NativeAuthenticator_));
 
     YT_LOG_INFO("Listening for HTTP requests on port %v", Config_->MonitoringPort);

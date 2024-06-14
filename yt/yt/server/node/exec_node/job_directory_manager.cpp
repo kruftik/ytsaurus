@@ -29,7 +29,7 @@ using namespace NTools;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ExecNodeLogger;
+static constexpr auto& Logger = ExecNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -114,11 +114,6 @@ public:
         return AllSucceeded(asyncUnlinkResults);
     }
 
-    bool UseVolumeQuota() override
-    {
-        return true;
-    }
-
 private:
     const TString Path_;
     const IPortoExecutorPtr Executor_;
@@ -150,9 +145,9 @@ private:
             volumeProperties["inode_limit"] = ToString(*properties.InodeLimit);
         }
 
-        auto onVolumeCreated = BIND([this_ = MakeStrong(this)] (const TString& volumePath) {
-            auto guard = Guard(this_->SpinLock_);
-            YT_VERIFY(this_->ManagedVolumes_.insert(volumePath).second);
+        auto onVolumeCreated = BIND([this, this_ = MakeStrong(this)] (const TString& volumePath) {
+            auto guard = Guard(SpinLock_);
+            YT_VERIFY(ManagedVolumes_.insert(volumePath).second);
         });
 
         return Executor_->CreateVolume(path, volumeProperties)
@@ -234,7 +229,7 @@ public:
         YT_LOG_DEBUG("Mounting tmpfs (Config: %v)",
             ConvertToYsonString(config, EYsonFormat::Text));
 
-        return BIND([=, this, this_ = MakeStrong(this)] () {
+        return BIND([=, this, this_ = MakeStrong(this)] {
             RunTool<TMountTmpfsAsRootTool>(config);
             YT_VERIFY(Directories_.insert(path).second);
         })
@@ -244,7 +239,7 @@ public:
 
     TFuture<void> CleanDirectories(const TString& pathPrefix) override
     {
-        return BIND([=, this, this_ = MakeStrong(this)] () {
+        return BIND([=, this, this_ = MakeStrong(this)] {
             std::vector<TString> toRelease;
             auto it = Directories_.lower_bound(pathPrefix);
             while (it != Directories_.end() && (*it == pathPrefix || it->StartsWith(pathPrefix + "/"))) {
@@ -275,11 +270,6 @@ public:
         })
         .AsyncVia(Invoker_)
         .Run();
-    }
-
-    bool UseVolumeQuota() override
-    {
-        return false;
     }
 
 private:

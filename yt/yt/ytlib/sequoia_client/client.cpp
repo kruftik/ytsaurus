@@ -38,7 +38,7 @@ public:
         const NTableClient::TColumnFilter& columnFilter,
         NTransactionClient::TTimestamp timestamp) override
     {
-        NApi::TLookupRowsOptions options = {};
+        NApi::TLookupRowsOptions options;
         options.KeepMissingRows = true;
         options.ColumnFilter = columnFilter;
         options.Timestamp = timestamp;
@@ -51,25 +51,25 @@ public:
             options);
     }
 
-        TFuture<NApi::TSelectRowsResult> SelectRows(
+    TFuture<NApi::TSelectRowsResult> SelectRows(
         ESequoiaTable table,
-        const TSelectRowsRequest& request,
+        const TSelectRowsQuery& query,
         NTransactionClient::TTimestamp timestamp) override
     {
         auto* tableDescriptor = ITableDescriptor::Get(table);
         TQueryBuilder builder;
         builder.SetSource(GetSequoiaTablePath(NativeRootClient_, tableDescriptor));
         builder.AddSelectExpression("*");
-        for (const auto& whereConjunct : request.Where) {
+        for (const auto& whereConjunct : query.WhereConjuncts) {
             builder.AddWhereConjunct(whereConjunct);
         }
-        for (const auto& orderByExpression : request.OrderBy) {
+        for (const auto& orderByExpression : query.OrderBy) {
             builder.AddOrderByExpression(orderByExpression);
         }
-        auto limit = request.Limit;
+        auto limit = query.Limit;
         if (limit) {
             builder.SetLimit(*limit);
-        } else if (!request.OrderBy.empty()) {
+        } else if (!query.OrderBy.empty()) {
             // TODO(h0pless): This is an arbitrary value. Remove it once ORDER BY will work with an unspecified limit.
             // For details see YT-16489.
             builder.SetLimit(100'000);
@@ -84,9 +84,15 @@ public:
     }
 
     TFuture<ISequoiaTransactionPtr> StartTransaction(
-        const NApi::TTransactionStartOptions& options) override
+        const NApi::TTransactionStartOptions& options,
+        const TSequoiaTransactionSequencingOptions& sequencingOptions) override
     {
-        return NDetail::StartSequoiaTransaction(this, NativeRootClient_, GroundRootClient_, options);
+        return NDetail::StartSequoiaTransaction(
+            this,
+            NativeRootClient_,
+            GroundRootClient_,
+            options,
+            sequencingOptions);
     }
 
     const TLogger& GetLogger() const override

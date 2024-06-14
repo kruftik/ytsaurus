@@ -7,15 +7,15 @@
 #include "chunk_replicator.h"
 #include "helpers.h"
 #include "chunk_owner_base.h"
-#include "domestic_medium.h"
 #include "dynamic_store.h"
 #include "chunk_owner_node_proxy.h"
 
 #include <yt/yt/server/master/cell_master/bootstrap.h>
-#include <yt/yt/server/master/cell_master/config.h>
 #include <yt/yt/server/master/cell_master/config_manager.h>
+#include <yt/yt/server/master/cell_master/config.h>
 #include <yt/yt/server/master/cell_master/hydra_facade.h>
 #include <yt/yt/server/master/cell_master/master_hydra_service.h>
+#include <yt/yt/server/master/cell_master/multi_phase_cell_sync_session.h>
 #include <yt/yt/server/master/cell_master/multicell_manager.h>
 
 #include <yt/yt/server/master/sequoia_server/config.h>
@@ -59,6 +59,7 @@ using namespace NSecurityServer;
 using namespace NCellMaster;
 using namespace NHydra;
 using namespace NTransactionClient;
+using namespace NTransactionServer;
 using namespace NRpc;
 using namespace NDataNodeTrackerClient;
 
@@ -76,7 +77,7 @@ public:
             bootstrap,
             TChunkServiceProxy::GetDescriptor(),
             EAutomatonThreadQueue::ChunkService,
-            ChunkServerLogger)
+            ChunkServerLogger())
         , ReconfigurationCallback_(CreateReconfigurationCallback(bootstrap))
         , CreateChunkRequestQueueProvider_(New<TPerUserRequestQueueProvider>(
             ReconfigurationCallback_,
@@ -150,6 +151,8 @@ private:
     TPerUserRequestQueueProviderPtr CreateChunkRequestQueueProvider_;
     TPerUserRequestQueueProviderPtr ExecuteBatchRequestQueueProvider_;
 
+    std::atomic<bool> EnableCypressTransactionsInSequoia_;
+
     static TPerUserRequestQueueProvider::TReconfigurationCallback CreateReconfigurationCallback(TBootstrap* bootstrap)
     {
         return [=] (TString userName, TRequestQueuePtr queue) {
@@ -168,6 +171,10 @@ private:
                 if (!user) {
                     return;
                 }
+
+                user->AlertIfPendingRemoval(
+                    Format("User pending for removal has accessed chunk service (User: %v)",
+                    user->GetName()));
 
                 const auto& chunkServiceConfig = bootstrap->GetConfigManager()->GetConfig()->ChunkService;
 
@@ -204,9 +211,28 @@ private:
         return Bootstrap_->GetConfigManager()->GetConfig()->ChunkService;
     }
 
+    void UpdateTransactionMirroringToSequoia()
+    {
+        VERIFY_THREAD_AFFINITY(AutomatonThread);
+
+        const auto& newConfig = Bootstrap_->GetConfigManager()->GetConfig()->SequoiaManager;
+        EnableCypressTransactionsInSequoia_.store(
+            newConfig->Enable && newConfig->EnableCypressTransactionsInSequoia,
+            std::memory_order::release);
+    }
+
+    bool GetEnableCypressTransactionsInSequoia() const noexcept
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return EnableCypressTransactionsInSequoia_.load(std::memory_order::acquire);
+    }
+
     void OnDynamicConfigChanged(TDynamicClusterConfigPtr oldClusterConfig)
     {
         VERIFY_THREAD_AFFINITY(AutomatonThread);
+
+        UpdateTransactionMirroringToSequoia();
 
         const auto& config = GetDynamicConfig();
 
@@ -408,6 +434,7 @@ private:
                         .ValueOrThrow();
 
                     BuildChunkSpec(
+                        Bootstrap_,
                         chunk,
                         replicas,
                         rowIndex,
@@ -419,7 +446,6 @@ private:
                         request->fetch_all_meta_extensions(),
                         extensionTags,
                         &nodeDirectoryBuilder,
-                        Bootstrap_,
                         spec);
 
 
@@ -636,7 +662,21 @@ private:
 
         ValidateClusterInitialized();
         ValidatePeer(EPeerKind::Leader);
-        SyncWithTransactionCoordinatorCell(context, transactionId);
+
+        TCellTagList cellTagsToSyncWith;
+        cellTagsToSyncWith.push_back(CellTagFromId(transactionId));
+
+        // Syncing with native chunk cells to ensure chunk schema has been received.
+        for (const auto& chunk : request->chunks()) {
+            auto chunkId = FromProto<TChunkId>(chunk.id());
+            cellTagsToSyncWith.push_back(CellTagFromId(chunkId));
+        }
+
+        SortUnique(cellTagsToSyncWith);
+
+        auto syncSession = New<TMultiPhaseCellSyncSession>(Bootstrap_, context->GetRequestId());
+        WaitFor(syncSession->Sync(cellTagsToSyncWith))
+            .ThrowOnError();
 
         const auto& chunkManager = Bootstrap_->GetChunkManager();
         auto mutation = chunkManager->CreateImportChunksMutation(context);
@@ -732,14 +772,14 @@ private:
         // just the Object Service ones), then enable boomerangs here.
         const auto enableMutationBoomerangs = false;
 
-        auto preparationFuture = NTransactionServer::RunTransactionReplicationSession(
+        NTransactionServer::RunTransactionReplicationSessionAndReply(
             !suppressUpstreamSync,
             Bootstrap_,
             std::move(transactionIds),
             context,
             chunkManager->CreateExecuteBatchMutation(context),
-            enableMutationBoomerangs);
-        YT_VERIFY(preparationFuture);
+            enableMutationBoomerangs,
+            GetEnableCypressTransactionsInSequoia());
     }
 
     DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, AttachChunkTrees)
@@ -761,14 +801,15 @@ private:
         // TODO(shakurov): use mutation idempotizer for all mutations (not
         // just the Object Service ones), then enable boomerangs here.
         const auto enableMutationBoomerangs = false;
-        auto preparationFuture = NTransactionServer::RunTransactionReplicationSession(
+
+        NTransactionServer::RunTransactionReplicationSessionAndReply(
             !suppressUpstreamSync,
             Bootstrap_,
             {transactionId},
             context,
             chunkManager->CreateAttachChunkTreesMutation(context),
-            enableMutationBoomerangs);
-        YT_VERIFY(preparationFuture);
+            enableMutationBoomerangs,
+            GetEnableCypressTransactionsInSequoia());
     }
 
     DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, UnstageChunkTree)
@@ -806,21 +847,22 @@ private:
         // TODO(shakurov): use mutation idempotizer for all mutations (not
         // just the Object Service ones), then enable boomerangs here.
         const auto enableMutationBoomerangs = false;
-        auto preparationFuture = NTransactionServer::RunTransactionReplicationSession(
+
+        NTransactionServer::RunTransactionReplicationSessionAndReply(
             !suppressUpstreamSync,
             Bootstrap_,
             {transactionId},
             context,
             chunkManager->CreateCreateChunkListsMutation(context),
-            enableMutationBoomerangs);
-        YT_VERIFY(preparationFuture);
+            enableMutationBoomerangs,
+            GetEnableCypressTransactionsInSequoia());
     }
 
     DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, SealChunk)
     {
         auto chunkId = FromProto<TChunkId>(request->chunk_id());
         context->SetRequestInfo(
-            "ChunkId: %v, ",
+            "ChunkId: %v",
             chunkId);
 
         ValidateClusterInitialized();
@@ -836,7 +878,7 @@ private:
     {
         auto transactionId = FromProto<TTransactionId>(request->transaction_id());
         context->SetRequestInfo(
-            "TransactionId: %v, ",
+            "TransactionId: %v",
             transactionId);
 
         ValidateClusterInitialized();
@@ -856,21 +898,21 @@ private:
         // just the Object Service ones), then enable boomerangs here.
         const auto enableMutationBoomerangs = false;
 
-        auto preparationFuture = NTransactionServer::RunTransactionReplicationSession(
+        NTransactionServer::RunTransactionReplicationSessionAndReply(
             !suppressUpstreamSync,
             Bootstrap_,
             {transactionId},
             context,
             chunkManager->CreateCreateChunkMutation(context),
-            enableMutationBoomerangs);
-        YT_VERIFY(preparationFuture);
+            enableMutationBoomerangs,
+            GetEnableCypressTransactionsInSequoia());
     }
 
     DECLARE_RPC_SERVICE_METHOD(NChunkClient::NProto, ConfirmChunk)
     {
         auto chunkId = FromProto<TChunkId>(request->chunk_id());
         context->SetRequestInfo(
-            "ChunkId: %v, ",
+            "ChunkId: %v",
             chunkId);
 
         ValidateClusterInitialized();
@@ -891,20 +933,20 @@ private:
             context->Request().mutable_replicas()->Clear();
             context->Request().mutable_legacy_replicas()->Clear();
 
-            NProto::TReqAddConfirmReplicas addSequoiaReplicas;
-            ToProto(addSequoiaReplicas.mutable_chunk_id(), chunkId);
+            auto addSequoiaReplicas = std::make_unique<NProto::TReqAddConfirmReplicas>();
+            ToProto(addSequoiaReplicas->mutable_chunk_id(), chunkId);
 
             for (const auto& replica : allReplicas) {
                 auto locationUuid = FromProto<TChunkLocationUuid>(replica.location_uuid());
                 if (!chunkManager->IsSequoiaChunkReplica(chunkId, locationUuid)) {
                     *context->Request().add_replicas() = replica;
                 } else {
-                    *addSequoiaReplicas.add_replicas() = replica;
+                    *addSequoiaReplicas->add_replicas() = replica;
                 }
             }
 
-            if (addSequoiaReplicas.replicas_size() > 0) {
-                WaitFor(chunkManager->AddSequoiaConfirmReplicas(addSequoiaReplicas))
+            if (addSequoiaReplicas->replicas_size() > 0) {
+                WaitFor(chunkManager->AddSequoiaConfirmReplicas(std::move(addSequoiaReplicas)))
                     .ThrowOnError();
             }
         }
@@ -921,7 +963,7 @@ private:
 
         auto cellTag = CellTagFromId(transactionId);
         auto cellId = multicellManager->GetCellId(cellTag);
-        auto syncFuture = hiveManager->SyncWith(cellId, true);
+        auto syncFuture = hiveManager->SyncWith(cellId, /*enableBatching*/ true);
 
         YT_LOG_DEBUG("Request will synchronize with another cell (RequestId: %v, CellTag: %v)",
             context->GetRequestId(),

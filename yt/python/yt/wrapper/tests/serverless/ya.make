@@ -1,4 +1,4 @@
-PY23_TEST()
+PY3TEST()
 
 INCLUDE(${ARCADIA_ROOT}/yt/opensource.inc)
 
@@ -34,8 +34,11 @@ TEST_SRCS(
     test_formats.py
     test_schema.py
     test_thread_pool.py
+    test_typed.py
 )
 
 END()
 
-RECURSE(py3_only)
+RECURSE(
+    py23_fork
+)

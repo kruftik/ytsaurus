@@ -1,6 +1,5 @@
 #pragma once
 
-#include "operation_controller_detail.h"
 #include "private.h"
 
 #include "data_flow_graph.h"
@@ -40,6 +39,18 @@ struct TJobNodeDescriptor
 
 ////////////////////////////////////////////////////////////////////////////////
 
+struct TAllocation
+{
+    TAllocationId Id;
+
+    TJobletPtr Joblet;
+    TJobId LastJobId;
+
+    void Persist(const TPersistenceContext& context);
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct TJoblet
     : public TRefCounted
 {
@@ -55,6 +66,8 @@ struct TJoblet
     TInstant LastUpdateTime;
     TInstant LastStatisticsUpdateTime;
     TInstant NodeJobStartTime;
+
+    std::optional<TDuration> WaitingForResourcesDuration;
 
     // There are no joblets for finished jobs, JobState may not contain finished states.
     std::optional<EJobState> JobState;

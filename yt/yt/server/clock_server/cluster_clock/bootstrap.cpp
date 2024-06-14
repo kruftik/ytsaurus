@@ -78,7 +78,7 @@ using namespace NObjectClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static inline const NLogging::TLogger Logger("Bootstrap");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, Logger, "Bootstrap");
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -86,7 +86,7 @@ TBootstrap::TBootstrap(TClusterClockConfigPtr config, INodePtr configNode)
     : Config_(std::move(config))
     , ConfigNode_(std::move(configNode))
 {
-    WarnForUnrecognizedOptions(Logger, Config_);
+    WarnForUnrecognizedOptions(Logger(), Config_);
 }
 
 TBootstrap::~TBootstrap() = default;
@@ -245,7 +245,8 @@ void TBootstrap::DoInitialize()
         HydraFacade_->GetHydraManager(),
         HydraFacade_->GetAutomaton(),
         GetCellTag(),
-        /*authenticator*/ nullptr);
+        /*authenticator*/ nullptr,
+        Config_->ClockClusterTag);
 
     RpcServer_->RegisterService(timestampManager->GetRpcService()); // null realm
     RpcServer_->RegisterService(CreateAdminService(
@@ -277,10 +278,12 @@ void TBootstrap::DoRun()
         "/election",
         HydraFacade_->GetElectionManager()->GetMonitoringProducer());
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+    }
     SetBuildAttributes(
         orchidRoot,
         "clock");

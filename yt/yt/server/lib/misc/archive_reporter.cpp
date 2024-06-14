@@ -79,7 +79,7 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const TLogger ArchiveReporterLogger("ArchiveReporter");
+YT_DEFINE_GLOBAL(const NLogging::TLogger, ArchiveReporterLogger, "ArchiveReporter");
 static constexpr int QueueIsTooLargeMultiplier = 2;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -115,7 +115,7 @@ public:
         NNative::IClientPtr client,
         IInvokerPtr invoker,
         const TProfiler& profiler)
-        : Logger(NYT::NDetail::ArchiveReporterLogger.WithTag("ReporterName: %v", std::move(reporterName)))
+        : Logger(NYT::NDetail::ArchiveReporterLogger().WithTag("ReporterName: %v", std::move(reporterName)))
         , ReporterConfig_(std::move(reporterConfig))
         , HandlerConfig_(std::move(handlerConfig))
         , NameTable_(std::move(nameTable))
@@ -147,7 +147,7 @@ public:
         Batcher_->UpdateSettings(
             newReporterConfig->ReportingPeriod,
             TBatchSizeLimiter(newReporterConfig->MaxItemsInBatch),
-            /*allowEmptyBatches=*/false);
+            /*allowEmptyBatches*/ false);
         SetEnabled(newReporterConfig->Enabled);
 
         ReporterConfig_.Store(newReporterConfig);

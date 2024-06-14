@@ -50,6 +50,22 @@ EAbortReason GetAbortReason(const TError& resultError, const TLogger& Logger)
 
 } // namespace
 
+// TODO(pogorelov): Move TTimeStatistics to NControllerAgent.
+static void Persist(const TPersistenceContext& context, NJobAgent::TTimeStatistics& timeStatistics)
+{
+    using NYT::Persist;
+
+    Persist(context, timeStatistics.PrepareDuration);
+    Persist(context, timeStatistics.ArtifactsDownloadDuration);
+    Persist(context, timeStatistics.PrepareRootFSDuration);
+    Persist(context, timeStatistics.ExecDuration);
+    Persist(context, timeStatistics.GpuCheckDuration);
+
+    if (context.GetVersion() >= ESnapshotVersion::WaitingForResourcesDuration) {
+        Persist(context, timeStatistics.WaitingForResourcesDuration);
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 TJobSummary::TJobSummary(TJobId id, EJobState state)
@@ -116,13 +132,6 @@ void TJobSummary::Persist(const TPersistenceContext& context)
     Persist(context, Id);
     Persist(context, State);
     Persist(context, FinishTime);
-    if (context.GetVersion() < ESnapshotVersion::DoNotPersistStatistics) {
-        std::optional<TStatistics> dummyStatistics;
-        Persist(context, dummyStatistics);
-
-        TYsonString dummyYson;
-        Persist(context, dummyYson);
-    }
     Persist(context, ReleaseFlags);
     Persist(context, Phase);
     Persist(context, TimeStatistics);
@@ -230,7 +239,6 @@ std::unique_ptr<TCompletedJobSummary> CreateAbandonedJobSummary(TJobId jobId)
 TAbortedJobSummary::TAbortedJobSummary(TJobId id, EAbortReason abortReason)
     : TJobSummary(id, EJobState::Aborted)
     , AbortReason(abortReason)
-    , AbortInitiator(EJobAbortInitiator::ControllerAgent)
 {
     FinishTime = TInstant::Now();
 }
@@ -238,7 +246,6 @@ TAbortedJobSummary::TAbortedJobSummary(TJobId id, EAbortReason abortReason)
 TAbortedJobSummary::TAbortedJobSummary(const TJobSummary& other, EAbortReason abortReason)
     : TJobSummary(other)
     , AbortReason(abortReason)
-    , AbortInitiator(EJobAbortInitiator::ControllerAgent)
 {
     State = EJobState::Aborted;
     FinishTime = TInstant::Now();
@@ -264,13 +271,12 @@ std::unique_ptr<TAbortedJobSummary> CreateAbortedJobSummary(
 {
     TAbortedJobSummary summary{jobId, eventSummary.AbortReason};
 
-    summary.FinishTime = eventSummary.FinishTime;
+    summary.FinishTime = TInstant::Now();
 
     ToProto(summary.Result.emplace().mutable_error(), eventSummary.Error);
     summary.Error = std::move(eventSummary.Error);
 
     summary.Scheduled = eventSummary.Scheduled;
-    summary.AbortInitiator = EJobAbortInitiator::Scheduler;
 
     return std::make_unique<TAbortedJobSummary>(std::move(summary));
 }
@@ -316,7 +322,7 @@ void ToProto(
 
 void FromProto(
     TAbortedAllocationSummary* abortedAllocationSummary,
-    NScheduler::NProto::TSchedulerToAgentAbortedAllocationEvent* protoEvent)
+    const NScheduler::NProto::TSchedulerToAgentAbortedAllocationEvent* protoEvent)
 {
     abortedAllocationSummary->OperationId = FromProto<TOperationId>(protoEvent->operation_id());
     abortedAllocationSummary->Id = FromProto<TAllocationId>(protoEvent->allocation_id());
@@ -326,6 +332,91 @@ void FromProto(
 
     abortedAllocationSummary->Error = FromProto<TError>(protoEvent->error());
     abortedAllocationSummary->Scheduled = protoEvent->scheduled();
+}
+
+void FormatValue(
+    TStringBuilderBase* builder,
+    const TAbortedAllocationSummary& abortedAllocationSummary,
+    TStringBuf /*spec*/)
+{
+    builder->AppendFormat(
+        "{AllocationEventType: AllocationAborted, Id: %v, AbortReason: %v, AbortionError: %v}",
+        abortedAllocationSummary.Id,
+        abortedAllocationSummary.AbortReason,
+        abortedAllocationSummary.Error);
+}
+
+void ToProto(
+    NScheduler::NProto::TSchedulerToAgentFinishedAllocationEvent* protoEvent,
+    const TFinishedAllocationSummary& summary)
+{
+    ToProto(protoEvent->mutable_operation_id(), summary.OperationId);
+    ToProto(protoEvent->mutable_allocation_id(), summary.Id);
+
+    protoEvent->set_finish_time(ToProto<ui64>(summary.FinishTime));
+}
+
+void FromProto(
+    TFinishedAllocationSummary* summary,
+    const NScheduler::NProto::TSchedulerToAgentFinishedAllocationEvent* protoEvent)
+{
+    summary->OperationId = FromProto<TOperationId>(protoEvent->operation_id());
+    summary->Id = FromProto<TAllocationId>(protoEvent->allocation_id());
+
+    summary->FinishTime = FromProto<TInstant>(protoEvent->finish_time());
+}
+
+void FormatValue(
+    TStringBuilderBase* builder,
+    const TFinishedAllocationSummary& finishedAllocationSummary,
+    TStringBuf /*spec*/)
+{
+    builder->AppendFormat(
+        "{AllocationEventType: AllocationFinished, Id: %v}",
+        finishedAllocationSummary.Id);
+}
+
+void ToProto(
+    NScheduler::NProto::TSchedulerToAgentAllocationEvent* protoEvent,
+    const TSchedulerToAgentAllocationEvent& event)
+{
+    Visit(
+        event.EventSummary,
+        [&] (const TAbortedAllocationSummary& summary) {
+            ToProto(protoEvent->mutable_aborted(), summary);
+        },
+        [&] (const TFinishedAllocationSummary& summary) {
+            ToProto(protoEvent->mutable_finished(), summary);
+        });
+}
+
+void FromProto(
+    TSchedulerToAgentAllocationEvent* event,
+    const NScheduler::NProto::TSchedulerToAgentAllocationEvent* protoEvent)
+{
+    using TProtoMessage = NScheduler::NProto::TSchedulerToAgentAllocationEvent;
+    switch (protoEvent->allocation_event_case()) {
+        case TProtoMessage::kAborted:
+            FromProto(&event->EventSummary.emplace<TAbortedAllocationSummary>(), &protoEvent->aborted());
+            break;
+        case TProtoMessage::kFinished:
+            FromProto(&event->EventSummary.emplace<TFinishedAllocationSummary>(), &protoEvent->finished());
+            break;
+        default:
+            YT_ABORT();
+    }
+}
+
+void FormatValue(
+    TStringBuilderBase* builder,
+    const TSchedulerToAgentAllocationEvent& allocationEvent,
+    TStringBuf /*spec*/)
+{
+    std::visit(
+        [&] (const auto& event) {
+            FormatValue(builder, event, "");
+        },
+        allocationEvent.EventSummary);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

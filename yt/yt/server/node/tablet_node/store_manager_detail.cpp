@@ -54,7 +54,7 @@ TStoreManagerBase::TStoreManagerBase(
     , InMemoryManager_(std::move(inMemoryManager))
     , Client_(std::move(client))
     , StructuredLogger_(tablet->GetStructuredLogger())
-    , Logger(TabletNodeLogger)
+    , Logger(TabletNodeLogger())
 {
     YT_VERIFY(StructuredLogger_);
 
@@ -504,7 +504,7 @@ void TStoreManagerBase::Remount(const TTableSettings& settings)
     UpdateInMemoryMode();
 }
 
-void TStoreManagerBase::Rotate(bool createNewStore, EStoreRotationReason reason)
+void TStoreManagerBase::Rotate(bool createNewStore, EStoreRotationReason reason, bool allowEmptyStore)
 {
     RotationScheduled_ = false;
     if (reason != EStoreRotationReason::Periodic) {
@@ -515,7 +515,7 @@ void TStoreManagerBase::Rotate(bool createNewStore, EStoreRotationReason reason)
 
     if (activeStore) {
         if (createNewStore && activeStore->GetRowCount() == 0 && reason != EStoreRotationReason::Discard) {
-            YT_LOG_ALERT("Empty dynamic store rotated (StoreId: %v, Reason: %v)",
+            YT_LOG_ALERT_UNLESS(allowEmptyStore, "Empty dynamic store rotated (StoreId: %v, Reason: %v)",
                 activeStore->GetId(),
                 reason);
         }
@@ -526,11 +526,13 @@ void TStoreManagerBase::Rotate(bool createNewStore, EStoreRotationReason reason)
 
         StructuredLogger_->OnStoreStateChanged(activeStore);
 
-        YT_LOG_INFO("Rotating store (StoreId: %v, DynamicMemoryUsage: %v, RowCount: %v, Reason: %v)",
+        YT_LOG_INFO("Rotating store (StoreId: %v, Reason: %v, DynamicMemoryUsage: %v, RowCount: %v, TimestampCount: %v, AllowEmptyStore: %v)",
             activeStore->GetId(),
+            reason,
             activeStore->GetDynamicMemoryUsage(),
             activeStore->GetRowCount(),
-            reason);
+            activeStore->GetTimestampCount(),
+            allowEmptyStore);
 
         if (activeStore->GetLockCount() > 0) {
             YT_LOG_INFO("Active store is locked and will be kept (StoreId: %v, LockCount: %v)",
@@ -538,7 +540,7 @@ void TStoreManagerBase::Rotate(bool createNewStore, EStoreRotationReason reason)
                 activeStore->GetLockCount());
             YT_VERIFY(LockedStores_.insert(IStorePtr(activeStore)).second);
         } else {
-            YT_LOG_INFO("Active store is not locked and will be dropped (StoreId: %v)",
+            YT_LOG_INFO("Active store is not locked and will be dropped (StoreId: %v, LockCount: %v)",
                 activeStore->GetId(),
                 activeStore->GetLockCount());
         }

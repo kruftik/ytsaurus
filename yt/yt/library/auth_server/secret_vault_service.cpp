@@ -13,15 +13,10 @@ void FormatValue(
         subrequest.SecretId,
         subrequest.SecretVersion,
         subrequest.DelegationToken,
-        subrequest.Signature);
-}
-
-TString ToString(const ISecretVaultService::TSecretSubrequest& subrequest)
-{
-    return ToStringViaBuilder(subrequest);
+        subrequest.Signature,
+        subrequest.TvmId);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 } // namespace NYT::NAuth
-

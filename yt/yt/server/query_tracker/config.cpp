@@ -58,6 +58,8 @@ void TSpytEngineConfig::Register(TRegistrar registrar)
         .Default();
     registrar.Parameter("default_discovery_path", &TThis::DefaultDiscoveryPath)
         .Default();
+    registrar.Parameter("default_discovery_group", &TThis::DefaultDiscoveryGroup)
+        .Default("spyt_public");
     registrar.Parameter("spyt_home", &TThis::SpytHome)
         .Default("//home/spark");
     registrar.Parameter("http_client", &TThis::HttpClient)
@@ -68,6 +70,18 @@ void TSpytEngineConfig::Register(TRegistrar registrar)
         .Default(TDuration::Minutes(20));
     registrar.Parameter("refresh_token_period", &TThis::RefreshTokenPeriod)
         .Default(TDuration::Minutes(10));
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void TQueryTrackerProxyConfig::Register(TRegistrar registrar)
+{
+    registrar.Parameter("max_query_file_count", &TThis::MaxQueryFileCount)
+        .Default(8192);
+    registrar.Parameter("max_query_file_name_size_bytes", &TThis::MaxQueryFileNameSizeBytes)
+        .Default(1_KB);
+    registrar.Parameter("max_query_file_content_size_bytes", &TThis::MaxQueryFileContentSizeBytes)
+        .Default(2_KB);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -92,6 +106,8 @@ void TQueryTrackerDynamicConfig::Register(TRegistrar registrar)
         .DefaultNew();
     registrar.Parameter("mock_engine", &TThis::MockEngine)
         .DefaultNew();
+    registrar.Parameter("proxy_config", &TThis::ProxyConfig)
+        .DefaultNew();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -99,9 +115,11 @@ void TQueryTrackerDynamicConfig::Register(TRegistrar registrar)
 void TQueryTrackerServerConfig::Register(TRegistrar registrar)
 {
     registrar.Parameter("min_required_state_version", &TThis::MinRequiredStateVersion)
-        .Default(7);
+        .Default(8);
     registrar.Parameter("abort_on_unrecognized_options", &TThis::AbortOnUnrecognizedOptions)
         .Default(false);
+    registrar.Parameter("proxy_thread_pool_size", &TThis::ProxyThreadPoolSize)
+        .Default(4);
     registrar.Parameter("user", &TThis::User);
     registrar.Parameter("cypress_annotations", &TThis::CypressAnnotations)
         .Default(NYTree::BuildYsonNodeFluently()

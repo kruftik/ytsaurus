@@ -80,7 +80,7 @@ using NNodeTrackerClient::GetDefaultAddress;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ControllerAgentLogger;
+static constexpr auto& Logger = ControllerAgentLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -369,7 +369,7 @@ private:
             BIND([] (const TOperationNodeUpdate*) { return false; }),
             BIND(&TImpl::OnOperationUpdateFailed, Unretained(this)),
             Config_->OperationsUpdatePeriod,
-            Logger);
+            Logger());
         OperationNodesAndArchiveUpdateExecutor_->Start();
 
         YT_VERIFY(!TransactionRefreshExecutor_);
@@ -1409,7 +1409,7 @@ private:
             }
 
             SetControllerAgentAlert(EControllerAgentAlertType::UpdateConfig, TError());
-            auto incrementRevision = Finally([this]() {
+            auto incrementRevision = Finally([this] {
                 ++ConfigRevision_;
             });
 

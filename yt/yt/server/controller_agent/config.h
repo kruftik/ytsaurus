@@ -717,6 +717,7 @@ public:
     TDuration DurationBeforeJobConsideredDisappearedFromNode;
 
     bool EnableGracefulAbort;
+    bool CheckNodeHeartbeatSequenceNumber;
 
     REGISTER_YSON_STRUCT(TJobTrackerConfig);
 
@@ -853,6 +854,9 @@ public:
 
     //! Number of threads for hosting controllers' invokers.
     int ControllerThreadCount;
+
+    //! Number of thread for hosting chunk scrapers' invokers.
+    int ChunkScraperThreadCount;
 
     //! Number of threads for running job spec build callbacks.
     int JobSpecBuildThreadCount;
@@ -1030,9 +1034,6 @@ public:
     //! not exceeding this threshold no throttling is done.
     int HeavyJobSpecSliceCountThreshold;
 
-    //! If job is not settled after this timeout it would be considered as aborted.
-    TDuration JobSettlementTimeout;
-
     //! We use the same config for input chunk scraper and intermediate chunk scraper.
     TIntermediateChunkScraperConfigPtr ChunkScraper;
 
@@ -1195,6 +1196,8 @@ public:
 
     //! How many initial successive job aborts are needed to fail operation.
     THashMap<EAbortReason, int> MaxJobAbortsUntilOperationFailure;
+
+    bool JobIdUnequalToAllocationId;
 
     REGISTER_YSON_STRUCT(TControllerAgentConfig);
 

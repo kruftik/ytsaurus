@@ -91,7 +91,7 @@ class YtClient(ClientState):
             self,
             timeout=None, deadline=None, attributes=None, ping=None, interrupt_on_failed=True,
             transaction_id=None, ping_ancestor_transactions=None, type='master', acquire=None, ping_period=None,
-            ping_timeout=None):
+            ping_timeout=None, prerequisite_transaction_ids=None):
         """
 
         It is designed to be used by with_statement::
@@ -116,7 +116,7 @@ class YtClient(ClientState):
             client=self,
             timeout=timeout, deadline=deadline, attributes=attributes, ping=ping, interrupt_on_failed=interrupt_on_failed,
             transaction_id=transaction_id, ping_ancestor_transactions=ping_ancestor_transactions, type=type,
-            acquire=acquire, ping_period=ping_period, ping_timeout=ping_timeout)
+            acquire=acquire, ping_period=ping_period, ping_timeout=ping_timeout, prerequisite_transaction_ids=prerequisite_transaction_ids)
 
     def abort_job(
             self,
@@ -250,6 +250,28 @@ class YtClient(ClientState):
             client=self,
             client_side=client_side)
 
+    def alter_query(
+            self,
+            query_id,
+            stage=None, annotations=None, access_control_objects=None):
+        """
+        Alter query.
+
+        :param query_id: id of a query to get
+        :type query_id: str
+        :param stage: query tracker stage, defaults to "production"
+        :type stage: str
+        :param annotations: a dictionary of annotations
+        :type stage: dict or None
+        :param access_control_objects: list access control object names
+        :type access_control_objects: list or None
+
+        """
+        return client_api.alter_query(
+            query_id,
+            client=self,
+            stage=stage, annotations=annotations, access_control_objects=access_control_objects)
+
     def alter_replication_card(
             self,
             replication_card_id,
@@ -297,19 +319,20 @@ class YtClient(ClientState):
     def alter_table_replica(
             self,
             replica_id,
-            enabled=None, mode=None):
+            enabled=None, mode=None, enable_replicated_table_tracker=None):
         """
-        Changes mode and enables or disables a table replica.
+        Changes mode and enables or disables a table replica or replicated table tracker for table replica.
 
         :param str replica_id: replica id.
         :param bool enabled: enable or disable the replica.
         :param str mode: switch the replica to sync or async mode.
+        :param bool enable_replicated_table_tracker: enable or disable replicated table tracker.
 
         """
         return client_api.alter_table_replica(
             replica_id,
             client=self,
-            enabled=enabled, mode=mode)
+            enabled=enabled, mode=mode, enable_replicated_table_tracker=enable_replicated_table_tracker)
 
     def balance_tablet_cells(
             self,
@@ -642,13 +665,12 @@ class YtClient(ClientState):
             self,
             table, output_file):
         """
-        Dump parquet into a file from table with a strict schema
-        `parquet doc <https://parquet.apache.org/docs>`_
+        Dump table with a strict schema as `Parquet <https://parquet.apache.org/docs>` file
 
         :param table: table
         :type table: str or :class:`TablePath <yt.wrapper.ypath.TablePath>`
         :param output_file: path to output file
-        :type path: str
+        :type output_file: str
 
         """
         return client_api.dump_parquet(
@@ -1665,6 +1687,39 @@ class YtClient(ClientState):
             max_row_count=max_row_count, max_data_weight=max_data_weight, replica_consistency=replica_consistency,
             format=format, raw=raw)
 
+    def pull_queue_consumer(
+            self,
+            consumer_path, queue_path, offset, partition_index,
+            max_row_count=None, max_data_weight=None, replica_consistency=None, format=None, raw=None):
+        """
+        Reads rows from a single partition of a queue (i.e. any ordered dynamic table) with authorization via consumer.
+        Returns at most max_row_count consecutive rows of a single tablet with row indexes larger than the given offset.
+
+        :param consumer_path: path to consumer table.
+        :type consumer_path: str or :class:`TablePath <yt.wrapper.ypath.TablePath>`
+        :param queue_path: path to queue table.
+        :type queue_path: str or :class:`TablePath <yt.wrapper.ypath.TablePath>`
+        :param offset: starting row index.
+        :type offset: int
+        :param partition_index: index of tablet to read from.
+        :type partition_index: int
+        :param max_row_count: maximum number of rows to read.
+        :type max_row_count: int
+        :param max_data_weight: a hint for the maximum data weight of the returned batch in bytes.
+        :type max_data_weight: int
+        :param replica_consistency: requested read consistency for chaos replicas.
+        :type replica_consistency: EReplicaConsistency
+        :param format: output format.
+        :type format: str or descendant of :class:`Format <yt.wrapper.format.Format>`
+        :param bool raw: don't parse response to rows.
+
+        """
+        return client_api.pull_queue_consumer(
+            consumer_path, queue_path, offset, partition_index,
+            client=self,
+            max_row_count=max_row_count, max_data_weight=max_data_weight, replica_consistency=replica_consistency,
+            format=format, raw=raw)
+
     def put_file_to_cache(
             self,
             path, md5,
@@ -2593,7 +2648,8 @@ class YtClient(ClientState):
     def start_query(
             self,
             engine, query,
-            settings=None, files=None, stage=None, annotations=None, access_control_object=None):
+            settings=None, files=None, stage=None, annotations=None, access_control_object=None,
+            access_control_objects=None):
         """
         Start query.
 
@@ -2611,44 +2667,15 @@ class YtClient(ClientState):
         :type stage: dict or None
         :param access_control_object: access control object name
         :type access_control_object: str or None
+        :param access_control_objects: list access control object names
+        :type access_control_objects: list or None
 
         """
         return client_api.start_query(
             engine, query,
             client=self,
-            settings=settings, files=files, stage=stage, annotations=annotations, access_control_object=access_control_object)
-
-    def start_spark_cluster(
-            self,
-            spark_worker_core_count, spark_worker_memory_limit, spark_worker_count,
-            spark_worker_timeout='5m', operation_alias=None, discovery_path=None, pool=None, spark_worker_tmpfs_limit='150G',
-            spark_master_memory_limit='2G', spark_history_server_memory_limit='8G', dynamic_config_path='//sys/spark/bin/releases/spark-launch-conf',
-            operation_spec=None):
-        """
-        Start Spark Standalone cluster in YT Vanilla Operation. See https://ytsaurus.tech/docs/en/user-guide/data-processing/spyt/overview
-        :param spark_worker_core_count: Number of cores that will be available on Spark worker
-        :param spark_worker_memory_limit: Amount of memory that will be available on Spark worker
-        :param spark_worker_count: Number of Spark workers
-        :param spark_worker_timeout: Worker timeout to wait master start
-        :param operation_alias: Alias for the underlying YT operation
-        :param discovery_path: Cypress path for discovery files and logs, the same path must be used in find_spark_cluster
-        :param pool: Pool for the underlying YT operation
-        :param spark_worker_tmpfs_limit: Limit of tmpfs usage per Spark worker
-        :param spark_master_memory_limit: Memory limit on Spark master
-        :param spark_history_server_memory_limit: Memory limit on Spark History Server
-        :param dynamic_config_path: YT path of dynamic config
-        :param operation_spec: YT Vanilla Operation spec
-        :param client: YtClient
-        :return: running YT Vanilla Operation with Spark Standalone
-
-        """
-        return client_api.start_spark_cluster(
-            spark_worker_core_count, spark_worker_memory_limit, spark_worker_count,
-            client=self,
-            spark_worker_timeout=spark_worker_timeout, operation_alias=operation_alias, discovery_path=discovery_path,
-            pool=pool, spark_worker_tmpfs_limit=spark_worker_tmpfs_limit, spark_master_memory_limit=spark_master_memory_limit,
-            spark_history_server_memory_limit=spark_history_server_memory_limit, dynamic_config_path=dynamic_config_path,
-            operation_spec=operation_spec)
+            settings=settings, files=files, stage=stage, annotations=annotations, access_control_object=access_control_object,
+            access_control_objects=access_control_objects)
 
     def start_transaction(
             self,
@@ -2865,13 +2892,12 @@ class YtClient(ClientState):
             self,
             table, input_file):
         """
-        Upload parquet from a file into a table that must be created with a strict schema
-        `parquet doc <https://parquet.apache.org/docs>`_
+        Upload `Parquet <https://parquet.apache.org/docs>` file as a table
 
         :param table: table
         :type table: str or :class:`TablePath <yt.wrapper.ypath.TablePath>`
         :param input_file: path to input file
-        :type path: str
+        :type input_file: str
 
         """
         return client_api.upload_parquet(

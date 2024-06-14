@@ -67,6 +67,14 @@ TKeyColumns GetSampleKeyColumns2()
     return keyColumns;
 }
 
+TKeyColumns GetSampleKeyColumns3()
+{
+    TKeyColumns keyColumns;
+    keyColumns.push_back("k");
+    keyColumns.push_back("any_key");
+    return keyColumns;
+}
+
 TTableSchemaPtr GetSampleTableSchema()
 {
     return New<TTableSchema>(std::vector{
@@ -81,6 +89,7 @@ TTableSchemaPtr GetSampleTableSchema()
         TColumnSchema("ki", EValueType::Int64),
         TColumnSchema("ku", EValueType::Uint64),
         TColumnSchema("kd", EValueType::Double),
+        TColumnSchema("any_key", EValueType::Any),
     });
 }
 
@@ -113,9 +122,9 @@ void ProfileForBothExecutionBackends(
     TCGVariables* variables,
     TJoinSubqueryProfiler joinProfiler)
 {
-    Profile(query, id, variables, joinProfiler, /*useCanonicalNullRelations*/ false, /*executionBackend*/ EExecutionBackend::Native)();
+    Profile(query, id, variables, joinProfiler, /*useCanonicalNullRelations*/ false, EExecutionBackend::Native)();
     if (EnableWebAssemblyInUnitTests()) {
-        Profile(query, id, variables, joinProfiler, /*useCanonicalNullRelations*/ false, /*executionBackend*/ EExecutionBackend::WebAssembly)();
+        Profile(query, id, variables, joinProfiler, /*useCanonicalNullRelations*/ false, EExecutionBackend::WebAssembly)();
     }
 }
 
@@ -125,9 +134,9 @@ void ProfileForBothExecutionBackends(
     llvm::FoldingSetNodeID* id,
     TCGVariables* variables)
 {
-    Profile(expr, schema, id, variables, /*useCanonicalNullRelations*/ false, /*executionBackend*/ EExecutionBackend::Native)();
+    Profile(expr, schema, id, variables, /*useCanonicalNullRelations*/ false, EExecutionBackend::Native)();
     if (EnableWebAssemblyInUnitTests()) {
-        Profile(expr, schema, id, variables, /*useCanonicalNullRelations*/ false, /*executionBackend*/ EExecutionBackend::WebAssembly)();
+        Profile(expr, schema, id, variables, /*useCanonicalNullRelations*/ false, EExecutionBackend::WebAssembly)();
     }
 }
 

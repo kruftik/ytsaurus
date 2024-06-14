@@ -105,8 +105,9 @@ public:
     void RequestJobGracefulAbort(TJobId jobId, EAbortReason reason) override;
     void UpdateRunningAllocationsStatistics(std::vector<TAgentToSchedulerRunningAllocationStatistics> runningAllocationStatisticsUpdates) override;
 
+    void RegisterAllocation(TStartedAllocationInfo allocationInfo) override;
     void RegisterJob(TStartedJobInfo jobInfo) override;
-    void ReviveJobs(std::vector<TStartedJobInfo> jobs) override;
+    void Revive(std::vector<TStartedAllocationInfo> allocations) override;
     void ReleaseJobs(std::vector<TJobToRelease> jobs) override;
     void AbortJob(
         TJobId jobId,
@@ -135,6 +136,7 @@ public:
     const NNodeTrackerClient::TNodeDirectoryPtr& GetNodeDirectory() override;
     const NChunkClient::TThrottlerManagerPtr& GetChunkLocationThrottlerManager() override;
     const IInvokerPtr& GetControllerThreadPoolInvoker() override;
+    const IInvokerPtr& GetChunkScraperThreadPoolInvoker() override;
     const IInvokerPtr& GetJobSpecBuildPoolInvoker() override;
     const IInvokerPtr& GetStatisticsOffloadInvoker() override;
     const IInvokerPtr& GetExecNodesUpdateInvoker() override;

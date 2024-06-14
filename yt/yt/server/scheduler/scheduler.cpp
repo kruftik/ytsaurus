@@ -116,7 +116,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SchedulerLogger;
+static constexpr auto& Logger = SchedulerLogger;
 
 static const TString UnknownTreeId = "<unknown>";
 
@@ -169,7 +169,7 @@ public:
         , OperationServiceResponseKeeper_(CreateResponseKeeper(
             Config_->OperationServiceResponseKeeper,
             GetControlInvoker(EControlQueue::UserRequest),
-            SchedulerLogger,
+            SchedulerLogger(),
             SchedulerProfiler))
         , NodeManager_(New<TNodeManager>(Config_, this, Bootstrap_))
         , ExperimentsAssigner_(Config_->Experiments)
@@ -317,6 +317,9 @@ public:
             .Counter("/metering/guarantees/record_count");
         GuaranteesMeteringUsageQuantityCounter_ = SchedulerProfiler
             .Counter("/metering/guarantees/usage_quantity");
+
+        TotalResourceLimitsProfiler_.Init(SchedulerProfiler.WithPrefix("/total_resource_limits"));
+        TotalResourceUsageProfiler_.Init(SchedulerProfiler.WithPrefix("/total_resource_usage"));
     }
 
     const NApi::NNative::IClientPtr& GetClient() const
@@ -421,7 +424,6 @@ public:
         return MasterConnector_.get();
     }
 
-
     void Disconnect(const TError& error) override
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
@@ -431,7 +433,7 @@ public:
 
     TInstant GetConnectionTime() const override
     {
-        VERIFY_THREAD_AFFINITY(ControlThread);
+        VERIFY_THREAD_AFFINITY_ANY();
 
         return MasterConnector_->GetConnectionTime();
     }
@@ -556,7 +558,7 @@ public:
                 permissions,
                 operation->GetRuntimeParameters()->Acl,
                 GetClient(),
-                Logger);
+                Logger());
         });
 
         return doValidateOperationAccess
@@ -1106,11 +1108,11 @@ public:
     // ISchedulerStrategyHost implementation
     TJobResources GetResourceLimits(const TSchedulingTagFilter& filter) const override
     {
-        VERIFY_THREAD_AFFINITY(ControlThread);
+        VERIFY_THREAD_AFFINITY_ANY();
 
         auto resourceLimits = NodeManager_->GetResourceLimits(filter);
 
-        {
+        if (!IsFairSharePreUpdateOffloadingEnabled()) {
             auto value = std::pair(GetCpuInstant(), resourceLimits);
             auto it = CachedResourceLimitsByTags_.find(filter);
             if (it == CachedResourceLimitsByTags_.end()) {
@@ -1125,7 +1127,7 @@ public:
 
     TJobResources GetResourceUsage(const TSchedulingTagFilter& filter) const override
     {
-        VERIFY_THREAD_AFFINITY(ControlThread);
+        VERIFY_THREAD_AFFINITY_ANY();
 
         return NodeManager_->GetResourceUsage(filter);
     }
@@ -1284,7 +1286,7 @@ public:
         MaybeDelay(operation->Spec()->TestingOperationOptions->DelayInsideMaterializeScheduler);
 
         {
-            auto error = Strategy_->OnOperationMaterialized(operation->GetId());
+            auto error = Strategy_->OnOperationMaterialized(operation->GetId(), operation->GetRevivedFromSnapshot());
             if (!error.IsOK()) {
                 OnOperationFailed(operation, error);
                 return;
@@ -1400,7 +1402,7 @@ public:
         auto buildCommonLogEventPart = [&] (const TString& schema, i64 usageQuantity, TInstant startTime, TInstant finishTime) {
             return NLogging::LogStructuredEventFluently(SchedulerResourceMeteringLogger, NLogging::ELogLevel::Info)
                 .Item("schema").Value(schema)
-                .Item("id").Value(Format("%v:%v:%v", key.TreeId, key.PoolId, (finishTime - TInstant()).Seconds()))
+                .Item("id").Value(TGuid::Create())
                 .DoIf(Config_->ResourceMetering->EnableNewAbcFormat, [&] (TFluentMap fluent) {
                     fluent
                         .Item("abc_id").Value(key.AbcId);
@@ -1814,6 +1816,8 @@ private:
 
     TExperimentAssigner ExperimentsAssigner_;
 
+    std::atomic<bool> EnableFairSharePreUpdateOffloading_ = true;
+
     DECLARE_THREAD_AFFINITY_SLOT(ControlThread);
 
     void InitOperationRuntimeParameters(
@@ -2061,8 +2065,8 @@ private:
 
         Strategy_->OnMasterConnected();
 
-        TotalResourceLimitsProfiler_.Init(SchedulerProfiler.WithPrefix("/total_resource_limits"));
-        TotalResourceUsageProfiler_.Init(SchedulerProfiler.WithPrefix("/total_resource_usage"));
+        TotalResourceLimitsProfiler_.Start();
+        TotalResourceUsageProfiler_.Start();
 
         SchedulerProfiler.AddFuncGauge("/jobs/registered_job_count", MakeStrong(this), [this] {
             return NodeManager_->GetActiveAllocationCount();
@@ -2088,8 +2092,8 @@ private:
 
     void DoCleanup()
     {
-        TotalResourceLimitsProfiler_.Reset();
-        TotalResourceUsageProfiler_.Reset();
+        TotalResourceLimitsProfiler_.Stop();
+        TotalResourceUsageProfiler_.Stop();
 
         {
             auto error = TError(EErrorCode::MasterDisconnected, "Master disconnected");
@@ -2369,6 +2373,7 @@ private:
             BackgroundThreadPool_->Configure(Config_->BackgroundThreadCount);
 
             ExperimentsAssigner_.UpdateExperimentConfigs(Config_->Experiments);
+            EnableFairSharePreUpdateOffloading_.store(Config_->EnableFairSharePreUpdateOffloading);
         }
 
         ++ConfigRevision_;
@@ -2521,25 +2526,6 @@ private:
                 OnOperationFailed(operation, error);
             }
         }
-    }
-
-    TRefCountedExecNodeDescriptorMapPtr CalculateExecNodeDescriptors(const TSchedulingTagFilter& filter) const override
-    {
-        VERIFY_THREAD_AFFINITY_ANY();
-
-        auto descriptors = GetCachedExecNodeDescriptors();
-
-        if (filter.IsEmpty()) {
-            return descriptors;
-        }
-
-        auto result = New<TRefCountedExecNodeDescriptorMap>();
-        for (const auto& [nodeId, descriptor] : *descriptors) {
-            if (filter.CanSchedule(descriptor->Tags)) {
-                EmplaceOrCrash(*result, descriptor->Id, descriptor);
-            }
-        }
-        return result;
     }
 
     TMemoryDistribution CalculateMemoryDistribution(const TSchedulingTagFilter& filter) const
@@ -3622,19 +3608,28 @@ private:
                     .Item("exec_node_count").Value(NodeManager_->GetExecNodeCount())
                     .Item("total_node_count").Value(NodeManager_->GetTotalNodeCount())
                     .Item("nodes_memory_distribution").Value(GetExecNodeMemoryDistribution(TSchedulingTagFilter()))
+                    // TODO(renadeen): we should move this map into tree orchid.
                     .Item("resource_limits_by_tags")
-                        .DoMapFor(CachedResourceLimitsByTags_, [] (TFluentMap fluent, const auto& pair) {
-                            const auto& [filter, record] = pair;
-                            if (!filter.IsEmpty()) {
-                                fluent.Item(filter.GetBooleanFormula().GetFormula()).Value(record.second);
+                        .Do([&] (TFluentAny fluent) {
+                            if (IsFairSharePreUpdateOffloadingEnabled()) {
+                                fluent.DoMapFor(Strategy_->GetResourceLimitsByTagFilter(), [] (TFluentMap fluent, const auto& pair) {
+                                    const auto& [filter, limits] = pair;
+                                    fluent.Item(filter.GetBooleanFormula().GetFormula()).Value(limits);
+                                });
+                            } else {
+                                fluent.DoMapFor(CachedResourceLimitsByTags_, [] (TFluentMap fluent, const auto& pair) {
+                                    const auto& [filter, record] = pair;
+                                    if (!filter.IsEmpty()) {
+                                        fluent.Item(filter.GetBooleanFormula().GetFormula()).Value(record.second);
+                                    }
+                                });
                             }
                         })
                     .Item("medium_directory").Value(
                         Bootstrap_
                         ->GetClient()
                         ->GetNativeConnection()
-                        ->GetMediumDirectory()
-                    )
+                        ->GetMediumDirectory())
                 .EndMap()
                 .Item("suspicious_jobs").BeginMap()
                     .Items(BuildSuspiciousJobsYson())
@@ -4005,6 +4000,11 @@ private:
     const THashMap<TString, TString>& GetUserDefaultParentPoolMap() const override
     {
         return UserToDefaultPoolMap_;
+    }
+
+    bool IsFairSharePreUpdateOffloadingEnabled() const override
+    {
+        return EnableFairSharePreUpdateOffloading_.load();
     }
 
     void LogOperationFinished(

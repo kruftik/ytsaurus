@@ -17,7 +17,7 @@ TChunkReaderMemoryManagerOptions::TChunkReaderMemoryManagerOptions(
     i64 bufferSize,
     NProfiling::TTagList profilingTagList,
     bool enableDetailedLogging,
-    ITypedNodeMemoryTrackerPtr memoryUsageTracker)
+    IMemoryUsageTrackerPtr memoryUsageTracker)
     : BufferSize(bufferSize)
     , ProfilingTagList(std::move(profilingTagList))
     , EnableDetailedLogging(enableDetailedLogging)
@@ -37,7 +37,7 @@ TChunkReaderMemoryManager::TChunkReaderMemoryManager(
     , MemoryUsageTracker_(Options_.MemoryUsageTracker)
     , ProfilingTagList_(std::move(Options_.ProfilingTagList))
     , Id_(TGuid::Create())
-    , Logger(ReaderMemoryManagerLogger.WithTag("Id: %v", Id_))
+    , Logger(ReaderMemoryManagerLogger().WithTag("Id: %v", Id_))
 {
     TGuid parentId;
     if (auto parent = HostMemoryManager_.Lock()) {

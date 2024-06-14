@@ -19,6 +19,8 @@
 #include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/helpers.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/discovery_client/member_client.h>
 #include <yt/yt/ytlib/discovery_client/discovery_client.h>
 
@@ -85,7 +87,7 @@ using namespace NQueueClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = QueueAgentLogger;
+static constexpr auto& Logger = QueueAgentLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -95,9 +97,9 @@ TBootstrap::TBootstrap(TQueueAgentServerConfigPtr config, INodePtr configNode)
     , DynamicConfig_(New<TQueueAgentServerDynamicConfig>())
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 }
 
@@ -134,6 +136,7 @@ void TBootstrap::DoRun()
         std::move(connectionOptions));
 
     NativeConnection_->GetClusterDirectorySynchronizer()->Start();
+    NativeConnection_->GetMasterCellDirectorySynchronizer()->Start();
 
     NativeAuthenticator_ = NNative::CreateNativeAuthenticator(NativeConnection_);
 
@@ -176,7 +179,7 @@ void TBootstrap::DoRun()
 
     DynamicState_ = New<TDynamicState>(Config_->DynamicState, NativeClient_, ClientDirectory_);
 
-    AlertManager_ = CreateAlertManager(QueueAgentLogger, TProfiler{}, ControlInvoker_);
+    AlertManager_ = CreateAlertManager(QueueAgentLogger(), TProfiler{}, ControlInvoker_);
 
     QueueAgentShardingManager_ = CreateQueueAgentShardingManager(
         ControlInvoker_,
@@ -212,14 +215,16 @@ void TBootstrap::DoRun()
         &MonitoringManager_,
         &orchidRoot);
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
-    SetNodeByYPath(
-        orchidRoot,
-        "/dynamic_config_manager",
-        CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+        SetNodeByYPath(
+            orchidRoot,
+            "/dynamic_config_manager",
+            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+    }
     if (CoreDumper_) {
         SetNodeByYPath(
             orchidRoot,

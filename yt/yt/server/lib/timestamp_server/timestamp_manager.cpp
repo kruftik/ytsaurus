@@ -50,12 +50,13 @@ public:
         IHydraManagerPtr hydraManager,
         TCompositeAutomatonPtr automaton,
         TCellTag cellTag,
-        IAuthenticatorPtr authenticator)
+        IAuthenticatorPtr authenticator,
+        NObjectClient::TCellTag clockClusterTag)
         : TServiceBase(
             // Ignored, method handlers use TimestampInvoker_.
             GetSyncInvoker(),
             TTimestampServiceProxy::GetDescriptor(),
-            TimestampServerLogger,
+            TimestampServerLogger(),
             NullRealmId,
             std::move(authenticator))
         , TCompositeAutomatonPart(
@@ -64,6 +65,7 @@ public:
             automatonInvoker)
         , Config_(std::move(config))
         , CellTag_(cellTag)
+        , ClockClusterTag_(clockClusterTag)
         , TimestampQueue_(New<TActionQueue>("Timestamp"))
         , TimestampInvoker_(TimestampQueue_->GetInvoker())
         , CalibrationExecutor_(New<TPeriodicExecutor>(
@@ -84,14 +86,14 @@ public:
 
         RegisterLoader(
             "TimestampManager",
-            BIND(&TImpl::Load, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::Load, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "TimestampManager",
-            BIND(&TImpl::Save, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::Save, Unretained(this)));
 
         TCompositeAutomatonPart::RegisterMethod(
-            BIND(&TImpl::HydraCommitTimestamp, Unretained(this)));
+            BIND_NO_PROPAGATE(&TImpl::HydraCommitTimestamp, Unretained(this)));
     }
 
     IServicePtr GetRpcService()
@@ -102,6 +104,7 @@ public:
 private:
     const TTimestampManagerConfigPtr Config_;
     const TCellTag CellTag_;
+    const TCellTag ClockClusterTag_;
 
     const TActionQueuePtr TimestampQueue_;
     const IInvokerPtr TimestampInvoker_;
@@ -157,8 +160,26 @@ private:
             return;
         }
 
-        int count = context->Request().count();
+        const auto& request = context->Request();
+
+        int count = request.count();
         YT_VERIFY(count >= 0);
+
+        auto requestClockClusterTag = request.has_clock_cluster_tag()
+            ? FromProto<TCellTag>(request.clock_cluster_tag())
+            : InvalidCellTag;
+
+        if (ClockClusterTag_ != InvalidCellTag && requestClockClusterTag != InvalidCellTag &&
+            ClockClusterTag_ != requestClockClusterTag)
+        {
+            context->Reply(TError(
+                NTransactionClient::EErrorCode::ClockClusterTagMismatch,
+                "Different clock cluster tag")
+                << TErrorAttribute("clock_cluster_tag", ClockClusterTag_)
+                << TErrorAttribute("request_clock_cluster_tag", requestClockClusterTag));
+            return;
+        }
+
         if (count > Config_->MaxTimestampsPerRequest) {
             context->Reply(TError("Too many timestamps requested: %v > %v",
                 count,
@@ -193,6 +214,9 @@ private:
         context->SetResponseInfo("Timestamp: %v", result);
 
         context->Response().set_timestamp(result);
+        if (ClockClusterTag_ != InvalidCellTag) {
+            context->Response().set_clock_cluster_tag(ToProto<int>(ClockClusterTag_));
+        }
         context->Reply();
     }
 
@@ -306,7 +330,7 @@ private:
             ->GetAutomatonCancelableContext()
             ->CreateInvoker(TimestampInvoker_);
 
-        auto callback = BIND([=, this, this_ = MakeStrong(this)] () {
+        auto callback = BIND([=, this, this_ = MakeStrong(this)] {
             VERIFY_THREAD_AFFINITY(TimestampThread);
 
             Active_.store(true);
@@ -339,7 +363,7 @@ private:
 
         TCompositeAutomatonPart::OnStopLeading();
 
-        TimestampInvoker_->Invoke(BIND([=, this, this_ = MakeStrong(this)] () {
+        TimestampInvoker_->Invoke(BIND([=, this, this_ = MakeStrong(this)] {
             VERIFY_THREAD_AFFINITY(TimestampThread);
 
             if (!Active_.load()) {
@@ -382,14 +406,16 @@ TTimestampManager::TTimestampManager(
     IHydraManagerPtr hydraManager,
     TCompositeAutomatonPtr automaton,
     TCellTag cellTag,
-    IAuthenticatorPtr authenticator)
+    IAuthenticatorPtr authenticator,
+    NObjectClient::TCellTag clockClusterTag)
     : Impl_(New<TImpl>(
         config,
         automatonInvoker,
         hydraManager,
         automaton,
         cellTag,
-        std::move(authenticator)))
+        std::move(authenticator),
+        clockClusterTag))
 { }
 
 TTimestampManager::~TTimestampManager() = default;

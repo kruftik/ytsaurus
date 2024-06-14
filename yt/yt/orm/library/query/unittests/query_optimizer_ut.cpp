@@ -29,13 +29,11 @@ TEST(TQueryOptimizerTest, OptimizeJoin)
         NQueryClient::TSourceLocation(),
         "F",
         MakeExpression<TReferenceExpression>(&objectsHolder, NQueryClient::TSourceLocation(), "meta.id", "p"));
-    query.GroupExprs.emplace(
-        MakeExpression<TReferenceExpression>(
+    query.GroupExprs = MakeExpression<TReferenceExpression>(
             &objectsHolder,
             NQueryClient::TSourceLocation(),
             "meta.id",
-            "p"),
-        NQueryClient::ETotalsMode::None);
+            "p");
     query.HavingPredicate = MakeExpression<TBinaryOpExpression>(
             &objectsHolder,
             NQueryClient::TSourceLocation(),
@@ -199,10 +197,8 @@ TEST(TQueryOptimizerTest, OptimizeStringTryGetString)
                 TExpressionList{
                     objectsHolder.New<TReferenceExpression>(NQueryClient::TSourceLocation(), "meta"),
                     objectsHolder.New<TLiteralExpression>(NQueryClient::TSourceLocation(), "/id")
-                }
-            )
-        }
-    );
+                })
+        });
 
     select.push_back(
         objectsHolder.New<TAliasExpression>(

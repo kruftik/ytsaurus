@@ -41,7 +41,7 @@ using namespace NTracing;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = DriverLogger;
+static constexpr auto& Logger = DriverLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -60,7 +60,7 @@ INodePtr ConvertToNodeWithUtf8Decoding(const Py::Object& obj)
 
 TDriverBase::TDriverBase()
     : Id_(TGuid::Create())
-    , Logger(NYT::NPython::Logger.WithTag("DriverId: %v", Id_))
+    , Logger(NYT::NPython::Logger().WithTag("DriverId: %v", Id_))
 { }
 
 void TDriverBase::Initialize(const IDriverPtr& driver, const INodePtr& configNode)
@@ -126,7 +126,7 @@ Py::Object TDriverBase::Execute(Py::Tuple& args, Py::Dict& kwargs)
     request.CommandName = ConvertStringObjectToString(GetAttr(pyRequest, "command_name"));
     request.Parameters = ConvertToNodeWithUtf8Decoding(GetAttr(pyRequest, "parameters"))->AsMap();
     request.ResponseParametersConsumer = holder->GetResponseParametersConsumer();
-    request.ResponseParametersFinishedCallback = [holder] () {
+    request.ResponseParametersFinishedCallback = [holder] {
         holder->OnResponseParametersFinished();
     };
 
@@ -156,7 +156,9 @@ Py::Object TDriverBase::Execute(Py::Tuple& args, Py::Dict& kwargs)
     auto inputStreamObj = GetAttr(pyRequest, "input_stream");
     if (!inputStreamObj.isNone()) {
         auto inputStreamHolder = CreateInputStreamWrapper(inputStreamObj, /* wrapPythonExceptions */ true);
-        request.InputStream = CreateAsyncAdapter(inputStreamHolder.get());
+        request.InputStream = CreateZeroCopyAdapter(
+            CreateAsyncAdapter(inputStreamHolder.get()),
+            /*blockSize*/ 1_MB);
         holder->HoldInputStream(std::move(inputStreamHolder));
     }
 
@@ -328,7 +330,7 @@ void TDriverModuleBase::Initialize(
         BIND(&TDriverResponseHolder::OnAfterPythonFinalize),
         /*index*/ 0);
     RegisterAfterFinalizeShutdownCallback(
-        BIND([] () {
+        BIND([] {
             YT_LOG_INFO("Module shutdown started");
             for (const auto& [driverId, weakDriver] : ActiveDrivers) {
                 auto driver = weakDriver.Lock();

@@ -71,7 +71,7 @@ using NYT::ToProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -220,7 +220,7 @@ private:
 
     void OnEndSlotScan()
     {
-        const auto& tracker = Bootstrap_->GetMemoryUsageTracker();
+        const auto& tracker = Bootstrap_->GetNodeMemoryUsageTracker();
         auto otherUsage = tracker->GetUsed(EMemoryCategory::TabletDynamic) -
             ActiveMemoryUsage_ - PassiveMemoryUsage_ - BackingMemoryUsage_;
 
@@ -285,8 +285,7 @@ private:
                             .TabletCellBundle = slot->GetTabletCellBundleName(),
                         },
                         storeId,
-                    }
-                );
+                    });
             }
             ++index;
         }
@@ -330,7 +329,7 @@ private:
         const auto& rowCache = tablet->GetRowCache();
 
         try {
-            auto reallocateResult = BIND(&TRowCache::ReallocateItems, rowCache, Logger)
+            auto reallocateResult = BIND(&TRowCache::ReallocateItems, rowCache, Logger())
                 .AsyncVia(ThreadPool_->GetInvoker())
                 .Run();
 
@@ -435,7 +434,7 @@ private:
         auto tabletId = tablet->GetId();
         auto writerProfiler = New<TWriterProfiler>();
 
-        auto Logger = TabletNodeLogger
+        auto Logger = TabletNodeLogger()
             .WithTag("%v, StoreId: %v",
                 tablet->GetLoggingTag(),
                 store->GetId());
@@ -501,7 +500,7 @@ private:
             auto flushResult = WaitFor(asyncFlushResult)
                 .ValueOrThrow();
 
-            tablet->ThrottleTabletStoresUpdate(slot, Logger);
+            tablet->ThrottleTabletStoresUpdate(slot, Logger());
 
             NTabletServer::NProto::TReqUpdateTabletStores updateTabletStoresReq;
             ToProto(updateTabletStoresReq.mutable_tablet_id(), tabletId);

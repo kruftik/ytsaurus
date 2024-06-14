@@ -163,7 +163,7 @@ TNodeShard::TNodeShard(
         BIND(&TNodeShard::CalculateResourceStatistics, MakeStrong(this)),
         Config_->SchedulingTagFilterExpireTimeout,
         GetInvoker()))
-    , Logger(NodeShardLogger.WithTag("NodeShardId: %v", Id_))
+    , Logger(NodeShardLogger().WithTag("NodeShardId: %v", Id_))
     , RemoveOutdatedScheduleAllocationEntryExecutor_(New<TPeriodicExecutor>(
         GetInvoker(),
         BIND(&TNodeShard::RemoveOutdatedScheduleAllocationEntries, MakeWeak(this)),
@@ -194,10 +194,11 @@ TNodeShard::TNodeShard(
     HeartbeatRegisteredControllerAgentsBytes_ = SchedulerProfiler
         .Counter("/node_heartbeat/response/proto_registered_controller_agents_bytes");
 
-    for (auto reason : TEnumTraitsImpl<ENodeSchedulingResult>::GetDomainValues()) {
-        UnscheduledResourcesCounterByResult_[reason].Init(SchedulerProfiler
-            .WithPrefix("/unscheduled_node_resources")
-            .WithTag("reason", FormatEnum(reason)),
+    for (auto reason : TEnumTraitsImpl<ESchedulingStopReason>::GetDomainValues()) {
+        UnscheduledResourcesCounterByStopReason_[reason].Init(
+            SchedulerProfiler
+                .WithPrefix("/unscheduled_node_resources")
+                .WithTag("reason", FormatEnum(reason)),
             EMetricType::Counter);
     }
 }
@@ -498,8 +499,7 @@ void TNodeShard::DoProcessHeartbeat(const TScheduler::TCtxNodeHeartbeatPtr& cont
         ManagerHost_->FormatHeartbeatResourceUsage(
             ToJobResources(resourceUsage),
             ToJobResources(resourceLimits),
-            request->disk_resources()
-        ),
+            request->disk_resources()),
         request->allocations_size());
 
     YT_VERIFY(Host_->GetNodeShardId(nodeId) == Id_);
@@ -656,10 +656,10 @@ void TNodeShard::DoProcessHeartbeat(const TScheduler::TCtxNodeHeartbeatPtr& cont
     ToProto(response->mutable_min_spare_resources(), GetMinSpareResources());
 
     if (isThrottlingActive) {
-        schedulingContext->SetNodeSchedulingResult(ENodeSchedulingResult::Throttling);
+        schedulingContext->SetSchedulingStopReason(ESchedulingStopReason::Throttling);
     }
 
-    UpdateUnscheduledNodeCounters(schedulingContext);
+    UpdateUnscheduledNodeCounters(schedulingContext, node);
 
     auto now = TInstant::Now();
     auto shouldSendRegisteredControllerAgents = ShouldSendRegisteredControllerAgents(request);
@@ -1225,9 +1225,18 @@ void TNodeShard::EndScheduleAllocation(const NProto::TScheduleAllocationResponse
     auto it = AllocationIdToScheduleEntry_.find(allocationId);
     if (it == std::end(AllocationIdToScheduleEntry_)) {
         YT_LOG_WARNING(
-            "No schedule entry for allocation, probably allocation was scheduled by controller too late (OperationId: %v, AllocationId: %v)",
+            "No schedule entry for allocation, probably allocation was scheduled by controller too late; aborting allocation in controller "
+            "(OperationId: %v, AllocationId: %v)",
             operationId,
             allocationId);
+
+        if (auto* operation = FindOperationState(operationId)) {
+            const auto& controller = operation->Controller;
+            controller->OnNonscheduledAllocationAborted(
+                allocationId,
+                EAbortReason::SchedulingTimeout,
+                operation->ControllerEpoch);
+        }
         return;
     }
 
@@ -1246,9 +1255,13 @@ void TNodeShard::EndScheduleAllocation(const NProto::TScheduleAllocationResponse
 
     auto result = New<TControllerScheduleAllocationResult>();
     if (response.success()) {
-        result->StartDescriptor.emplace(
-            allocationId,
-            FromProto<TJobResourcesWithQuota>(response.resource_limits()));
+        result->StartDescriptor.emplace(TAllocationStartDescriptor{
+            .Id = allocationId,
+            .ResourceLimits = FromProto<TJobResourcesWithQuota>(response.resource_limits()),
+            });
+        FromProto(
+            &(result->StartDescriptor->AllocationAttributes),
+            response.allocation_attributes());
     }
     for (const auto& protoCounter : response.failed()) {
         result->Failed[static_cast<EScheduleAllocationFailReason>(protoCounter.reason())] = protoCounter.value();
@@ -1717,7 +1730,7 @@ TAllocationPtr TNodeShard::ProcessAllocationHeartbeat(
     auto operationState = FindOperationState(operationId);
 
     if (!allocation) {
-        auto Logger = SchedulerLogger.WithTag(
+        auto Logger = SchedulerLogger().WithTag(
             "Address: %v, AllocationId: %v, OperationId: %v, AllocationState: %v",
             address,
             allocationId,
@@ -1796,11 +1809,13 @@ TAllocationPtr TNodeShard::ProcessAllocationHeartbeat(
     switch (allocationState) {
         case EAllocationState::Finished: {
             if (auto error = FromProto<TError>(allocationStatus->result().error());
-                ParseAbortReason(error, allocationId, Logger).value_or(EAbortReason::Scheduler) == EAbortReason::GetSpecFailed)
+                !error.IsOK())
             {
-                YT_LOG_DEBUG("Node has failed to get allocation spec, abort allocation");
+                YT_LOG_DEBUG("Allocation aborted, storage scheduled");
 
-                OnAllocationAborted(allocation, error, EAbortReason::GetSpecFailed);
+                auto abortReason = ParseAbortReason(error, allocationId, Logger).value_or(EAbortReason::Scheduler);
+
+                OnAllocationAborted(allocation, error, abortReason);
             } else {
                 YT_LOG_DEBUG("Allocation finished, storage scheduled");
 
@@ -2052,6 +2067,8 @@ void TNodeShard::ProcessScheduledAndPreemptedAllocations(
         ToProto(startInfo->mutable_operation_id(), allocation->GetOperationId());
         *startInfo->mutable_resource_limits() = ToNodeResources(allocation->ResourceUsage());
 
+        ToProto(startInfo->mutable_allocation_attributes(), allocation->AllocationAttributes());
+
         if (Config_->SendFullControllerAgentDescriptorsForAllocations) {
             SetControllerAgentDescriptor(agent, startInfo->mutable_controller_agent_descriptor());
         } else {
@@ -2117,6 +2134,11 @@ void TNodeShard::OnAllocationFinished(const TAllocationPtr& allocation)
     }
 
     SetFinishedState(allocation);
+
+    if (auto* operationState = FindOperationState(allocation->GetOperationId())) {
+        const auto& controller = operationState->Controller;
+        controller->OnAllocationFinished(allocation);
+    }
 
     UnregisterAllocation(allocation);
 }
@@ -2260,18 +2282,27 @@ void TNodeShard::ProcessOperationInfoHeartbeat(
     }
 }
 
-void TNodeShard::UpdateUnscheduledNodeCounters(const ISchedulingContextPtr& schedulingContext)
+void TNodeShard::UpdateUnscheduledNodeCounters(const ISchedulingContextPtr& schedulingContext, const TExecNodePtr& node)
 {
-    auto nodeSchedulingResult = schedulingContext->GetNodeSchedulingResult();
-    if (nodeSchedulingResult == ENodeSchedulingResult::FullyScheduled) {
+    auto now = TInstant::Now();
+
+    auto nodeFreeResources = schedulingContext->GetNodeFreeResourcesWithoutDiscount();
+
+    auto finally = Finally([&] {
+        node->LastHeartbeatUnscheduledResources() = nodeFreeResources;
+        node->LastHeartbeatTime() = now;
+    });
+
+    auto schedulingStopReason = schedulingContext->GetSchedulingStopReason();
+    if (schedulingStopReason == ESchedulingStopReason::FullyScheduled) {
         return;
     }
 
-    auto minSpareResources = GetMinSpareResources();
-    auto nodeFreeResources = schedulingContext->GetNodeFreeResourcesWithoutDiscount();
+    if (Dominates(node->LastHeartbeatUnscheduledResources(), GetMinSpareResources())) {
+        auto secondsSinceLastHeartbeat = (now - node->LastHeartbeatTime()).SecondsFloat();
+        auto unscheduledResourceTime = node->LastHeartbeatUnscheduledResources() * secondsSinceLastHeartbeat;
 
-    if (Dominates(nodeFreeResources, minSpareResources)) {
-        UnscheduledResourcesCounterByResult_[nodeSchedulingResult].Update(nodeFreeResources);
+        UnscheduledResourcesCounterByStopReason_[schedulingStopReason].Update(unscheduledResourceTime);
     }
 }
 

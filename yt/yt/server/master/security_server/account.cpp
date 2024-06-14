@@ -1,5 +1,6 @@
 #include "account.h"
 #include "private.h"
+#include "helpers.h"
 
 #include <yt/yt/server/master/cell_master/serialize.h>
 
@@ -27,7 +28,7 @@ using namespace NConcurrency;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SecurityServerLogger;
+static constexpr auto& Logger = SecurityServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -137,7 +138,7 @@ TAccountMulticellStatistics SubtractAccountMulticellStatistics(
 ////////////////////////////////////////////////////////////////////////////////
 
 void TChunkMergerCriteria::AssignNotNull(const TChunkMergerCriteria& rhs) {
-#define XX(type, camelCaseName, snakeCaseName) \
+#define XX(type, camelCaseName, snakeCaseName, reign) \
     if (rhs.camelCaseName) { \
         camelCaseName = rhs.camelCaseName; \
     }
@@ -147,7 +148,7 @@ void TChunkMergerCriteria::AssignNotNull(const TChunkMergerCriteria& rhs) {
 }
 
 bool TChunkMergerCriteria::IsEmpty() const {
-#define XX(type, camelCaseName, snakeCaseName) camelCaseName ||
+#define XX(type, camelCaseName, snakeCaseName, reign) camelCaseName ||
     return !(FOR_EACH_CHUNK_MERGER_CRITERIA_FIELD(XX) false);
 #undef XX
 }
@@ -158,7 +159,7 @@ void TChunkMergerCriteria::Validate() const {
             *MaxChunkCount);
     }
 
-#define XX(type, camelCaseName, snakeCaseName) \
+#define XX(type, camelCaseName, snakeCaseName, reign) \
     if (camelCaseName && camelCaseName <= 0) { \
         THROW_ERROR_EXCEPTION("Invalid chunk merger criteria: " #snakeCaseName " must be positive, found %v", \
             *camelCaseName); \
@@ -171,7 +172,7 @@ void TChunkMergerCriteria::Validate() const {
 void TChunkMergerCriteria::Save(NCellMaster::TSaveContext& context) const
 {
     using NYT::Save;
-#define XX(type, camelCaseName, snakeCaseName) Save(context, camelCaseName);
+#define XX(type, camelCaseName, snakeCaseName, reign) Save(context, camelCaseName);
     FOR_EACH_CHUNK_MERGER_CRITERIA_FIELD(XX)
 #undef XX
 }
@@ -179,14 +180,18 @@ void TChunkMergerCriteria::Save(NCellMaster::TSaveContext& context) const
 void TChunkMergerCriteria::Load(NCellMaster::TLoadContext& context)
 {
     using NYT::Load;
-#define XX(type, camelCaseName, snakeCaseName) Load(context, camelCaseName);
+#define XX(type, camelCaseName, snakeCaseName, reign) \
+    if (static_cast<int>(context.GetVersion()) >= reign) { \
+        Load(context, camelCaseName); \
+    }
+
     FOR_EACH_CHUNK_MERGER_CRITERIA_FIELD(XX)
 #undef XX
 }
 
 void Serialize(const TChunkMergerCriteria& criteria, NYson::IYsonConsumer* consumer)
 {
-#define XX(type, camelCaseName, snakeCaseName) \
+#define XX(type, camelCaseName, snakeCaseName, reign) \
     .DoIf(criteria.camelCaseName.has_value(), [&] (TFluentMap fluent) { \
         fluent.Item(#snakeCaseName).Value(criteria.camelCaseName); \
     })
@@ -203,7 +208,7 @@ void Deserialize(TChunkMergerCriteria& criteria, NYTree::INodePtr node)
 
     auto map = node->AsMap();
 
-#define XX(type, camelCaseName, snakeCaseName) \
+#define XX(type, camelCaseName, snakeCaseName, reign) \
     result.camelCaseName = map->FindChildValue<type>(#snakeCaseName);
 
     FOR_EACH_CHUNK_MERGER_CRITERIA_FIELD(XX)
@@ -217,6 +222,8 @@ void Deserialize(TChunkMergerCriteria& criteria, NYTree::INodePtr node)
 TAccount::TAccount(TAccountId id, bool isRoot)
     : TNonversionedMapObjectBase<TAccount>(id, isRoot)
     , MergeJobThrottler_(CreateReconfigurableThroughputThrottler(TThroughputThrottlerConfig::Create(0)))
+    , ShardIndex_(GetAccountShardIndex(id))
+    , ProfilingBucketIndex_(GetAccountProfilingBucketIndex(id))
     , ChunkMergerNodeTraversals_(id)
 { }
 
@@ -283,10 +290,7 @@ void TAccount::Load(NCellMaster::TLoadContext& context)
     }
 
     Load(context, AllowUsingChunkMerger_);
-
-    if (context.GetVersion() >= EMasterReign::SupportAccountChunkMergerCriteria) {
-        Load(context, ChunkMergerCriteria_);
-    }
+    Load(context, ChunkMergerCriteria_);
 
     MergeJobThrottler_->SetLimit(MergeJobRateLimit_);
 
@@ -477,8 +481,8 @@ TViolatedClusterResourceLimits TAccount::GetViolatedResourceLimits(
 {
     const auto& multicellManager = bootstrap->GetMulticellManager();
 
-    auto primaryCellTag = multicellManager->GetPrimaryCellTag();
-    const auto& cellTags = multicellManager->GetSecondaryCellTags();
+    auto selfCellTag = multicellManager->GetCellTag();
+    const auto& cellTags = multicellManager->GetRegisteredMasterCellTags();
 
     TViolatedClusterResourceLimits violatedLimits;
     for (auto* account = this; account; account = account->GetParent()) {
@@ -515,8 +519,8 @@ TViolatedClusterResourceLimits TAccount::GetViolatedResourceLimits(
         if (account->IsChunkHostMasterMemoryLimitViolated()) {
             violatedLimits.MasterMemory().ChunkHost = 1;
         }
-        if (account->IsCellMasterMemoryLimitViolated(primaryCellTag)) {
-            violatedLimits.MasterMemory().PerCell[primaryCellTag] = 1;
+        if (account->IsCellMasterMemoryLimitViolated(selfCellTag)) {
+            violatedLimits.MasterMemory().PerCell[selfCellTag] = 1;
         }
         for (auto cellTag : cellTags) {
             if (account->IsCellMasterMemoryLimitViolated(cellTag)) {
@@ -534,8 +538,8 @@ TViolatedClusterResourceLimits TAccount::GetRecursiveViolatedResourceLimits(
 {
     const auto& multicellManager = bootstrap->GetMulticellManager();
 
-    auto primaryCellTag = multicellManager->GetPrimaryCellTag();
-    const auto& cellTags = multicellManager->GetSecondaryCellTags();
+    auto selfCellTag = multicellManager->GetCellTag();
+    const auto& cellTags = multicellManager->GetRegisteredMasterCellTags();
 
     return AccumulateOverMapObjectSubtree(
         this,
@@ -574,8 +578,8 @@ TViolatedClusterResourceLimits TAccount::GetRecursiveViolatedResourceLimits(
             if (account->IsChunkHostMasterMemoryLimitViolated()) {
                 ++violatedLimits->MasterMemory().ChunkHost;
             }
-            if (account->IsCellMasterMemoryLimitViolated(primaryCellTag)) {
-                ++violatedLimits->MasterMemory().PerCell[primaryCellTag];
+            if (account->IsCellMasterMemoryLimitViolated(selfCellTag)) {
+                ++violatedLimits->MasterMemory().PerCell[selfCellTag];
             }
             for (auto cellTag : cellTags) {
                 if (account->IsCellMasterMemoryLimitViolated(cellTag)) {

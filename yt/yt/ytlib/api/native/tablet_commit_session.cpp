@@ -3,9 +3,8 @@
 #include "cell_commit_session.h"
 #include "client.h"
 #include "config.h"
+#include "connection.h"
 #include "tablet_request_batcher.h"
-
-#include <yt/yt/ytlib/api/native/connection.h>
 
 #include <yt/yt/ytlib/tablet_client/tablet_service_proxy.h>
 
@@ -70,20 +69,31 @@ public:
         TUnversionedRow row,
         TLockMask lockMask) override
     {
+        YT_VERIFY(!Prepared_);
+
         YT_VERIFY(!IsVersioned_);
+
         Batcher_->SubmitUnversionedRow(command, row, lockMask);
     }
 
     virtual void SubmitVersionedRow(TTypeErasedRow row) override
     {
+        YT_VERIFY(!Prepared_);
+
         IsVersioned_ = true;
 
         Batcher_->SubmitVersionedRow(row);
     }
 
-    virtual void PrepareRequests() override
+    virtual TSharedRange<TUnversionedSubmittedRow> PrepareRequests() override
     {
-        Batches_ = Batcher_->PrepareBatches();
+        if (Prepared_) {
+            return {};
+        }
+        Prepared_ = true;
+
+        auto prepared = Batcher_->PrepareBatches();
+        Batches_ = std::move(prepared.Batches);
 
         auto batchCount = std::ssize(Batches_);
         CellCommitSession_
@@ -92,6 +102,8 @@ public:
         CellCommitSession_
             ->GetCommitSignatureGenerator()
             ->RegisterRequests(batchCount);
+
+        return std::move(prepared.MergedRows);
     }
 
     // NB: Concurrent #Invoke calls with different retry indices are possible.
@@ -137,6 +149,11 @@ public:
         }
     }
 
+    virtual NTabletClient::TTableMountInfoPtr GetTableMountInfo() const override
+    {
+        return TableInfo_;
+    }
+
 private:
     const IClientPtr Client_;
     const TConnectionDynamicConfigPtr Config_;
@@ -161,6 +178,7 @@ private:
     std::vector<TBatchSignatures> BatchSignatures_;
 
     bool IsVersioned_ = false;
+    bool Prepared_ = false;
 
     struct TCommitContext final
     {
@@ -242,7 +260,11 @@ private:
         }
 
         if (batchIndex == 0) {
-            ToProto(req->mutable_prerequisite_transaction_ids(), Options_.PrerequisiteTransactionIds);
+            auto prerequisiteTransactions = transaction->GetPrerequisiteTransactionIds();
+            for (auto transactionId : Options_.PrerequisiteTransactionIds) {
+                prerequisiteTransactions.push_back(transactionId);
+            }
+            ToProto(req->mutable_prerequisite_transaction_ids(), prerequisiteTransactions);
         }
 
         YT_LOG_DEBUG("Sending transaction rows (BatchIndex: %v/%v, RowCount: %v, "

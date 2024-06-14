@@ -168,15 +168,15 @@ public:
         , NodeStatusDirectory_(std::move(nodeStatusDirectory))
         , BlockCache_(std::move(blockCache))
         , Networks_(Client_->GetNativeConnection()->GetNetworks())
-        , Logger(ChunkClientLogger.WithTag("ChunkFragmentReaderId: %v", TGuid::Create()))
+        , Logger(ChunkClientLogger().WithTag("ChunkFragmentReaderId: %v", TGuid::Create()))
         , ReaderInvoker_(TDispatcher::Get()->GetReaderInvoker())
         , PeerInfoCache_(New<TPeerInfoCache>(
-            BIND([this_ = MakeWeak(this)] (TNodeId nodeId) -> TErrorOr<TPeerInfoPtr> {
-                auto reader = this_.Lock();
-                if (!reader) {
+            BIND([this, weakThis = MakeWeak(this)] (TNodeId nodeId) -> TErrorOr<TPeerInfoPtr> {
+                auto this_ = weakThis.Lock();
+                if (!this_) {
                     return TError(NYT::EErrorCode::Canceled, "Reader was destroyed");
                 }
-                return reader->GetPeerInfo(nodeId);
+                return GetPeerInfo(nodeId);
             }),
             Config_->PeerInfoExpirationTimeout,
             ReaderInvoker_))
@@ -307,12 +307,8 @@ private:
     void SchedulePeriodicProbing()
     {
         TDelayedExecutor::Submit(
-            BIND([weakReader = MakeWeak(this)] {
-                if (auto reader = weakReader.Lock()) {
-                    reader->RunPeriodicProbing();
-                }
-            })
-            .Via(ReaderInvoker_),
+            BIND(&TChunkFragmentReader::RunPeriodicProbing, MakeWeak(this))
+                .Via(ReaderInvoker_),
             Config_->PeriodicUpdateDelay);
     }
 };
@@ -746,7 +742,7 @@ public:
         : TProbingSessionBase(
             reader,
             MakeOptions(),
-            reader->Logger.WithTag("PeriodicProbingSessionId: %v", TGuid::Create()))
+            reader->Logger().WithTag("PeriodicProbingSessionId: %v", TGuid::Create()))
     { }
 
     void Run()
@@ -1493,14 +1489,12 @@ private:
                 "Failed to apply throttling in fragment chunk reader")
                 << error;
 
-            BIND(
+            SessionInvoker_->Invoke(BIND(
                 &TSimpleReadFragmentsSession::OnGotChunkFragments,
                 MakeStrong(this),
                 plan,
                 0 /*throttledBytes*/,
-                throttlingError)
-                .Via(SessionInvoker_)
-                .Run();
+                throttlingError));
             return;
         }
 
@@ -1779,7 +1773,7 @@ public:
         : Reader_(std::move(reader))
         , Options_(std::move(options))
         , SessionInvoker_(CreateSerializedInvoker(Reader_->ReaderInvoker_))
-        , Logger(Reader_->Logger.WithTag("ChunkFragmentReadSessionId: %v, ReadSessionId: %v",
+        , Logger(Reader_->Logger().WithTag("ChunkFragmentReadSessionId: %v, ReadSessionId: %v",
             TGuid::Create(),
             Options_.ReadSessionId))
     {

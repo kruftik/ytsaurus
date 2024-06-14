@@ -252,7 +252,6 @@ public:
     {
         return false;
     }
-
 };
 
 class TIfNullCodegen
@@ -310,7 +309,6 @@ public:
         YT_VERIFY(nullableArgs.size() == 2);
         return nullableArgs[1];
     }
-
 };
 
 class TIsNaNCodegen
@@ -359,7 +357,6 @@ public:
     {
         return false;
     }
-
 };
 
 class TCoalesceCodegen
@@ -414,8 +411,7 @@ private:
             },
             [&] (TCGExprContext& /*builder*/) {
                 return argument;
-            }
-        );
+            });
     }
 };
 
@@ -588,6 +584,7 @@ public:
         }
 
         auto iteration = [
+            this,
             this_ = MakeStrong(this),
             argumentType,
             name
@@ -603,14 +600,14 @@ public:
                         builder,
                         aggregateValue.GetIsNull(builder),
                         [&] (TCGBaseContext& builder) {
-                            return this_->InitializeAggregateValue(
+                            return InitializeAggregateValue(
                                 builder,
                                 buffer,
                                 newValue,
                                 argumentType);
                         },
                         [&] (TCGBaseContext& builder) {
-                            return this_->UpdateAggregateValue(
+                            return UpdateAggregateValue(
                                 builder,
                                 buffer,
                                 aggregateValue,
@@ -624,6 +621,7 @@ public:
         };
 
         auto merge = [
+            this,
             this_ = MakeStrong(this),
             argumentType,
             name
@@ -639,10 +637,10 @@ public:
                         builder,
                         aggState.GetIsNull(builder),
                         [&] (TCGBaseContext& builder) {
-                            return this_->InitializeAggregateValue(builder, buffer, dstAggState, argumentType);
+                            return InitializeAggregateValue(builder, buffer, dstAggState, argumentType);
                         },
                         [&] (TCGBaseContext& builder) {
-                            return this_->UpdateAggregateValue(builder, buffer, aggState, dstAggState, argumentType);
+                            return UpdateAggregateValue(builder, buffer, aggState, dstAggState, argumentType);
                         });
                 });
         };
@@ -794,6 +792,7 @@ public:
         }
 
         auto iteration = [
+            this,
             this_ = MakeStrong(this),
             argumentTypes,
             name
@@ -810,14 +809,14 @@ public:
                         builder,
                         aggregate.GetIsNull(builder),
                         [&] (TCGBaseContext& builder) {
-                            return this_->InitializeAggregateValue(
+                            return InitializeAggregateValue(
                                 builder,
                                 buffer,
                                 newValues,
                                 argumentTypes);
                         },
                         [&] (TCGBaseContext& builder) {
-                            return this_->UpdateAggregateValue(
+                            return UpdateAggregateValue(
                                 builder,
                                 buffer,
                                 aggregate,
@@ -831,6 +830,7 @@ public:
         };
 
         auto merge = [
+            this,
             this_ = MakeStrong(this),
             argumentTypes,
             name
@@ -856,7 +856,7 @@ public:
                                 argumentTypes);
                         },
                         [&] (TCGBaseContext& builder) {
-                            return this_->MergeTwoAggStates(builder, buffer, aggState, dstAggState, argumentTypes);
+                            return MergeTwoAggStates(builder, buffer, aggState, dstAggState, argumentTypes);
                         });
                 });
         };
@@ -874,11 +874,12 @@ public:
         codegenAggregate.Merge = merge;
 
         codegenAggregate.Finalize = [
+            this,
             this_ = MakeStrong(this),
             name,
             argumentTypes
         ] (TCGBaseContext& builder, Value* buffer, TCGValue aggState) {
-            return this_->Finalize(builder, buffer, aggState, argumentTypes);
+            return Finalize(builder, buffer, aggState, argumentTypes);
         };
 
         return codegenAggregate;
@@ -940,17 +941,16 @@ public:
             return CodegenIf<TCGBaseContext, TCGValue>(
                 builder,
                 compareResult,
-                [&](TCGBaseContext& builder){
+                [&] (TCGBaseContext& builder){
                     if (AllScalar(argumentTypes)) {
                         return PackValues(builder, buffer, newValues, argumentTypes, &aggregate);
                     } else {
                         return PackValues(builder, buffer, newValues, argumentTypes);
                     }
                 },
-                [&](TCGBaseContext& /*builder*/){
+                [&] (TCGBaseContext& /*builder*/){
                     return aggregate;
-                }
-            );
+                });
         } else {
             YT_UNIMPLEMENTED();
         }
@@ -987,8 +987,7 @@ public:
                 },
                 [&] (TCGBaseContext& /*builder*/) {
                     return PackValues(builder, buffer, dstDataUnpacked, argumentTypes);
-                }
-            );
+                });
         } else {
             YT_UNIMPLEMENTED();
         }

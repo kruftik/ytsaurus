@@ -10,7 +10,7 @@ using namespace NHydra;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ChaosNodeLogger;
+static constexpr auto& Logger = ChaosNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -49,7 +49,7 @@ NHydra::EFinalRecoveryAction GetActionToRecoverFromReign(TReign reign)
 TSaveContext::TSaveContext(
     ICheckpointableOutputStream* output,
     NLogging::TLogger logger)
-    : NYT::NLeaseServer::TSaveContext(
+    : NLeaseServer::TSaveContext(
         output,
         std::move(logger),
         GetCurrentReign())

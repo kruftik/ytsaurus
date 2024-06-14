@@ -50,7 +50,7 @@ SRCS(
     api/native/list_operations.cpp
     api/native/partition_tables.cpp
     api/native/pipeline_type_handler.cpp
-    api/native/producer_type_handler.cpp
+    api/native/queue_producer_type_handler.cpp
     api/native/replicated_table_replica_type_handler.cpp
     api/native/replication_card_collocation_type_handler.cpp
     api/native/replication_card_type_handler.cpp
@@ -290,8 +290,6 @@ SRCS(
 
     lease_client/proto/lease_service.proto
 
-    misc/config.cpp
-    misc/memory_reference_tracker.cpp
     misc/memory_usage_tracker.cpp
     misc/synchronizer_detail.cpp
 
@@ -317,6 +315,7 @@ SRCS(
     object_client/caching_object_service.cpp
     object_client/config.cpp
     object_client/helpers.cpp
+    object_client/master_ypath_proxy.cpp
     object_client/object_attribute_cache.cpp
     object_client/object_service_cache.cpp
     object_client/object_service_proxy.cpp
@@ -339,8 +338,6 @@ SRCS(
     query_client/functions_cache.cpp
     query_client/session_coordinator.cpp
     query_client/tracked_memory_chunk_provider.cpp
-    query_client/shuffle.cpp
-    query_client/join_tree.cpp
 
     queue_client/config.cpp
     queue_client/queue_consumer_init.cpp
@@ -380,7 +377,6 @@ SRCS(
     sequoia_client/table_descriptor.cpp
     sequoia_client/transaction.cpp
     sequoia_client/write_set.cpp
-    sequoia_client/ypath_detail.cpp
 
     sequoia_client/proto/transaction_client.proto
 
@@ -390,6 +386,7 @@ SRCS(
     table_chunk_format/column_reader.cpp
     table_chunk_format/column_writer_detail.cpp
     table_chunk_format/column_writer.cpp
+    table_chunk_format/column_meta.cpp
     table_chunk_format/data_block_writer.cpp
     table_chunk_format/floating_point_column_reader.cpp
     table_chunk_format/floating_point_column_writer.cpp
@@ -546,6 +543,31 @@ GENERATE_YT_RECORD(
 )
 
 GENERATE_YT_RECORD(
+    sequoia_client/records/transactions.yaml
+    OUTPUT_INCLUDES
+        yt/yt/ytlib/sequoia_client/public.h
+        yt/yt/core/ytree/attributes.h
+)
+
+GENERATE_YT_RECORD(
+    sequoia_client/records/transaction_descendants.yaml
+    OUTPUT_INCLUDES
+        yt/yt/ytlib/sequoia_client/public.h
+)
+
+GENERATE_YT_RECORD(
+    sequoia_client/records/transaction_replicas.yaml
+    OUTPUT_INCLUDES
+        yt/yt/ytlib/sequoia_client/public.h
+)
+
+GENERATE_YT_RECORD(
+    sequoia_client/records/dependent_transactions.yaml
+    OUTPUT_INCLUDES
+        yt/yt/ytlib/sequoia_client/public.h
+)
+
+GENERATE_YT_RECORD(
     scheduler/records/operation_alias.yaml
 )
 
@@ -575,6 +597,12 @@ GENERATE_YT_RECORD(
     scheduler/records/job_spec.yaml
 )
 
+GENERATE_YT_RECORD(
+    queue_client/records/queue_producer_session.yaml
+    OUTPUT_INCLUDES
+    yt/yt/core/yson/string.h
+)
+
 ADDINCL(
     contrib/libs/sparsehash/src
 )
@@ -601,6 +629,7 @@ PEERDIR(
     yt/yt/library/xor_filter
     yt/yt/client
     yt/yt/library/formats
+    yt/yt/library/query/engine
     yt/yt/library/query/engine_api
     yt/yt/library/query/row_comparer_api
     yt/yt/library/web_assembly/api
@@ -632,4 +661,5 @@ RECURSE_FOR_TESTS(
     table_client/unittests
     tablet_client/unittests
     queue_client/unittests
+    table_chunk_format/unittests
 )

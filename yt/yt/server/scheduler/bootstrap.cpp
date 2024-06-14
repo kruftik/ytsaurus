@@ -24,6 +24,8 @@
 #include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/helpers.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
 
 #include <yt/yt/library/monitoring/http_integration.h>
@@ -87,7 +89,7 @@ using namespace NLogging;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SchedulerLogger;
+static constexpr auto& Logger = SchedulerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -96,9 +98,9 @@ TBootstrap::TBootstrap(TSchedulerBootstrapConfigPtr config, INodePtr configNode)
     , ConfigNode_(std::move(configNode))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 }
 
@@ -131,6 +133,7 @@ void TBootstrap::DoRun()
     Client_ = Connection_->CreateNativeClient(clientOptions);
 
     Connection_->GetClusterDirectorySynchronizer()->Start();
+    Connection_->GetMasterCellDirectorySynchronizer()->Start();
 
     BusServer_ = CreateBusServer(Config_->BusServer);
 
@@ -156,10 +159,12 @@ void TBootstrap::DoRun()
         &MonitoringManager_,
         &orchidRoot);
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+    }
     SetNodeByYPath(
         orchidRoot,
         "/scheduler",

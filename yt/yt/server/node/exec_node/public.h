@@ -40,8 +40,7 @@ struct TUserSandboxOptions
     std::vector<TTmpfsVolume> TmpfsVolumes;
     std::optional<i64> InodeLimit;
     std::optional<i64> DiskSpaceLimit;
-    bool HasRootFSQuota = false;
-    bool EnableDiskQuota = false;
+    bool EnableRootVolumeDiskQuota = false;
     int UserId = 0;
 
     TCallback<void(const TError&)> DiskOverdraftCallback;
@@ -77,6 +76,8 @@ DECLARE_REFCOUNTED_CLASS(TSlotManager)
 DECLARE_REFCOUNTED_CLASS(TSlotLocation)
 DECLARE_REFCOUNTED_STRUCT(IJobDirectoryManager)
 
+DECLARE_REFCOUNTED_STRUCT(IJobInputCache)
+
 DECLARE_REFCOUNTED_STRUCT(IUserSlot)
 DECLARE_REFCOUNTED_CLASS(TGpuSlot)
 
@@ -84,6 +85,8 @@ DECLARE_REFCOUNTED_CLASS(TControllerAgentConnectorPool)
 DECLARE_REFCOUNTED_CLASS(TSchedulerConnector)
 
 DECLARE_REFCOUNTED_STRUCT(IJobEnvironment)
+
+DECLARE_REFCOUNTED_STRUCT(IJobProxyLogManager)
 
 DEFINE_ENUM(EExecNodeThrottlerKind,
     //! Controls incoming bandwidth used by Artifact Cache downloads.

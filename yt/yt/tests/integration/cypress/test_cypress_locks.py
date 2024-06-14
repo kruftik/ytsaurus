@@ -1591,3 +1591,54 @@ class TestCypressLocksShardedTxCTxS(TestCypressLocksShardedTx):
             }
         }
     }
+
+
+class TestCypressLocksMirroredTx(TestCypressLocksShardedTxCTxS):
+    USE_SEQUOIA = True
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = True
+    ENABLE_TMP_ROOTSTOCK = False
+    NUM_CYPRESS_PROXIES = 1
+    NUM_TEST_PARTITIONS = 8
+
+    _SUPRESSED_MESSAGES = [
+        "Retrieving TVM service ticket",
+        "Polling peer",
+        "Waiting for bus to become ready",
+        "Created bus",
+        "Bus has become ready",
+        "Request is dropped because channel is terminated",
+        "Sleeping before peer polling",
+        "Failed to poll peer",
+        "Parsing service ticket",
+    ]
+
+    DELTA_DRIVER_CONFIG = {
+        "logging": {
+            "suppressed_messages": _SUPRESSED_MESSAGES,
+        },
+    }
+
+    DELTA_DRIVER_LOGGING_CONFIG = {
+        "suppressed_messages": _SUPRESSED_MESSAGES,
+    }
+
+    DELTA_RPC_DRIVER_CONFIG = {
+        "logging": {
+            "suppressed_messages": _SUPRESSED_MESSAGES,
+        },
+    }
+
+    DELTA_CONTROLLER_AGENT_CONFIG = {
+        "commit_operation_cypress_node_changes_via_system_transaction": True,
+    }
+
+    DELTA_DYNAMIC_MASTER_CONFIG = {
+        "transaction_manager": {
+            "forbid_transaction_actions_for_cypress_transactions": True,
+        },
+        "cell_master": {
+            "logging": {
+                "suppressed_messages": _SUPRESSED_MESSAGES,
+            },
+        },
+    }

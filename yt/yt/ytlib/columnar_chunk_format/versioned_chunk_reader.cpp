@@ -38,7 +38,7 @@ using NTableClient::TTableSchemaPtr;
 using NTableClient::TChunkColumnMapping;
 using NTableClient::TChunkColumnMappingPtr;
 
-static const auto& Logger = NTableClient::TableClientLogger;
+static constexpr auto& Logger = NTableClient::TableClientLogger;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -390,7 +390,7 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TString ToString(const TReaderStatistics& statistics)
+void FormatValue(TStringBuilderBase* builder, const TReaderStatistics& statistics, TStringBuf /*spec*/)
 {
     auto ticksInSecond = DurationToCpuDuration(TDuration::Seconds(1));
     auto ticksToNanoseconds = 1000000000 / static_cast<double>(ticksInSecond);
@@ -399,7 +399,8 @@ TString ToString(const TReaderStatistics& statistics)
         return static_cast<ui64>(cpuDuration * ticksToNanoseconds);
     };
 
-    return Format(
+    Format(
+        builder,
         "RowCount: %v, "
         "Summary Init/Read Time: %vns / %vns, "
         "BuildReadWindows/GetValuesIdMapping/CreateColumnBlockHolders/GetTypesFromSchema/BuildColumnInfos/CreateRowsetBuilder/CreateBlockManager Times: %vns / %vns / %vns / %vns / %vns / %vns / %vns, "
@@ -757,6 +758,24 @@ IVersionedReaderPtr CreateVersionedChunkReader(
 
     readerStatistics->BuildColumnInfosTime = getDurationAndReset();
 
+    auto blockManager = blockManagerFactory(std::move(groupBlockHolders), windowsList);
+    readerStatistics->CreateBlockManagerTime = getDurationAndReset();
+
+    // Do not log in case of reading from memory.
+    YT_LOG_DEBUG_IF(
+        !blockManager->IsFetchingCompleted(),
+        "Creating rowset builder (ReadItemCount: %v, GroupIds: %v, KeyTypes: %v, "
+        "ReadItemWidth: %v, KeyColumnIndexes: %v, ValueTypes: %v, NewMeta: %v)",
+        readItemCount,
+        groupIds,
+        keyTypes,
+        readItemWidth,
+        keyColumnIndexes,
+        MakeFormattableView(valueSchema, [] (TStringBuilderBase* builder, TValueSchema valueSchema) {
+            builder->AppendFormat("%v", valueSchema.Type);
+        }),
+        preparedChunkMeta->FullNewMeta);
+
     auto rowsetBuilder = CreateRowsetBuilder(std::move(readItems), {
         keyTypes,
         static_cast<ui16>(readItemWidth),
@@ -769,9 +788,6 @@ IVersionedReaderPtr CreateVersionedChunkReader(
     });
 
     readerStatistics->CreateRowsetBuilderTime = getDurationAndReset();
-
-    auto blockManager = blockManagerFactory(std::move(groupBlockHolders), windowsList);
-    readerStatistics->CreateBlockManagerTime = getDurationAndReset();
 
     std::unique_ptr<bool[]> columnHunkFlags;
     if (chunkSchema->HasHunkColumns()) {
@@ -857,12 +873,24 @@ TSharedRange<TRowRange> ClipRanges(
     }
 
     if (startIt != endIt) {
+        if (lower && lower <= startIt->first) {
+            lower = {};
+        }
+
+        if (upper && upper >= (endIt - 1)->second) {
+            upper = {};
+        }
+
+        if (!lower && !upper) {
+            return ranges.Slice(startIt, endIt);
+        }
+
         std::vector<TRowRange> items(startIt, endIt);
-        if (lower && lower > items.front().first) {
+        if (lower) {
             items.front().first = lower;
         }
 
-        if (upper && upper < items.back().second) {
+        if (upper) {
             items.back().second = upper;
         }
 

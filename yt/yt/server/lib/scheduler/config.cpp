@@ -314,11 +314,6 @@ void TFairShareStrategyTreeConfig::Register(TRegistrar registrar)
     registrar.Parameter("enable_aggressive_starvation", &TThis::EnableAggressiveStarvation)
         .Default(false);
 
-    registrar.Parameter("max_unpreemptible_running_allocation_count", &TThis::MaxUnpreemptibleRunningAllocationCount)
-        .Alias("max_unpreemptible_running_job_count")
-        .Alias("max_unpreemptable_running_job_count")
-        .Default();
-
     registrar.Parameter("non_preemptible_resource_usage_threshold", &TThis::NonPreemptibleResourceUsageThreshold)
         .DefaultNew();
 
@@ -591,11 +586,6 @@ void TFairShareStrategyTreeConfig::Register(TRegistrar registrar)
     registrar.Postprocessor([&] (TFairShareStrategyTreeConfig* config) {
         if (!config->NonPreemptibleResourceUsageThreshold) {
             THROW_ERROR_EXCEPTION("\"non_preemptible_resource_usage_threshold\" must not be null");
-        }
-
-        auto& nonPreemptibleUserSlotsUsage = config->NonPreemptibleResourceUsageThreshold->UserSlots;
-        if (!nonPreemptibleUserSlotsUsage) {
-            nonPreemptibleUserSlotsUsage = config->MaxUnpreemptibleRunningAllocationCount;
         }
     });
 
@@ -1064,7 +1054,13 @@ void TSchedulerConfig::Register(TRegistrar registrar)
         .DefaultNew();
 
     registrar.Parameter("event_log", &TThis::EventLog)
-        .DefaultNew();
+        .DefaultCtor([] {
+            auto config = New<NEventLog::TEventLogManagerConfig>();
+            config->Enable = false;
+            config->MaxRowWeight = 128_MB;
+            config->Path = "//sys/scheduler/event_log";
+            return config;
+        });
 
     registrar.Parameter("spec_template", &TThis::SpecTemplate)
         .Default();
@@ -1187,11 +1183,10 @@ void TSchedulerConfig::Register(TRegistrar registrar)
     registrar.Parameter("rpc_server", &TThis::RpcServer)
         .DefaultNew();
 
+    registrar.Parameter("enable_fair_share_preupdate_offloading", &TThis::EnableFairSharePreUpdateOffloading)
+        .Default(false);
+
     registrar.Preprocessor([&] (TSchedulerConfig* config) {
-        config->EventLog->MaxRowWeight = 128_MB;
-        if (!config->EventLog->Path) {
-            config->EventLog->Path = "//sys/scheduler/event_log";
-        }
         config->OperationServiceResponseKeeper->EnableWarmup = false;
     });
 

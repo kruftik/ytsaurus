@@ -55,7 +55,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = DataNodeLogger;
+static constexpr auto& Logger = DataNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -108,7 +108,7 @@ public:
 
         MediumDirectoryManager_ = New<TMediumDirectoryManager>(
             this,
-            DataNodeLogger);
+            DataNodeLogger());
 
         MediumUpdater_ = New<TMediumUpdater>(
             this,
@@ -163,7 +163,7 @@ public:
                 LegacyRawThrottlers_[kind] = CreateNamedReconfigurableThroughputThrottler(
                     std::move(throttlerConfig),
                     ToString(kind),
-                    DataNodeLogger,
+                    DataNodeLogger(),
                     DataNodeProfiler.WithPrefix("/throttlers"));
             }
 
@@ -224,15 +224,15 @@ public:
         P2PBlockCache_ = New<TP2PBlockCache>(
             GetConfig()->DataNode->P2P,
             P2PActionQueue_->GetInvoker(),
-            GetMemoryUsageTracker()->WithCategory(EMemoryCategory::P2P));
+            GetNodeMemoryUsageTracker()->WithCategory(EMemoryCategory::P2P));
         P2PSnooper_ = New<TP2PSnooper>(
             GetConfig()->DataNode->P2P,
-            GetMemoryUsageTracker()->WithCategory(EMemoryCategory::P2P));
+            GetNodeMemoryUsageTracker()->WithCategory(EMemoryCategory::P2P));
         P2PDistributor_ = New<TP2PDistributor>(
             GetConfig()->DataNode->P2P,
             P2PActionQueue_->GetInvoker(),
             this);
-        GetMemoryUsageTracker()->SetCategoryLimit(EMemoryCategory::P2P, P2PBlockCache_->GetCapacity() + P2PSnooper_->GetCapacity());
+        GetNodeMemoryUsageTracker()->SetCategoryLimit(EMemoryCategory::P2P, P2PBlockCache_->GetCapacity() + P2PSnooper_->GetCapacity());
 
         TableSchemaCache_ = New<TTableSchemaCache>(GetConfig()->DataNode->TableSchemaCache);
 
@@ -243,7 +243,7 @@ public:
         IOThroughputMeter_ = CreateIOThroughputMeter(
             GetDynamicConfigManager(),
             ChunkStore_,
-            DataNodeLogger.WithTag("IOMeter"));
+            DataNodeLogger().WithTag("IOMeter"));
         JobController_->Initialize();
 
         DiskManagerProxy_ = CreateDiskManagerProxy(
@@ -254,7 +254,7 @@ public:
         DiskChangeChecker_ = New<TDiskChangeChecker>(
             DiskInfoProvider_,
             GetControlInvoker(),
-            DataNodeLogger);
+            DataNodeLogger());
         LocationManager_ = New<TLocationManager>(
             this,
             ChunkStore_,
@@ -505,7 +505,7 @@ private:
         P2PBlockCache_->UpdateConfig(newConfig->DataNode->P2P);
         P2PSnooper_->UpdateConfig(newConfig->DataNode->P2P);
         P2PDistributor_->UpdateConfig(newConfig->DataNode->P2P);
-        GetMemoryUsageTracker()->SetCategoryLimit(EMemoryCategory::P2P, P2PBlockCache_->GetCapacity() + P2PSnooper_->GetCapacity());
+        GetNodeMemoryUsageTracker()->SetCategoryLimit(EMemoryCategory::P2P, P2PBlockCache_->GetCapacity() + P2PSnooper_->GetCapacity());
 
         ChunkStore_->UpdateConfig(newConfig->DataNode);
 

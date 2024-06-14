@@ -17,6 +17,8 @@
 #include <yt/yt/ytlib/object_client/caching_object_service.h>
 #include <yt/yt/ytlib/object_client/object_service_cache.h>
 
+#include <yt/yt/client/sequoia_client/public.h>
+
 #include <yt/yt_proto/yt/client/cell_master/proto/cell_directory.pb.h>
 
 #include <yt/yt/core/concurrency/action_queue.h>
@@ -74,8 +76,9 @@ public:
     {
         for (const auto& masterConfig : Config_->SecondaryMasters) {
             auto cellId = masterConfig->CellId;
-            SecondaryMasterConnectionConfigs_[CellTagFromId(cellId)] = masterConfig;
-            SecondaryMasterCellTags_.push_back(CellTagFromId(cellId));
+            auto cellTag = CellTagFromId(cellId);
+            EmplaceOrCrash(SecondaryMasterConnectionConfigs_, cellTag, masterConfig);
+            SecondaryMasterCellTags_.push_back(cellTag);
             SecondaryMasterCellIds_.push_back(cellId);
         }
         // Sort tag list to simplify subsequent equality checks.
@@ -169,10 +172,10 @@ public:
         THashMap<TCellTag, std::vector<TString>> cellAddresses;
         cellAddresses.reserve(protoDirectory.items_size());
 
-        TSecondaryMasterConnectionConfigs cellTagToSecondaryMaster;
-        TCellTagList secondaryCellTags;
-        cellTagToSecondaryMaster.reserve(protoDirectory.items_size());
-        secondaryCellTags.reserve(protoDirectory.items_size());
+        TSecondaryMasterConnectionConfigs newSecondaryMasterConnectionConfigs;
+        TCellTagList newSecondaryMasterCellTags;
+        newSecondaryMasterConnectionConfigs.reserve(protoDirectory.items_size());
+        newSecondaryMasterCellTags.reserve(protoDirectory.items_size());
 
         auto primaryCellFound = false;
 
@@ -180,7 +183,6 @@ public:
             TMasterConnectionConfigPtr masterConnectionConfig;
             FromProto(&masterConnectionConfig, item);
             YT_VERIFY(masterConnectionConfig->Addresses);
-            Sort(*masterConnectionConfig->Addresses);
 
             auto cellId = masterConnectionConfig->CellId;
             auto cellTag = CellTagFromId(cellId);
@@ -198,8 +200,8 @@ public:
                 YT_VERIFY(cellId == PrimaryMasterCellId_);
                 primaryCellFound = true;
             } else {
-                EmplaceOrCrash(cellTagToSecondaryMaster, cellTag, std::move(masterConnectionConfig));
-                secondaryCellTags.push_back(cellTag);
+                EmplaceOrCrash(newSecondaryMasterConnectionConfigs, cellTag, std::move(masterConnectionConfig));
+                newSecondaryMasterCellTags.push_back(cellTag);
             }
         }
 
@@ -207,19 +209,19 @@ public:
         YT_VERIFY(cellTagToRoles.contains(PrimaryMasterCellTag_) && cellAddresses.contains(PrimaryMasterCellTag_));
 
         // To get the actual values under lock.
-        const auto& oldSecondaryMasterCellTags = GetSecondaryMasterCellTags();
-        const auto& oldSecondaryMasterConnectionConfigs = GetSecondaryMasterConnectionConfigs();
+        auto oldSecondaryMasterCellTags = GetSecondaryMasterCellTags();
+        auto oldSecondaryMasterConnectionConfigs = GetSecondaryMasterConnectionConfigs();
 
-        if (ClusterMasterCompositionChanged(cellTagToSecondaryMaster)) {
+        if (ClusterMasterCompositionChanged(newSecondaryMasterConnectionConfigs)) {
             YT_LOG_INFO("Cluster membership configuration has changed, starting reconfiguration "
                 "(SecondaryMasterCellTags: %v, ReceivedSecondaryMasterCellTags: %v)",
                 oldSecondaryMasterCellTags,
-                secondaryCellTags);
-            ReconfigureMasterCellDirectory(oldSecondaryMasterConnectionConfigs, cellTagToSecondaryMaster, secondaryCellTags);
+                newSecondaryMasterCellTags);
+            ReconfigureMasterCellDirectory(oldSecondaryMasterConnectionConfigs, newSecondaryMasterConnectionConfigs, newSecondaryMasterCellTags);
         }
 
         if (oldSecondaryMasterCellTags.empty() &&
-            !secondaryCellTags.empty()) {
+            !newSecondaryMasterCellTags.empty()) {
             const auto primaryMasterCellRoles = cellTagToRoles[PrimaryMasterCellTag_];
             cellTagToRoles.clear();
             cellTagToRoles.emplace(PrimaryMasterCellTag_, primaryMasterCellRoles);
@@ -232,7 +234,6 @@ public:
         } else {
             if (Config_->PrimaryMaster->Addresses) {
                 auto expectedPrimaryCellAddresses = *Config_->PrimaryMaster->Addresses;
-                Sort(expectedPrimaryCellAddresses);
                 const auto& actualPrimaryCellAddresses = cellAddresses[PrimaryMasterCellTag_];
                 YT_LOG_WARNING_UNLESS(
                     expectedPrimaryCellAddresses == actualPrimaryCellAddresses,
@@ -243,7 +244,6 @@ public:
                 for (auto [_, cellConfig] : oldSecondaryMasterConnectionConfigs) {
                     if (cellConfig->Addresses) {
                         auto expectedCellAddresses = *cellConfig->Addresses;
-                        Sort(expectedCellAddresses);
                         const auto& actualCellAddresses = cellAddresses[CellTagFromId(cellConfig->CellId)];
 
                         YT_LOG_WARNING_UNLESS(
@@ -314,15 +314,15 @@ private:
     TCellIdList SecondaryMasterCellIds_;
     THashMap<TCellTag, IServicePtr> CachingObjectServices_;
 
-    bool ClusterMasterCompositionChanged(const TSecondaryMasterConnectionConfigs& secondaryMasterConnectionConfigs)
+    bool ClusterMasterCompositionChanged(const TSecondaryMasterConnectionConfigs& newSecondaryMasterConnectionConfigs)
     {
         const auto& oldSecondaryMasterConnectionConfigs = GetSecondaryMasterConnectionConfigs();
 
-        if (secondaryMasterConnectionConfigs.size() != oldSecondaryMasterConnectionConfigs.size()) {
+        if (newSecondaryMasterConnectionConfigs.size() != oldSecondaryMasterConnectionConfigs.size()) {
             return true;
         }
 
-        for (const auto& [cellTag, secondaryMasterConnectionConfig] : secondaryMasterConnectionConfigs) {
+        for (const auto& [cellTag, secondaryMasterConnectionConfig] : newSecondaryMasterConnectionConfigs) {
             if (!oldSecondaryMasterConnectionConfigs.contains(cellTag)) {
                 return true;
             }
@@ -337,60 +337,75 @@ private:
 
     void ReconfigureMasterCellDirectory(
         const TSecondaryMasterConnectionConfigs& oldSecondaryMasterConnectionConfigs,
-        const TSecondaryMasterConnectionConfigs& secondaryMasterConnectionConfigs,
+        const TSecondaryMasterConnectionConfigs& newSecondaryMasterConnectionConfigs,
         const TCellTagList& secondaryMasterCellTags)
     {
         TCellIdList secondaryMasterCellIds;
-        THashSet<TCellTag> addedSecondaryCellTags;
-        TSecondaryMasterConnectionConfigs reconfiguredSecondaryMasterConfigs;
-        secondaryMasterCellIds.reserve(secondaryMasterConnectionConfigs.size());
-        addedSecondaryCellTags.reserve(secondaryMasterConnectionConfigs.size());
-        reconfiguredSecondaryMasterConfigs.reserve(secondaryMasterConnectionConfigs.size());
+        THashSet<TCellTag> newSecondaryMasterCellTags;
+        THashSet<TCellTag> changedSecondaryMasterCellTags;
+        TSecondaryMasterConnectionConfigs newSecondaryMasterConfigs;
+        TSecondaryMasterConnectionConfigs changedSecondaryMasterConfigs;
+        secondaryMasterCellIds.reserve(newSecondaryMasterConnectionConfigs.size());
+        newSecondaryMasterCellTags.reserve(newSecondaryMasterConnectionConfigs.size());
+        changedSecondaryMasterCellTags.reserve(newSecondaryMasterConnectionConfigs.size());
+        newSecondaryMasterConfigs.reserve(newSecondaryMasterConnectionConfigs.size());
+        changedSecondaryMasterConfigs.reserve(newSecondaryMasterConnectionConfigs.size());
 
-        // TODO(cherepashka): add logic for removal and addition of master cells.
-        for (const auto& [cellTag, secondaryMaster] : secondaryMasterConnectionConfigs) {
+        for (const auto& [cellTag, secondaryMaster] : newSecondaryMasterConnectionConfigs) {
             if (!oldSecondaryMasterConnectionConfigs.contains(cellTag)) {
-                YT_LOG_DEBUG("Unexpected master cell cluster reconfiguration (AppearedCellTag: %v)",
-                    cellTag);
-                InsertOrCrash(addedSecondaryCellTags, cellTag);
+                EmplaceOrCrash(newSecondaryMasterConfigs, cellTag, secondaryMaster);
+                InsertOrCrash(newSecondaryMasterCellTags, cellTag);
             } else if (secondaryMaster->Addresses != GetOrCrash(oldSecondaryMasterConnectionConfigs, cellTag)->Addresses) {
                 YT_LOG_INFO("Master cell will be reconfigured (CellTag: %v, NewCellAddresses: %v, OldCellAddresses: %v)",
                     cellTag,
                     secondaryMaster->Addresses,
                     GetOrCrash(oldSecondaryMasterConnectionConfigs, cellTag)->Addresses);
-                EmplaceOrCrash(reconfiguredSecondaryMasterConfigs, cellTag, secondaryMaster);
+                EmplaceOrCrash(changedSecondaryMasterConfigs, cellTag, secondaryMaster);
+                InsertOrCrash(changedSecondaryMasterCellTags, cellTag);
             }
             secondaryMasterCellIds.push_back(secondaryMaster->CellId);
         }
 
         Sort(secondaryMasterCellIds);
 
-        THashSet<TCellTag> removedSecondaryTags;
+        THashSet<TCellTag> removedSecondaryMasterCellTags;
+        removedSecondaryMasterCellTags.reserve(oldSecondaryMasterConnectionConfigs.size());
         for (const auto& [cellTag, _] : oldSecondaryMasterConnectionConfigs) {
-            if (!secondaryMasterConnectionConfigs.contains(cellTag)) {
-                removedSecondaryTags.insert(cellTag);
+            if (!newSecondaryMasterConnectionConfigs.contains(cellTag)) {
+                InsertOrCrash(removedSecondaryMasterCellTags, cellTag);
             }
         }
-        YT_LOG_WARNING_UNLESS(
-            removedSecondaryTags.empty(),
+        YT_LOG_ALERT_UNLESS(
+            removedSecondaryMasterCellTags.empty(),
             "Some master cells were removed in new configuration of secondary masters (RemovedCellTags: %v)",
-            removedSecondaryTags);
+            removedSecondaryMasterCellTags);
 
         {
             auto guard = WriterGuard(SpinLock_);
-            for (const auto& [cellTag, secondaryMaster] : reconfiguredSecondaryMasterConfigs) {
+            for (const auto& [_, secondaryMaster] : newSecondaryMasterConfigs) {
+                InitMasterChannels(secondaryMaster);
+            }
+            for (const auto& [cellTag, secondaryMaster] : changedSecondaryMasterConfigs) {
                 RemoveMasterChannels(cellTag);
                 InitMasterChannels(secondaryMaster);
             }
-            SecondaryMasterConnectionConfigs_ = secondaryMasterConnectionConfigs;
+            // TODO(cherepashka): add logic for removal of master cells.
+
+            SecondaryMasterConnectionConfigs_ = newSecondaryMasterConnectionConfigs;
             SecondaryMasterCellIds_ = std::move(secondaryMasterCellIds);
             SecondaryMasterCellTags_ = secondaryMasterCellTags;
         }
 
+        YT_LOG_DEBUG("Finished reconfiguration of cell cluster membership "
+            "(NewCellTags: %v, ChangedCellTags: %v, RemovedCellTags: %v)",
+            newSecondaryMasterCellTags,
+            changedSecondaryMasterCellTags,
+            removedSecondaryMasterCellTags);
+
         CellDirectoryChanged_.Fire(
-            addedSecondaryCellTags,
-            reconfiguredSecondaryMasterConfigs,
-            removedSecondaryTags);
+            newSecondaryMasterConfigs,
+            changedSecondaryMasterConfigs,
+            removedSecondaryMasterCellTags);
     }
 
     IChannelPtr GetCellChannelOrThrow(TCellTag cellTag, EMasterChannelKind kind) const
@@ -452,7 +467,7 @@ private:
             CellChannelMap_[cellTag][EMasterChannelKind::Cache],
             Cache_,
             config->CellId,
-            ObjectClientLogger,
+            ObjectClientLogger(),
             /*profiler*/ {},
             /*authenticator*/ nullptr);
         EmplaceOrCrash(CachingObjectServices_, cellTag, cachingObjectService);
@@ -508,6 +523,10 @@ private:
         const NNative::TConnectionOptions& options)
     {
         auto isRetriableError = BIND_NO_PROPAGATE([options] (const TError& error) {
+            if (error.GetCode() == NSequoiaClient::EErrorCode::SequoiaRetriableError) {
+                return true;
+            }
+
             const auto* effectiveError = &error;
             if (error.GetCode() == NObjectClient::EErrorCode::ForwardedRequestFailed &&
                 !error.InnerErrors().empty())

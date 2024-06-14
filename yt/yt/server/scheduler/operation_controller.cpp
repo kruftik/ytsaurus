@@ -17,7 +17,7 @@ using NYT::FromProto;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = SchedulerLogger;
+static constexpr auto& Logger = SchedulerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -64,7 +64,7 @@ void FromProto(
             std::bind(&TBootstrap::GetRemoteClient, bootstrap, _1),
             operationTransactionPingPeriod);
     } catch (const std::exception& ex) {
-        YT_LOG_INFO(ex, "Failed to attach operation transactions", operationId);
+        YT_LOG_INFO(ex, "Failed to attach operation transactions (OperationId: %v)", operationId);
     }
 
     result->Attributes = TOperationControllerInitializeAttributes{
@@ -106,15 +106,18 @@ void FromProto(
     result->Attributes = TYsonString(resultProto.attributes(), EYsonType::MapFragment);
     result->RevivedFromSnapshot = resultProto.revived_from_snapshot();
     for (const auto& allocationProto : resultProto.revived_allocations()) {
+        auto allocationId = FromProto<TAllocationId>(allocationProto.allocation_id());
         auto allocation = New<TAllocation>(
-            FromProto<TAllocationId>(allocationProto.allocation_id()),
+            allocationId,
             operationId,
             incarnationId,
             TControllerEpoch(resultProto.controller_epoch()),
             /*execNode*/ nullptr,
             FromProto<TInstant>(allocationProto.start_time()),
-            FromProto<TJobResources>(allocationProto.resource_limits()),
-            FromProto<TDiskQuota>(allocationProto.disk_quota()),
+            TAllocationStartDescriptor{
+                .Id = allocationId,
+                .ResourceLimits = FromProto<TJobResourcesWithQuota>(allocationProto.resource_limits()),
+            },
             preemptionMode,
             allocationProto.tree_id(),
             UndefinedSchedulingIndex,

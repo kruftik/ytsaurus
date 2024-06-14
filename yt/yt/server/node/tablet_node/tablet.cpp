@@ -17,6 +17,7 @@
 #include "hunk_chunk.h"
 #include "hunk_lock_manager.h"
 #include "hedging_manager_registry.h"
+#include "serialize.h"
 
 #include <yt/yt/server/node/cluster_node/config.h>
 #include <yt/yt/server/node/cluster_node/dynamic_config_manager.h>
@@ -598,7 +599,7 @@ void TSmoothMovementData::ValidateWriteToTablet() const
     }
 
     THROW_ERROR_EXCEPTION("Cannot write into tablet since it is a "
-        "smooth movement %lv in stage %Qlv",
+        "smooth movement %Qlv in stage %Qlv",
         Role_,
         Stage_);
 }
@@ -674,7 +675,7 @@ TTablet::TTablet(
     , Context_(context)
     , LockManager_(New<TLockManager>())
     , HunkLockManager_(CreateHunkLockManager(this, Context_))
-    , Logger(TabletNodeLogger.WithTag("TabletId: %v", Id_))
+    , Logger(TabletNodeLogger().WithTag("TabletId: %v", Id_))
     , Settings_(TTableSettings::CreateNew())
 { }
 
@@ -714,7 +715,7 @@ TTablet::TTablet(
     , IdGenerator_(idGenerator)
     , LockManager_(New<TLockManager>())
     , HunkLockManager_(CreateHunkLockManager(this, Context_))
-    , Logger(TabletNodeLogger.WithTag("TabletId: %v", Id_))
+    , Logger(TabletNodeLogger().WithTag("TabletId: %v", Id_))
     , Settings_(std::move(settings))
     , Eden_(std::make_unique<TPartition>(
         this,
@@ -873,6 +874,7 @@ void TTablet::Save(TSaveContext& context) const
     Save(context, IdGenerator_);
     Save(context, CompressionDictionaryInfos_);
     Save(context, SmoothMovementData_);
+    Save(context, CustomRuntimeData_);
 
     HunkLockManager_->Save(context);
 }
@@ -910,8 +912,6 @@ void TTablet::Load(TLoadContext& context)
     // during construction. Initialize() will take care of this.
     Initialize();
 
-    auto tabletSizeProfiler = GetTabletSizeProfiler();
-
     int storeCount = TSizeSerializer::LoadSuspended(context);
     SERIALIZATION_DUMP_WRITE(context, "stores[%v]", storeCount);
     SERIALIZATION_DUMP_INDENT(context) {
@@ -926,11 +926,14 @@ void TTablet::Load(TLoadContext& context)
                 if (store->IsChunk()) {
                     YT_VERIFY(store->AsChunk()->GetChunkId());
                 }
-
-                tabletSizeProfiler.AddStore(store);
             }
         }
     }
+
+    // NB: We can handle store/hunk chunk in profiling only after it's `Initialize` was called,
+    // since hunk chunks being initialized in `TTablet::Load` we handle it here, but regular stores
+    // should be handled in `TTablet::AsyncLoad`.
+    auto tabletSizeProfiler = GetTabletSizeProfiler();
 
     int hunkChunkCount = TSizeSerializer::LoadSuspended(context);
     SERIALIZATION_DUMP_WRITE(context, "hunk_chunks[%v]", hunkChunkCount);
@@ -1009,10 +1012,7 @@ void TTablet::Load(TLoadContext& context)
 
     Load(context, BackupMetadata_);
 
-    // COMPAT(gritukan)
-    if (context.GetVersion() >= ETabletReign::TabletWriteManager) {
-        TabletWriteManager_->Load(context);
-    }
+    TabletWriteManager_->Load(context);
 
     Load(context, LastDiscardStoresRevision_);
     // COMPAT(ifsmirnov)
@@ -1037,10 +1037,7 @@ void TTablet::Load(TLoadContext& context)
     }
 
     // COMPAT(akozhikhov)
-    if (context.GetVersion() >= ETabletReign::ValueDictionaryCompression ||
-        (context.GetVersion() < ETabletReign::NoMountRevisionCheckInBulkInsert &&
-         context.GetVersion() >= ETabletReign::ValueDictionaryCompression_23_2))
-    {
+    if (context.GetVersion() >= ETabletReign::ValueDictionaryCompression) {
         Load(context, CompressionDictionaryInfos_);
         for (auto policy : TEnumTraits<EDictionaryCompressionPolicy>::GetDomainValues()) {
             auto chunkId = CompressionDictionaryInfos_[policy].ChunkId;
@@ -1057,6 +1054,11 @@ void TTablet::Load(TLoadContext& context)
     // COMPAT(ifsmirnov)
     if (context.GetVersion() >= ETabletReign::SmoothTabletMovement) {
         Load(context, SmoothMovementData_);
+    }
+
+    // COMPAT(gryzlov-ad)
+    if (context.GetVersion() >= ETabletReign::AddTabletCustomRuntimeData) {
+        Load(context, CustomRuntimeData_);
     }
 
     // COMPAT(aleksandra-zh)
@@ -1149,13 +1151,6 @@ void TTablet::AsyncLoad(TLoadContext& context)
     using NYT::Load;
 
     Load(context, *Settings_.MountConfig);
-    // COMPAT(ifsmirnov)
-    if (context.GetVersion() < ETabletReign::MountConfigExperiments) {
-        RawSettings_.Provided.MountConfigNode = ConvertTo<IMapNodePtr>(Load<TYsonString>(context));
-        if (Load<bool>(context)) {
-            RawSettings_.Provided.ExtraMountConfig = ConvertTo<IMapNodePtr>(Load<TYsonString>(context));
-        }
-    }
     Load(context, *Settings_.StoreReaderConfig);
     Load(context, *Settings_.HunkReaderConfig);
     Load(context, *Settings_.StoreWriterConfig);
@@ -1163,41 +1158,34 @@ void TTablet::AsyncLoad(TLoadContext& context)
     Load(context, *Settings_.HunkWriterConfig);
     Load(context, *Settings_.HunkWriterOptions);
 
-    // COMPAT(ifsmirnov)
-    if (context.GetVersion() >= ETabletReign::MountConfigExperiments) {
-        auto& providedSettings = RawSettings_.Provided;
-
-        providedSettings.MountConfigNode = ConvertTo<IMapNodePtr>(Load<TYsonString>(context));
-        if (Load<bool>(context)) {
-            providedSettings.ExtraMountConfig = ConvertTo<IMapNodePtr>(Load<TYsonString>(context));
+    // COMPAT(osidorkin)
+    if (context.GetVersion() < ETabletReign::ChunkReplicaAlwaysPrecache) {
+        const auto& mountConfig = Settings_.MountConfig;
+        if (!mountConfig->PrecacheChunkReplicasOnMount && !mountConfig->RegisterChunkReplicasOnStoresUpdate) {
+            mountConfig->PrecacheChunkReplicasOnMount = true;
+            mountConfig->RegisterChunkReplicasOnStoresUpdate = true;
         }
-
-        RawSettings_.CreateNewProvidedConfigs();
-        Load(context, *providedSettings.StoreReaderConfig);
-        Load(context, *providedSettings.HunkReaderConfig);
-        Load(context, *providedSettings.StoreWriterConfig);
-        Load(context, *providedSettings.StoreWriterOptions);
-        Load(context, *providedSettings.HunkWriterConfig);
-        Load(context, *providedSettings.HunkWriterOptions);
-
-        RawSettings_.GlobalPatch = New<TTableConfigPatch>();
-        Load(context, *RawSettings_.GlobalPatch);
-        RawSettings_.Experiments = ConvertTo<decltype(RawSettings_.Experiments)>(
-            Load<TYsonString>(context));
-    } else {
-        auto& providedSettings = RawSettings_.Provided;
-
-        // MountConfigNode and ExtraMountConfig should be already filled above.
-
-        providedSettings.StoreReaderConfig = Settings_.StoreReaderConfig;
-        providedSettings.HunkReaderConfig = Settings_.HunkReaderConfig;
-        providedSettings.StoreWriterConfig = Settings_.StoreWriterConfig;
-        providedSettings.StoreWriterOptions = Settings_.StoreWriterOptions;
-        providedSettings.HunkWriterConfig = Settings_.HunkWriterConfig;
-        providedSettings.HunkWriterOptions = Settings_.HunkWriterOptions;
-
-        RawSettings_.GlobalPatch = New<TTableConfigPatch>();
     }
+
+    auto& providedSettings = RawSettings_.Provided;
+
+    providedSettings.MountConfigNode = ConvertTo<IMapNodePtr>(Load<TYsonString>(context));
+    if (Load<bool>(context)) {
+        providedSettings.ExtraMountConfig = ConvertTo<IMapNodePtr>(Load<TYsonString>(context));
+    }
+
+    RawSettings_.CreateNewProvidedConfigs();
+    Load(context, *providedSettings.StoreReaderConfig);
+    Load(context, *providedSettings.HunkReaderConfig);
+    Load(context, *providedSettings.StoreWriterConfig);
+    Load(context, *providedSettings.StoreWriterOptions);
+    Load(context, *providedSettings.HunkWriterConfig);
+    Load(context, *providedSettings.HunkWriterOptions);
+
+    RawSettings_.GlobalPatch = New<TTableConfigPatch>();
+    Load(context, *RawSettings_.GlobalPatch);
+    RawSettings_.Experiments = ConvertTo<decltype(RawSettings_.Experiments)>(
+        Load<TYsonString>(context));
 
     Load(context, PivotKey_);
     Load(context, NextPivotKey_);
@@ -1217,6 +1205,8 @@ void TTablet::AsyncLoad(TLoadContext& context)
         }
     }
 
+    auto tabletSizeProfiler = GetTabletSizeProfiler();
+
     SERIALIZATION_DUMP_WRITE(context, "stores[%v]", StoreIdMap_.size());
     SERIALIZATION_DUMP_INDENT(context) {
         for (int index = 0; index < std::ssize(StoreIdMap_); ++index) {
@@ -1226,14 +1216,12 @@ void TTablet::AsyncLoad(TLoadContext& context)
                 auto store = GetStore(storeId);
                 store->AsyncLoad(context);
                 store->Initialize();
+                tabletSizeProfiler.AddStore(store);
             }
         }
     }
 
-    // COMPAT(gritukan)
-    if (context.GetVersion() >= ETabletReign::TabletWriteManager) {
-        TabletWriteManager_->AsyncLoad(context);
-    }
+    TabletWriteManager_->AsyncLoad(context);
 }
 
 void TTablet::Clear()
@@ -1983,6 +1971,8 @@ TTabletSnapshotPtr TTablet::BuildSnapshot(
 
     snapshot->TabletCellBundle = Context_->GetTabletCellBundleName();
 
+    snapshot->CustomRuntimeData = CustomRuntimeData_;
+
     return snapshot;
 }
 
@@ -2110,7 +2100,7 @@ void TTablet::ReconfigureRowCache(const ITabletSlotPtr& slot)
             lookupCacheCapacity,
             TabletNodeProfiler.WithTag("table_path", TablePath_).WithPrefix("/row_cache"),
             Context_
-                ->GetMemoryUsageTracker()
+                ->GetNodeMemoryUsageTracker()
                 ->WithCategory(EMemoryCategory::LookupRowsCache));
     }
 
@@ -2455,6 +2445,9 @@ void TTablet::PopulateReplicateTabletContentRequest(NProto::TReqReplicateTabletC
     replicatableContent->set_trimmed_row_count(GetTrimmedRowCount());
     replicatableContent->set_retained_timestamp(RetainedTimestamp_);
     replicatableContent->set_cumulative_data_weight(CumulativeDataWeight_);
+    if (CustomRuntimeData_) {
+        replicatableContent->set_custom_runtime_data(CustomRuntimeData_.ToString());
+    }
 
     request->set_last_commit_timestamp(GetLastCommitTimestamp());
     request->set_last_write_timestamp(GetLastWriteTimestamp());
@@ -2504,6 +2497,10 @@ void TTablet::LoadReplicatedContent(const NProto::TReqReplicateTabletContent* re
     SetTrimmedRowCount(replicatableContent.trimmed_row_count());
     RetainedTimestamp_ = replicatableContent.retained_timestamp();
     CumulativeDataWeight_ = replicatableContent.cumulative_data_weight();
+
+    CustomRuntimeData_ = replicatableContent.has_custom_runtime_data()
+        ? TYsonString(replicatableContent.custom_runtime_data())
+        : TYsonString();
 
     RuntimeData_->LastCommitTimestamp = request->last_commit_timestamp();
     RuntimeData_->LastWriteTimestamp = request->last_write_timestamp();

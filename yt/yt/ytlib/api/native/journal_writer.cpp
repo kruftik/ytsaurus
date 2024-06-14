@@ -143,7 +143,7 @@ private:
             , Options_(options)
             , Config_(options.Config ? options.Config : New<TJournalWriterConfig>())
             , Counters_(options.Counters)
-            , Logger(ApiLogger.WithTag("Path: %v, TransactionId: %v",
+            , Logger(ApiLogger().WithTag("Path: %v, TransactionId: %v",
                 Path_,
                 Options_.TransactionId))
         {
@@ -291,6 +291,8 @@ private:
 
         TChunkListId ChunkListId_;
         IChannelPtr UploadMasterChannel_;
+
+        int OpenChunkSessionRetryIndex_ = 0;
 
         struct TNode
             : public TRefCounted
@@ -681,15 +683,18 @@ private:
             {
                 TEventTimerGuard timingGuard(Counters_.CreateChunkTimer);
 
-                auto batchReq = CreateExecuteBatchRequest();
+                TChunkServiceProxy proxy(UploadMasterChannel_);
+
+                auto req = proxy.CreateChunk();
+                GenerateMutationId(req);
+
                 if (AreOverlayedChunksEnabled()) {
-                    batchReq->RequireServerFeature(EMasterFeature::OverlayedJournals);
+                    req->RequireServerFeature(EMasterFeature::OverlayedJournals);
                 }
 
                 // NB: It is too dangerous to throttle journals.
                 // Hence we omit setting logical_request_weight.
                 // And set user to "root".
-                auto* req = batchReq->add_create_chunk_subrequests();
                 req->set_type(ToProto<int>(ErasureCodec_ == NErasure::ECodec::None ? EObjectType::JournalChunk : EObjectType::ErasureJournalChunk));
                 req->set_account(Account_);
                 ToProto(req->mutable_transaction_id(), UploadTransaction_->GetId());
@@ -703,15 +708,14 @@ private:
                 req->set_overlayed(AreOverlayedChunksEnabled());
                 req->set_replica_lag_limit(Options_.ReplicaLagLimit);
 
-                auto batchRspOrError = WaitFor(batchReq->Invoke());
+                auto rspOrError = WaitFor(req->Invoke());
                 THROW_ERROR_EXCEPTION_IF_FAILED(
-                    GetCumulativeError(batchRspOrError),
+                    rspOrError,
                     "Error creating chunk");
 
-                const auto& batchRsp = batchRspOrError.Value();
-                const auto& rsp = batchRsp->create_chunk_subresponses(0);
+                const auto& rsp = rspOrError.Value();
 
-                session->Id = FromProto<TSessionId>(rsp.session_id());
+                session->Id = FromProto<TSessionId>(rsp->session_id());
             }
 
             YT_LOG_DEBUG("Chunk created (SessionId: %v, ElapsedTime: %v)",
@@ -819,10 +823,15 @@ private:
             {
                 TEventTimerGuard timingGuard(Counters_.ConfirmChunkTimer);
 
-                auto batchReq = CreateExecuteBatchRequest();
                 YT_VERIFY(!replicas.empty());
                 YT_VERIFY(session->Nodes.size() == replicas.size());
-                auto* req = batchReq->add_confirm_chunk_subrequests();
+                TChunkServiceProxy proxy(UploadMasterChannel_);
+
+                auto req = proxy.ConfirmChunk();
+                GenerateMutationId(req);
+                auto* multicellSyncExt = req->Header().MutableExtension(NObjectClient::NProto::TMulticellSyncExt::multicell_sync_ext);
+                multicellSyncExt->set_suppress_upstream_sync(true);
+
                 ToProto(req->mutable_chunk_id(), chunkId);
                 req->mutable_chunk_info();
                 ToProto(req->mutable_legacy_replicas(), replicas);
@@ -847,9 +856,9 @@ private:
                 TMiscExt miscExt;
                 SetProtoExtension(meta->mutable_extensions(), miscExt);
 
-                auto batchRspOrError = WaitFor(batchReq->Invoke());
+                auto rspOrError = WaitFor(req->Invoke());
                 THROW_ERROR_EXCEPTION_IF_FAILED(
-                    GetCumulativeError(batchRspOrError),
+                    rspOrError,
                     "Error confirming chunk %v",
                     chunkId);
             }
@@ -927,12 +936,23 @@ private:
                                 sessionIndex,
                                 Config_->OpenSessionBackoffTime);
 
+                            OpenChunkSessionRetryIndex_++;
+                            if (OpenChunkSessionRetryIndex_ > Config_->OpenSessionRetryCount) {
+                                promise.TrySet(TError(
+                                    NChunkClient::EErrorCode::MasterCommunicationFailed,
+                                    "Failed to open chunk session, retry count limit exceeded")
+                                    << TErrorAttribute("retry_count", Config_->OpenSessionRetryCount));
+                                return;
+                            }
+
                             TDelayedExecutor::Submit(
                                 BIND(&TImpl::ScheduleAllocateChunkSession, MakeWeak(this), promise, sessionIndex)
                                     .Via(Invoker_),
                                 Config_->OpenSessionBackoffTime);
                             return;
                         }
+
+                        OpenChunkSessionRetryIndex_ = 0;
 
                         // NB: Avoid overwriting EChunkSessionState::Discarded state.
                         if (session->State == EChunkSessionState::Allocating) {

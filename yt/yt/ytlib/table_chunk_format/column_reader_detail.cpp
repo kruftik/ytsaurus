@@ -11,7 +11,7 @@ using namespace NTableClient;
 
 TUnversionedSegmentReaderBase::TUnversionedSegmentReaderBase(
     TRef data,
-    const TSegmentMeta& meta,
+    const NProto::TSegmentMeta& meta,
     int columnIndex,
     int columnId,
     EValueType valueType,
@@ -68,9 +68,9 @@ const char* TVersionedValueExtractorBase::InitTimestampIndexReader(const char* p
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TDenseVersionedValueExtractorBase::TDenseVersionedValueExtractorBase(const TSegmentMeta& meta, bool aggregate)
+TDenseVersionedValueExtractorBase::TDenseVersionedValueExtractorBase(const NProto::TSegmentMeta& meta, bool aggregate)
     : TVersionedValueExtractorBase(aggregate)
-    , DenseVersionedMeta_(meta.GetExtension(TDenseVersionedSegmentMeta::dense_versioned_segment_meta))
+    , DenseVersionedMeta_(meta.GetExtension(NProto::TDenseVersionedSegmentMeta::dense_versioned_segment_meta))
 { }
 
 std::pair<ui32, ui32> TDenseVersionedValueExtractorBase::GetValueIndexRange(i64 segmentRowIndex, ui32 lowerTimestampIndex)
@@ -265,8 +265,7 @@ int TColumnReaderBase::FindSegmentByRowIndex(i64 rowIndex) const
         rowIndex,
         [] (i64 index, const NProto::TSegmentMeta& segmentMeta) {
             return index < segmentMeta.chunk_row_count();
-        }
-    );
+        });
 
     return std::distance(ColumnMeta_.segments().begin(), it);
 }
@@ -285,8 +284,7 @@ int TColumnReaderBase::FindFirstBlockSegment() const
         CurrentBlockIndex_,
         [] (const NProto::TSegmentMeta& segmentMeta, int blockIndex) {
             return segmentMeta.block_index() < blockIndex;
-        }
-    );
+        });
     YT_VERIFY(it != ColumnMeta_.segments().end());
     return std::distance(ColumnMeta_.segments().begin(), it);
 }
@@ -299,8 +297,7 @@ int TColumnReaderBase::FindLastBlockSegment() const
         CurrentBlockIndex_,
         [] (int blockIndex, const NProto::TSegmentMeta& segmentMeta) {
             return blockIndex < segmentMeta.block_index();
-        }
-    );
+        });
 
     YT_VERIFY(it != ColumnMeta_.segments().begin());
     return std::distance(ColumnMeta_.segments().begin(), it - 1);
@@ -393,7 +390,7 @@ void TUnversionedColumnReaderBase::CreateCurrentSegmentReader()
 ////////////////////////////////////////////////////////////////////////////////
 
 TVersionedColumnReaderBase::TVersionedColumnReaderBase(
-    const TColumnMeta& columnMeta,
+    const NProto::TColumnMeta& columnMeta,
     int columnId,
     const TColumnSchema& columnSchema)
     : TColumnReaderBase(columnMeta)

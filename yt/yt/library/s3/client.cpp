@@ -96,6 +96,18 @@ void TListObjectsResponse::Deserialize(const NHttp::IResponsePtr& response)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void TPutBucketRequest::Serialize(THttpRequest* request) const
+{
+    request->Method = NHttp::EMethod::Put;
+    request->Path = Format("/%v", Bucket);
+    request->Headers["Content-Length"] = "0";
+}
+
+void TPutBucketResponse::Deserialize(const NHttp::IResponsePtr& /*response*/)
+{ }
+
+////////////////////////////////////////////////////////////////////////////////
+
 void TPutObjectRequest::Serialize(THttpRequest* request) const
 {
     request->Method = NHttp::EMethod::Put;
@@ -299,6 +311,7 @@ public:
 
     DEFINE_STRUCTURED_COMMAND(ListBuckets)
     DEFINE_STRUCTURED_COMMAND(ListObjects)
+    DEFINE_STRUCTURED_COMMAND(PutBucket)
     DEFINE_STRUCTURED_COMMAND(PutObject)
     DEFINE_STRUCTURED_COMMAND(UploadPart)
     DEFINE_STRUCTURED_COMMAND(GetObject)
@@ -316,8 +329,7 @@ private:
         auto error = NYT::TError(
             "Got status code %v %v",
             ToUnderlying(statusCode),
-            ToHttpString(statusCode)
-        );
+            ToHttpString(statusCode));
         auto responseBody = response->ReadAll();
         try {
             const auto xml = ParseXmlDocument(responseBody);
@@ -325,7 +337,7 @@ private:
                 error <<= TErrorAttribute(node.Name(), node.Value<TString>());
             }
         } catch (const std::exception&) {
-            error <<= TErrorAttribute("ResponseBody", responseBody.ToStringBuf());
+            error <<= TErrorAttribute("response_body", responseBody.ToStringBuf());
             auto headers = response->GetHeaders();
             for (TStringBuf header : {"x-amz-request-id", "x-amz-id-2"}) {
                 if (auto* value = headers->Find(header)) {
@@ -342,14 +354,14 @@ private:
         auto req = BaseHttpRequest_;
         request.Serialize(&req);
 
-        return BIND([this, this_ = MakeStrong(this)](THttpRequest req) {
+        return BIND([this, this_ = MakeStrong(this)] (THttpRequest req) {
             PrepareHttpRequest(
                 &req,
                 Config_->AccessKeyId,
                 Config_->SecretAccessKey);
 
             return Client_->MakeRequest(std::move(req))
-                .ApplyUnique(BIND([](TErrorOr<NHttp::IResponsePtr>&& responseOrError) -> TErrorOr<TCommandResponse> {
+                .ApplyUnique(BIND([] (TErrorOr<NHttp::IResponsePtr>&& responseOrError) -> TErrorOr<TCommandResponse> {
                     if (!responseOrError.IsOK()) {
                         return TError("HTTP request failed") << std::move(responseOrError);
                     }

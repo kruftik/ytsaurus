@@ -4,7 +4,6 @@
 #include "partition_balancer.h"
 #include "private.h"
 #include "slot_manager.h"
-#include "slot_manager.h"
 #include "store.h"
 #include "sorted_chunk_store.h"
 #include "store_compactor.h"
@@ -44,7 +43,7 @@ using namespace NTableClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletNodeLogger;
+static constexpr auto& Logger = TabletNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -148,7 +147,7 @@ private:
         backendState.TabletNodeConfig = Bootstrap_->GetConfig()->TabletNode;
         backendState.TabletNodeDynamicConfig = Bootstrap_->GetDynamicConfigManager()->GetConfig()->TabletNode;
 
-        const auto& memoryTracker = Bootstrap_->GetMemoryUsageTracker();
+        const auto& memoryTracker = Bootstrap_->GetNodeMemoryUsageTracker();
         const auto& cellar = Bootstrap_->GetCellarManager()->GetCellar(NCellarClient::ECellarType::Tablet);
         for (const auto& occupant : cellar->Occupants()) {
             if (!occupant) {

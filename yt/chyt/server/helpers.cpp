@@ -70,8 +70,9 @@ void RegisterNewUser(
 {
     auto user = std::make_unique<DB::User>();
     user->setName(userName);
-    user->access.grant(DB::AccessFlags::allFlags(), "YT" /*database*/);
-    user->access.grant(DB::AccessFlags::allFlags(), "system" /*database*/);
+    user->access.grant(DB::AccessFlags::allFlags(), /*database*/ "YT");
+    user->access.grant(DB::AccessType::SHOW, /*database*/ "system");
+    user->access.grant(DB::AccessType::SELECT, /*database*/ "system");
     user->access.grant(DB::AccessType::CREATE_TEMPORARY_TABLE);
     user->access.grant(DB::AccessType::dictGet);
 
@@ -475,6 +476,28 @@ DB::ASTPtr WrapTableExpressionWithSubquery(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void HandleBreakpoint(
+    const NYPath::TYPath& breakpointFilename,
+    const NApi::IClientPtr& client)
+{
+    auto resultOrError = WaitFor(client->CreateNode(breakpointFilename, EObjectType::MapNode));
+    if (!resultOrError.IsOK() && resultOrError.FindMatching(NYTree::EErrorCode::AlreadyExists)) {
+        return;
+    }
+    resultOrError.ThrowOnError();
+
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        bool exists = WaitFor(client->NodeExists(Format("%v/release", breakpointFilename)))
+            .ValueOrThrow();
+        if (exists) {
+            break;
+        }
+        TDelayedExecutor::WaitForDuration(TDuration::MilliSeconds(300));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 } // namespace NYT::NClickHouseServer
 
 namespace DB {
@@ -546,11 +569,20 @@ TString ToString(const Block& block)
         content.Flush());
 }
 
+void FormatValue(NYT::TStringBuilderBase* builder, const Field& field, TStringBuf spec)
+{
+    FormatValue(builder, ToString(field), spec);
+}
+
+void FormatValue(NYT::TStringBuilderBase* builder, const Block& block, TStringBuf spec)
+{
+    FormatValue(builder, ToString(block), spec);
+}
+
 void PrintTo(const Field& field, std::ostream* os)
 {
     *os << ToString(field);
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 

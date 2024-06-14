@@ -274,6 +274,7 @@ public class YTsaurusClientConfig {
 
         /**
          * If true, rpc proxy balancer addresses will be ignored and only rpc proxy addresses will be discovered.
+         *
          * @return this
          */
         public Builder setIgnoreBalancers(boolean ignoreBalancers) {
@@ -285,7 +286,9 @@ public class YTsaurusClientConfig {
             javaOptions = JavaOptions.empty().withOption("-XX:+UseParallelGC");
 
             int javaMajorVersion = getJavaMajorVersion();
-            if (javaMajorVersion >= 17) {
+            if (javaMajorVersion >= 21) {
+                javaBinary = "/opt/jdk21/bin/java";
+            } else if (javaMajorVersion >= 17) {
                 javaBinary = "/opt/jdk17/bin/java";
             } else if (javaMajorVersion >= 15) {
                 javaBinary = "/opt/jdk15/bin/java";
@@ -297,8 +300,7 @@ public class YTsaurusClientConfig {
                     .beginMap()
                     .key("layer_paths").value(Arrays.asList(
                             "//porto_layers/delta/jdk/layer_with_jdk_lastest.tar.gz",
-                            "//porto_layers/base/precise/" +
-                                    "porto_layer_search_ubuntu_precise_app_lastest.tar.gz"
+                            "//porto_layers/base/focal/porto_layer_search_ubuntu_focal_app_lastest.tar.gz"
                     ))
                     .endMap()
                     .build();

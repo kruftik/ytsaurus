@@ -167,6 +167,9 @@ void TDynamicChunkMergerConfig::Register(TRegistrar registrar)
     registrar.Parameter("delay_between_iterations", &TThis::DelayBetweenIterations)
         .Default();
 
+    registrar.Parameter("max_meta_chunk_size", &TThis::MaxChunkMeta)
+        .Default(15000);
+
     registrar.Parameter("allow_setting_chunk_merger_mode", &TThis::AllowSettingChunkMergerMode)
         .Default(false);
 }
@@ -531,6 +534,9 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
         .Default(256_MB)
         .GreaterThanOrEqual(0);
 
+    registrar.Parameter("force_rack_awareness_for_erasure_parts", &TThis::ForceRackAwarenessForErasureParts)
+        .Default(false);
+
     registrar.Parameter("job_throttler", &TThis::JobThrottler)
         .DefaultCtor([] {
             auto jobThrottler = New<NConcurrency::TThroughputThrottlerConfig>();
@@ -562,6 +568,9 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
         .Default();
 
     registrar.Parameter("deprecated_codec_name_to_alias", &TThis::DeprecatedCodecNameToAlias)
+        .Default();
+
+    registrar.Parameter("forbidden_erasure_codecs", &TThis::ForbiddenErasureCodecs)
         .Default();
 
     registrar.Parameter("max_oldest_part_missing_chunks", &TThis::MaxOldestPartMissingChunks)
@@ -645,6 +654,10 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
     registrar.Parameter("processed_removed_sequoia_replicas_on_master", &TThis::ProcessRemovedSequoiaReplicasOnMaster)
         .Default(true);
 
+    registrar.Parameter("enable_chunk_purgatory", &TThis::EnableChunkPurgatory)
+        .Default(true)
+        .DontSerializeDefault();
+
     registrar.Parameter("removal_job_schedule_delay", &TThis::RemovalJobScheduleDelay)
         .Default(TDuration::Minutes(3))
         .DontSerializeDefault();
@@ -667,7 +680,14 @@ void TDynamicChunkManagerConfig::Register(TRegistrar registrar)
         .Default(true);
 
     registrar.Parameter("schemaless_end_upload_preserves_table_schema", &TThis::SchemalessEndUploadPreservesTableSchema)
+        .Default(true);
+
+    registrar.Parameter("enable_two_random_choices_write_target_allocation", &TThis::EnableTwoRandomChoicesWriteTargetAllocation)
         .Default(false)
+        .DontSerializeDefault();
+
+    registrar.Parameter("nodes_to_check_before_giving_up_on_write_target_allocation", &TThis::NodesToCheckBeforeGivingUpOnWriteTargetAllocation)
+        .Default(32)
         .DontSerializeDefault();
 
     registrar.Postprocessor([] (TThis* config) {

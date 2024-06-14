@@ -19,6 +19,8 @@
 #include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/helpers.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
 
 #include <yt/yt/ytlib/node_tracker_client/node_directory_synchronizer.h>
@@ -86,7 +88,7 @@ using namespace NCoreDump;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ControllerAgentLogger;
+static constexpr auto& Logger = ControllerAgentLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -95,9 +97,9 @@ TBootstrap::TBootstrap(TControllerAgentBootstrapConfigPtr config, INodePtr confi
     , ConfigNode_(std::move(configNode))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 }
 
@@ -137,6 +139,8 @@ void TBootstrap::DoRun()
 
     Connection_->GetClusterDirectorySynchronizer()->Start();
 
+    Connection_->GetMasterCellDirectorySynchronizer()->Start();
+
     auto clientOptions = TClientOptions::FromUser(NSecurityClient::SchedulerUserName);
     Client_ = Connection_->CreateNativeClient(clientOptions);
 
@@ -161,10 +165,12 @@ void TBootstrap::DoRun()
 
     ControllerAgent_->Initialize();
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+    }
     SetNodeByYPath(
         orchidRoot,
         "/controller_agent",

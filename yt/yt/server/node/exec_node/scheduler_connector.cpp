@@ -3,13 +3,10 @@
 #include "allocation.h"
 #include "bootstrap.h"
 #include "job_controller.h"
-#include "master_connector.h"
 #include "private.h"
+#include "slot_manager.h"
 
 #include <yt/yt/server/node/cluster_node/bootstrap.h>
-#include <yt/yt/server/node/cluster_node/master_connector.h>
-
-#include <yt/yt/server/node/exec_node/slot_manager.h>
 
 #include <yt/yt/server/node/job_agent/job_resource_manager.h>
 
@@ -26,12 +23,13 @@
 
 #include <yt/yt/ytlib/scheduler/job_resources_helpers.h>
 
+#include <yt/yt/library/tracing/jaeger/sampler.h>
+
 #include <yt/yt/core/concurrency/scheduler.h>
 
 namespace NYT::NExecNode {
 
 using namespace NTracing;
-
 using namespace NJobAgent;
 using namespace NNodeTrackerClient;
 using namespace NNodeTrackerClient::NProto;
@@ -43,7 +41,7 @@ using namespace NScheduler;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ExecNodeLogger;
+static constexpr auto& Logger = ExecNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -52,14 +50,15 @@ TSchedulerConnector::TSchedulerConnector(IBootstrap* bootstrap)
     , DynamicConfig_(New<TSchedulerConnectorDynamicConfig>())
     , HeartbeatExecutor_(New<TRetryingPeriodicExecutor>(
         Bootstrap_->GetControlInvoker(),
-        BIND([weakThis = MakeWeak(this)] {
-            auto strongThis = weakThis.Lock();
-            return strongThis ? strongThis->SendHeartbeat() : TError("Scheduler connector is destroyed");
+        BIND([this, weakThis = MakeWeak(this)] {
+            auto this_ = weakThis.Lock();
+            return this_ ? SendHeartbeat() : TError("Scheduler connector is destroyed");
         }),
         DynamicConfig_.Acquire()->HeartbeatExecutor))
     , TimeBetweenSentHeartbeatsCounter_(ExecNodeProfiler.Timer("/scheduler_connector/time_between_sent_heartbeats"))
     , TimeBetweenAcknowledgedHeartbeatsCounter_(ExecNodeProfiler.Timer("/scheduler_connector/time_between_acknowledged_heartbeats"))
     , TimeBetweenFullyProcessedHeartbeatsCounter_(ExecNodeProfiler.Timer("/scheduler_connector/time_between_fully_processed_heartbeats"))
+    , TracingSampler_(New<TSampler>(DynamicConfig_.Acquire()->TracingSampler))
 {
     VERIFY_INVOKER_THREAD_AFFINITY(Bootstrap_->GetControlInvoker(), ControlThread);
 }
@@ -90,6 +89,8 @@ void TSchedulerConnector::OnDynamicConfigChanged(
         newConfig->HeartbeatExecutor.MaxBackoff,
         newConfig->HeartbeatExecutor.BackoffMultiplier);
     HeartbeatExecutor_->SetOptions(newConfig->HeartbeatExecutor);
+
+    TracingSampler_->UpdateConfig(newConfig->TracingSampler);
 }
 
 void TSchedulerConnector::DoSendOutOfBandHeartbeatIfNeeded()
@@ -103,13 +104,16 @@ void TSchedulerConnector::DoSendOutOfBandHeartbeatIfNeeded()
 
     const auto& jobResourceManager = Bootstrap_->GetJobResourceManager();
     auto resourceLimits = jobResourceManager->GetResourceLimits();
-    auto resourceUsage = jobResourceManager->GetResourceUsage(/*includeWaiting*/ true);
-    bool hasWaitingResourceHolders = jobResourceManager->GetWaitingResourceHolderCount();
+    auto resourceUsage = jobResourceManager->GetResourceUsage({
+        NJobAgent::EResourcesState::Pending,
+        NJobAgent::EResourcesState::Acquired,
+    });
+    bool hasPendingResourceHolders = jobResourceManager->GetPendingResourceHolderCount() > 0;
 
     auto freeResources = MakeNonnegative(resourceLimits - resourceUsage);
 
     if (!Dominates(MinSpareResources_, ToJobResources(ToNodeResources(freeResources))) &&
-        !hasWaitingResourceHolders)
+        !hasPendingResourceHolders)
     {
         scheduleOutOfBandHeartbeat();
     }
@@ -191,6 +195,9 @@ TError TSchedulerConnector::DoSendHeartbeat()
         requestTraceContext = TTraceContext::NewRoot("SchedulerHeartbeatRequest");
         requestTraceContext->SetRecorded();
         requestTraceContext->AddTag("node_id", ToString(nodeId));
+
+        static const TString SchedulerConnectorTracingUserName = "scheduler_connector";
+        TracingSampler_->SampleTraceContext(SchedulerConnectorTracingUserName, requestTraceContext);
     }
 
     auto contextGuard = TTraceContextGuard(requestTraceContext);

@@ -111,12 +111,7 @@ void TLegacyInputSliceLimit::Persist(const TPersistenceContext& context)
     Persist(context, Key);
 }
 
-TString ToString(const TLegacyInputSliceLimit& limit)
-{
-    return Format("RowIndex: %v, Key: %v", limit.RowIndex, limit.Key);
-}
-
-void FormatValue(TStringBuilderBase* builder, const TLegacyInputSliceLimit& limit, TStringBuf /*format*/)
+void FormatValue(TStringBuilderBase* builder, const TLegacyInputSliceLimit& limit, TStringBuf /*spec*/)
 {
     builder->AppendFormat("{RowIndex: %v, Key: %v}",
         limit.RowIndex,
@@ -239,12 +234,7 @@ void Serialize(const TInputSliceLimit& limit, IYsonConsumer* consumer)
         .EndMap();
 }
 
-TString ToString(const TInputSliceLimit& limit)
-{
-    return ToStringViaBuilder(limit);
-}
-
-void FormatValue(TStringBuilderBase* builder, const TInputSliceLimit& limit, TStringBuf /*format*/)
+void FormatValue(TStringBuilderBase* builder, const TInputSliceLimit& limit, TStringBuf /*spec*/)
 {
     if (!limit.RowIndex && !limit.KeyBound) {
         builder->AppendChar('#');
@@ -424,7 +414,7 @@ TInputChunkSlice::TInputChunkSlice(
     }
 
     if (LegacyUpperLimit_.RowIndex) {
-        OverrideSize(*LegacyUpperLimit_.RowIndex - *LegacyLowerLimit_.RowIndex, std::max<i64>(1, dataWeight * inputChunk->GetColumnSelectivityFactor()));
+        OverrideSize(*LegacyUpperLimit_.RowIndex - *LegacyLowerLimit_.RowIndex, std::max<i64>(1, dataWeight * inputChunk->GetSelectivityFactor()));
     }
 }
 
@@ -441,7 +431,7 @@ TInputChunkSlice::TInputChunkSlice(
 
     if (protoChunkSlice.has_row_count_override() || protoChunkSlice.has_data_weight_override()) {
         YT_VERIFY((protoChunkSlice.has_row_count_override() && protoChunkSlice.has_data_weight_override()));
-        OverrideSize(protoChunkSlice.row_count_override(), std::max<i64>(1, protoChunkSlice.data_weight_override() * inputChunk->GetColumnSelectivityFactor()));
+        OverrideSize(protoChunkSlice.row_count_override(), std::max<i64>(1, protoChunkSlice.data_weight_override() * inputChunk->GetSelectivityFactor()));
     }
 }
 
@@ -464,7 +454,7 @@ TInputChunkSlice::TInputChunkSlice(
 
     if (protoChunkSlice.has_row_count_override() || protoChunkSlice.has_data_weight_override()) {
         YT_VERIFY(protoChunkSlice.has_row_count_override() && protoChunkSlice.has_data_weight_override());
-        OverrideSize(protoChunkSlice.row_count_override(), std::max<i64>(1, protoChunkSlice.data_weight_override() * chunkSlice.GetInputChunk()->GetColumnSelectivityFactor()));
+        OverrideSize(protoChunkSlice.row_count_override(), std::max<i64>(1, protoChunkSlice.data_weight_override() * chunkSlice.GetInputChunk()->GetSelectivityFactor()));
     }
 }
 
@@ -489,7 +479,7 @@ TInputChunkSlice::TInputChunkSlice(
 
     if (protoChunkSlice.has_row_count_override() || protoChunkSlice.has_data_weight_override()) {
         YT_VERIFY(protoChunkSlice.has_row_count_override() && protoChunkSlice.has_data_weight_override());
-        OverrideSize(protoChunkSlice.row_count_override(), std::max<i64>(1, protoChunkSlice.data_weight_override() * chunkSlice.GetInputChunk()->GetColumnSelectivityFactor()));
+        OverrideSize(protoChunkSlice.row_count_override(), std::max<i64>(1, protoChunkSlice.data_weight_override() * chunkSlice.GetInputChunk()->GetSelectivityFactor()));
     }
 }
 
@@ -506,7 +496,7 @@ TInputChunkSlice::TInputChunkSlice(
 
     if (protoChunkSpec.has_row_count_override() || protoChunkSpec.has_data_weight_override()) {
         YT_VERIFY((protoChunkSpec.has_row_count_override() && protoChunkSpec.has_data_weight_override()));
-        OverrideSize(protoChunkSpec.row_count_override(), std::max<i64>(1, protoChunkSpec.data_weight_override() * inputChunk->GetColumnSelectivityFactor()));
+        OverrideSize(protoChunkSpec.row_count_override(), std::max<i64>(1, protoChunkSpec.data_weight_override() * inputChunk->GetSelectivityFactor()));
     }
 }
 
@@ -532,6 +522,7 @@ std::vector<TInputChunkSlicePtr> TInputChunkSlice::SliceEvenly(i64 sliceDataWeig
         lowerRowIndex = LowerLimit_.RowIndex.value_or(0);
         upperRowIndex = UpperLimit_.RowIndex.value_or(InputChunk_->GetRowCount());
     }
+    upperRowIndex = std::max(lowerRowIndex, upperRowIndex);
     i64 rowCount = upperRowIndex - lowerRowIndex;
 
     if (rowCount == 0) {
@@ -742,9 +733,11 @@ void TInputChunkSlice::Persist(const TPersistenceContext& context)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TString ToString(const TInputChunkSlicePtr& slice)
+void FormatValue(TStringBuilderBase* builder, const TInputChunkSlicePtr& slice, TStringBuf /*spec*/)
 {
-    return Format("ChunkId: %v, LowerLimit: %v, UpperLimit: %v, RowCount: %v, DataWeight: %v, PartIndex: %v",
+    Format(
+        builder,
+        "ChunkId: %v, LowerLimit: %v, UpperLimit: %v, RowCount: %v, DataWeight: %v, PartIndex: %v",
         slice->GetInputChunk()->GetChunkId(),
         slice->IsLegacy ? ToString(slice->LegacyLowerLimit()) : ToString(slice->LowerLimit()),
         slice->IsLegacy ? ToString(slice->LegacyUpperLimit()) : ToString(slice->UpperLimit()),

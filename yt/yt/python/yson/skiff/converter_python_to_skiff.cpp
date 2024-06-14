@@ -242,8 +242,7 @@ TPythonToSkiffConverter CreatePrimitivePythonToSkiffConverterImpl(TString descri
                         std::move(converter), \
                         isPySchemaOptional, \
                         isTiSchemaOptional, \
-                        IsValidateOptionalOnRuntime \
-                    ); \
+                        IsValidateOptionalOnRuntime); \
                 }
 
                 CASE(EWireType::Int8)
@@ -267,8 +266,7 @@ TPythonToSkiffConverter CreatePrimitivePythonToSkiffConverterImpl(TString descri
                     std::move(converter), \
                     isPySchemaOptional, \
                     isTiSchemaOptional, \
-                    IsValidateOptionalOnRuntime \
-                ); \
+                    IsValidateOptionalOnRuntime); \
             }
 
         CASE(EPythonType::Bytes, EWireType::String32)
@@ -282,7 +280,7 @@ TPythonToSkiffConverter CreatePrimitivePythonToSkiffConverterImpl(TString descri
 
 TPythonToSkiffConverter WrapWithMiddlewareConverter(TPythonToSkiffConverter converter, Py::Callable middlewareConverter, bool isTiSchemaOptional)
 {
-    auto simpleConverter = [converter = std::move(converter), middlewareConverter = std::move(middlewareConverter)](PyObject* obj, TCheckedInDebugSkiffWriter* writer) mutable {
+    auto simpleConverter = [converter = std::move(converter), middlewareConverter = std::move(middlewareConverter)] (PyObject* obj, TCheckedInDebugSkiffWriter* writer) mutable {
         Py::Tuple args(1);
         args[0] = Py::Object(obj);
         auto pyBaseObject = middlewareConverter.apply(args);
@@ -290,7 +288,7 @@ TPythonToSkiffConverter WrapWithMiddlewareConverter(TPythonToSkiffConverter conv
     };
 
     if (isTiSchemaOptional) {
-        return [simpleConverter = std::move(simpleConverter)](PyObject* obj, TCheckedInDebugSkiffWriter* writer) mutable {
+        return [simpleConverter = std::move(simpleConverter)] (PyObject* obj, TCheckedInDebugSkiffWriter* writer) mutable {
             if (obj == Py_None) {
                 // The middleware may not be ready to handle None, so we avoid calling it here.
                 writer->WriteVariant8Tag(0);
@@ -356,9 +354,7 @@ public:
                     CreatePythonToSkiffConverter(
                         fieldDescription,
                         GetAttr(field, PySchemaFieldName),
-                        validateOptionalOnRuntime
-                    )
-                );
+                        validateOptionalOnRuntime));
                 FieldNames_.push_back(fieldName);
             }
         }
@@ -394,9 +390,7 @@ public:
             CreatePythonToSkiffConverter(
                 Description_ + ".<list-element>",
                 GetAttr(pySchema, ItemFieldName),
-                validateOptionalOnRuntime
-            )
-        )
+                validateOptionalOnRuntime))
     { }
 
     void operator() (PyObject* obj, TCheckedInDebugSkiffWriter* writer)
@@ -433,8 +427,7 @@ public:
         int i = 0;
         for (const auto& pyElementSchema : Py::List(GetAttr(pySchema, ElementsFieldName))) {
             ElementConverters_.push_back(
-                CreatePythonToSkiffConverter(Format("%v.<tuple-element-%v>", description, i), pyElementSchema, validateOptionalOnRuntime)
-            );
+                CreatePythonToSkiffConverter(Format("%v.<tuple-element-%v>", description, i), pyElementSchema, validateOptionalOnRuntime));
             i += 1;
         }
     }
@@ -508,8 +501,7 @@ public:
         : RowClassName_(GetRowClassName(pySchema))
         , ValidateOptionalOnRuntime_(
             FindAttr(pySchema, SchemaRuntimeContextFieldName)
-            && GetAttr(GetAttr(pySchema, SchemaRuntimeContextFieldName), ValidateOptionalOnRuntimeFieldName).as_bool()
-        )
+            && GetAttr(GetAttr(pySchema, SchemaRuntimeContextFieldName), ValidateOptionalOnRuntimeFieldName).as_bool())
         , StructConverter_(RowClassName_, GetAttr(pySchema, StructSchemaFieldName), ValidateOptionalOnRuntime_)
     {
         auto otherColumnsField = GetAttr(GetAttr(pySchema, StructSchemaFieldName), OtherColumnsFieldFieldName);

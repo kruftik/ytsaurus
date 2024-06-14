@@ -83,11 +83,6 @@ void FormatValue(TStringBuilderBase* builder, const THunkStoreLockingState& ref,
         ref.TransientLockCount);
 }
 
-TString ToString(const THunkStoreLockingState& ref)
-{
-    return ToStringViaBuilder(ref);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 class THunkLockManager
@@ -99,7 +94,7 @@ public:
         ITabletContext* context)
         : Tablet_(tablet)
         , Context_(context)
-        , Logger(TabletNodeLogger.WithTag("LockerTabletId: %v", tablet->GetId()))
+        , Logger(TabletNodeLogger().WithTag("LockerTabletId: %v", tablet->GetId()))
     { }
 
     void Initialize() override
@@ -521,7 +516,6 @@ private:
                     .Force2PC = true,
                     .CoordinatorPrepareMode = ETransactionCoordinatorPrepareMode::Late
                 };
-
                 return transaction->Commit(commitOptions);
             }))
             .Subscribe(BIND([=, this] (const TErrorOr<NApi::TTransactionCommitResult>& resultOrError) {

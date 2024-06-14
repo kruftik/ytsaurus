@@ -12,6 +12,8 @@
 
 #include <yt/yt/server/lib/chunk_server/immutable_chunk_meta.h>
 
+#include <yt/yt/server/lib/misc/assert_sizeof.h>
+
 #include <yt/yt/ytlib/chunk_client/proto/chunk_info.pb.h>
 #include <yt/yt/ytlib/chunk_client/proto/chunk_service.pb.h>
 
@@ -91,7 +93,9 @@ struct TChunkDynamicData
     //! chunks. (The two lists are separate.)
     TIntrusiveLinkedListNode<TChunk> LinkedListNode;
 };
-static_assert(sizeof(TChunkDynamicData) == 144);
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TChunkDynamicData, 144);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -527,7 +531,8 @@ private:
 
 DEFINE_MASTER_OBJECT_TYPE(TChunk)
 
-static_assert(sizeof(TChunk) == 296, "sizeof(TChunk) != 296");
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TChunk, 288);
 
 ////////////////////////////////////////////////////////////////////////////////
 

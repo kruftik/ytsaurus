@@ -2,9 +2,9 @@ RECURSE(
     chyt
     local
     query-tracker
-    queue-agent
     strawberry
     systest
+    ya-build
     ytsaurus
     ytsaurus-bundle
 )

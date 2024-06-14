@@ -26,7 +26,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CellBalancerLogger;
+static constexpr auto& Logger = CellBalancerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -322,7 +322,6 @@ void TCellTrackerImpl::SchedulePeerAssignment(TCellBase* cell, ICellBalancer* ba
     if (hasFollower && !hasLeader) {
         return;
     }
-
 
     // Try to assign missing peers.
     for (int peerId = 0; peerId < std::ssize(cell->Peers()); ++peerId) {

@@ -4,6 +4,7 @@
 #include <yt/yt/server/node/tablet_node/store_manager.h>
 #include <yt/yt/server/node/tablet_node/sorted_store_manager.h>
 #include <yt/yt/server/node/tablet_node/ordered_store_manager.h>
+#include <yt/yt/server/node/tablet_node/serialize.h>
 
 #include <yt/yt/server/lib/tablet_node/proto/tablet_manager.pb.h>
 
@@ -43,26 +44,26 @@ TSimpleTabletManager::TSimpleTabletManager(
 {
     RegisterLoader(
         "SimpleTabletManager.Keys",
-        BIND(&TSimpleTabletManager::LoadKeys, Unretained(this)));
+        BIND_NO_PROPAGATE(&TSimpleTabletManager::LoadKeys, Unretained(this)));
     RegisterLoader(
         "SimpleTabletManager.Values",
-        BIND(&TSimpleTabletManager::LoadValues, Unretained(this)));
+        BIND_NO_PROPAGATE(&TSimpleTabletManager::LoadValues, Unretained(this)));
     RegisterLoader(
         "SimpleTabletManager.Async",
-        BIND(&TSimpleTabletManager::LoadAsync, Unretained(this)));
+        BIND_NO_PROPAGATE(&TSimpleTabletManager::LoadAsync, Unretained(this)));
 
     RegisterSaver(
         ESyncSerializationPriority::Keys,
         "SimpleTabletManager.Keys",
-        BIND(&TSimpleTabletManager::SaveKeys, Unretained(this)));
+        BIND_NO_PROPAGATE(&TSimpleTabletManager::SaveKeys, Unretained(this)));
     RegisterSaver(
         ESyncSerializationPriority::Values,
         "SimpleTabletManager.Values",
-        BIND(&TSimpleTabletManager::SaveValues, Unretained(this)));
+        BIND_NO_PROPAGATE(&TSimpleTabletManager::SaveValues, Unretained(this)));
     RegisterSaver(
         EAsyncSerializationPriority::Default,
         "SimpleTabletManager.Async",
-        BIND(&TSimpleTabletManager::SaveAsync, Unretained(this)));
+        BIND_NO_PROPAGATE(&TSimpleTabletManager::SaveAsync, Unretained(this)));
 }
 
 void TSimpleTabletManager::InitializeTablet(TTabletOptions options)
@@ -153,6 +154,11 @@ TTablet* TSimpleTabletManager::FindTablet(const TTabletId& id) const
     YT_VERIFY(id == NullTabletId);
 
     return TabletMap_.Get(id);
+}
+
+TTablet* TSimpleTabletManager::FindOrphanedTablet(TTabletId /*id*/) const
+{
+    return nullptr;
 }
 
 TTablet* TSimpleTabletManager::GetTablet(const TTabletId& id) const

@@ -486,34 +486,28 @@ INSTANTIATE_TEST_SUITE_P(
         TElectionTestData(
             -1,
             TStatus(EPeerState::Following, 0, TEpochId(), {0, 1}),
-            TStatus(EPeerState::Following, 0, TEpochId(), {0, 2})
-        ),
+            TStatus(EPeerState::Following, 0, TEpochId(), {0, 2})),
         TElectionTestData(
             1,
-            TStatus(EPeerState::Leading, 1, OtherEpoch, {0, 1})
-        ),
+            TStatus(EPeerState::Leading, 1, OtherEpoch, {0, 1})),
         TElectionTestData(
             -1,
-            TStatus(EPeerState::Leading, 1, OtherEpoch, {-1, -1})
-        ),
+            TStatus(EPeerState::Leading, 1, OtherEpoch, {-1, -1})),
         // all followers
         TElectionTestData(
             -1,
             TStatus(EPeerState::Following, 1, OtherEpoch, {0, 1}),
-            TStatus(EPeerState::Following, 2, OtherEpoch, {0, 2})
-        ),
+            TStatus(EPeerState::Following, 2, OtherEpoch, {0, 2})),
         // all leaders
         TElectionTestData(
             2,
             TStatus(EPeerState::Leading, 1, OtherEpoch, {0, 1}),
-            TStatus(EPeerState::Leading, 2, OtherEpoch, {0, 2})
-        ),
+            TStatus(EPeerState::Leading, 2, OtherEpoch, {0, 2})),
         // potential leader should recognize itself as a leader
         TElectionTestData(
             -1,
             TStatus(EPeerState::Following, 2, OtherEpoch, {0, 1}),
-            TStatus(EPeerState::Following, 2, OtherEpoch, {0, 2})
-        )
+            TStatus(EPeerState::Following, 2, OtherEpoch, {0, 2}))
 ));
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -535,7 +529,7 @@ TEST_P(TElectionDelayedTest, JoinActiveQuorum)
     for (int id = 1; id < 3; id++) {
         EXPECT_RPC_CALL(*PeerMocks[id], GetStatus)
             .WillRepeatedly(HANDLE_RPC_CALL(TElectionServiceMock, GetStatus, [=], {
-                TDelayedExecutor::Submit(BIND([=] () {
+                TDelayedExecutor::Submit(BIND([=] {
                     response->set_state(ToProto<int>(id == 2 ? EPeerState::Leading : EPeerState::Following));
                     response->set_vote_id(2);
                     ToProto(response->mutable_vote_epoch_id(), TEpochId());

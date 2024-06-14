@@ -11,6 +11,12 @@
 
 #include <yt/yt/ytlib/scheduler/scheduler_service_proxy.h>
 
+#include <yt/yt/ytlib/security_client/permission_cache.h>
+
+#include <yt/yt/client/tablet_client/table_mount_cache.h>
+
+#include <yt/yt/client/ypath/rich.h>
+
 #include <yt/yt/core/ytree/convert.h>
 
 namespace NYT::NApi::NNative {
@@ -20,13 +26,15 @@ const auto& Logger = NativeConnectionLogger;
 ////////////////////////////////////////////////////////////////////////////////
 
 using namespace NAuth;
-using namespace NRpc;
-using namespace NYTree;
+using namespace NConcurrency;
 using namespace NLogging;
-using namespace NYson;
+using namespace NObjectClient;
+using namespace NRpc;
 using namespace NSecurityClient;
 using namespace NScheduler;
-using namespace NConcurrency;
+using namespace NYPath;
+using namespace NYTree;
+using namespace NYson;
 
 using NYT::FromProto;
 using NYT::ToProto;
@@ -203,6 +211,43 @@ TError MakeRevivalError(
     return MakeOperationRevivalError()
         << TErrorAttribute("job_id", jobId)
         << TErrorAttribute("operation_id", operationId);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void CheckPermission(
+    const NYPath::TYPath& path,
+    const NTabletClient::TTableMountInfoPtr& tableInfo,
+    const TAuthenticationOptions& options,
+    const IConnectionPtr& connection,
+    EPermission permission)
+{
+    NSecurityClient::TPermissionKey permissionKey{
+        .Object = FromObjectId(tableInfo->TableId),
+        .User = options.GetAuthenticatedUser(),
+        .Permission = permission,
+    };
+    const auto& permissionCache = connection->GetPermissionCache();
+    WaitFor(permissionCache->Get(permissionKey))
+        .ThrowOnError("No %v permission for %v", permission, path);
+}
+
+void CheckReadPermission(
+    const NYPath::TYPath& path,
+    const NTabletClient::TTableMountInfoPtr& tableInfo,
+    const TAuthenticationOptions& options,
+    const IConnectionPtr& connection)
+{
+    CheckPermission(path, tableInfo, options, connection, EPermission::Read);
+}
+
+void CheckWritePermission(
+    const NYPath::TYPath& path,
+    const NTabletClient::TTableMountInfoPtr& tableInfo,
+    const TAuthenticationOptions& options,
+    const IConnectionPtr& connection)
+{
+    CheckPermission(path, tableInfo, options, connection, EPermission::Write);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

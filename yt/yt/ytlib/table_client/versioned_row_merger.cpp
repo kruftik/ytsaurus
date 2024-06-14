@@ -1,11 +1,16 @@
 #include "versioned_row_merger.h"
 
 #include "config.h"
+#include "private.h"
 
 #include <yt/yt/library/query/engine_api/column_evaluator.h>
 
+#include <yt/yt/client/table_client/helpers.h>
+#include <yt/yt/client/table_client/logical_type.h>
 #include <yt/yt/client/table_client/unversioned_value.h>
 #include <yt/yt/client/table_client/versioned_row.h>
+
+#include <yt/yt/client/tablet_client/watermark_runtime_data.h>
 
 #include <yt/yt/client/transaction_client/helpers.h>
 
@@ -14,6 +19,11 @@ namespace NYT::NTableClient {
 using namespace NQueryClient;
 using namespace NTransactionClient;
 using namespace NTabletClient;
+using namespace NYTree;
+
+////////////////////////////////////////////////////////////////////////////////
+
+static const auto& Logger = TableClientLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -33,7 +43,8 @@ public:
         bool lookup,
         bool mergeRowsOnFlush,
         std::optional<int> ttlColumnIndex,
-        bool mergeDeletionsOnFlush)
+        bool mergeDeletionsOnFlush,
+        std::optional<TWatermarkRuntimeData> watermarkRuntimeData)
         : RowBuffer_(std::move(rowBuffer))
         , KeyColumnCount_(keyColumnCount)
         , Config_(std::move(config))
@@ -45,6 +56,7 @@ public:
         , MergeRowsOnFlush_(mergeRowsOnFlush)
         , MergeDeletionsOnFlush_(mergeDeletionsOnFlush)
         , TtlColumnIndex_(ttlColumnIndex)
+        , WatermarkRuntimeData_(std::move(watermarkRuntimeData))
     {
         int mergedKeyColumnCount = 0;
         if (columnFilter.IsUniversal()) {
@@ -140,6 +152,7 @@ public:
             PartialValues_.end());
 
         auto rowMaxDataTtl = ComputeRowMaxDataTtl();
+        auto watermarkTimestamp = ComputeWatermarkTimestamp();
 
         // Scan through input values.
         auto columnIdsBeginIt = ColumnIds_.begin();
@@ -188,12 +201,11 @@ public:
             }
 #endif
 
-            auto retentionBeginIt = ColumnValues_.begin();
+            auto retentionBeginIt = Config_ || watermarkTimestamp ? ColumnValues_.end() : ColumnValues_.begin();
 
             // Apply retention config if present.
             if (Config_) {
-                YT_VERIFY(rowMaxDataTtl.has_value());
-                retentionBeginIt = ColumnValues_.end();
+                YT_VERIFY(rowMaxDataTtl);
 
                 // Compute safety limit by MinDataTtl.
                 while (retentionBeginIt != ColumnValues_.begin()) {
@@ -286,6 +298,16 @@ public:
                         YT_ASSERT((state.Flags & EValueFlags::Aggregate) == initialAggregateFlags);
                         static_cast<TUnversionedValue&>(*retentionBeginIt) = state;
                     }
+                }
+            }
+
+            if (watermarkTimestamp) {
+                while (retentionBeginIt != ColumnValues_.begin()) {
+                    if ((retentionBeginIt - 1)->Timestamp <= *watermarkTimestamp) {
+                        break;
+                    }
+
+                    --retentionBeginIt;
                 }
             }
 
@@ -391,6 +413,7 @@ private:
     const bool MergeRowsOnFlush_;
     const bool MergeDeletionsOnFlush_;
     const std::optional<int> TtlColumnIndex_;
+    const std::optional<TWatermarkRuntimeData> WatermarkRuntimeData_;
 
     bool Started_ = false;
 
@@ -423,20 +446,40 @@ private:
             return std::nullopt;
         }
 
-        auto ttlColumnValue = std::find_if(
+        auto ttlColumnIt = std::find_if(
             PartialValues_.rbegin(),
             PartialValues_.rend(),
             [&] (const TVersionedValue& value) {
                 return value.Id == TtlColumnIndex_;
             });
 
-        if (ttlColumnValue != PartialValues_.rend() && ttlColumnValue->Type == EValueType::Uint64 &&
-            (DeleteTimestamps_.empty() || ttlColumnValue->Timestamp > DeleteTimestamps_.back()))
+        if (ttlColumnIt != PartialValues_.rend() && ttlColumnIt->Type == EValueType::Uint64 &&
+            (DeleteTimestamps_.empty() || ttlColumnIt->Timestamp > DeleteTimestamps_.back()))
         {
-            return std::max(Config_->MinDataTtl, TDuration::MilliSeconds(ttlColumnValue->Data.Uint64));
+            return std::max(Config_->MinDataTtl, TDuration::MilliSeconds(FromUnversionedValue<ui64>(*ttlColumnIt)));
         }
 
         return Config_->MaxDataTtl;
+    }
+
+    std::optional<TTimestamp> ComputeWatermarkTimestamp() const
+    {
+        if (!WatermarkRuntimeData_) {
+            return {};
+        }
+
+        TTimestamp watermarkTimestamp = MinTimestamp;
+        for (const auto& value : PartialValues_) {
+            if (value.Id != WatermarkRuntimeData_->ColumnIndex) {
+                continue;
+            }
+
+            if (value.Type != EValueType::Null && FromUnversionedValue<ui64>(value) <= WatermarkRuntimeData_->Watermark) {
+                watermarkTimestamp = std::max(watermarkTimestamp, value.Timestamp);
+            }
+        }
+
+        return watermarkTimestamp;
     }
 };
 
@@ -468,7 +511,8 @@ std::unique_ptr<IVersionedRowMerger> CreateLegacyVersionedRowMerger(
         lookup,
         mergeRowsOnFlush,
         ttlColumnIndex,
-        mergeDeletionsOnFlush);
+        mergeDeletionsOnFlush,
+        /*runtimeData*/ std::nullopt);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -476,33 +520,76 @@ std::unique_ptr<IVersionedRowMerger> CreateLegacyVersionedRowMerger(
 std::unique_ptr<IVersionedRowMerger> CreateVersionedRowMerger(
     ERowMergerType rowMergerType,
     TRowBufferPtr rowBuffer,
-    int columnCount,
-    int keyColumnCount,
+    TTableSchemaPtr tableSchema,
     const TColumnFilter& columnFilter,
     TRetentionConfigPtr config,
     TTimestamp currentTimestamp,
     TTimestamp majorTimestamp,
     TColumnEvaluatorPtr columnEvaluator,
+    NYson::TYsonString customRuntimeData,
     bool lookup,
     bool mergeRowsOnFlush,
-    std::optional<int> ttlColumnIndex,
+    bool useTtlColumn,
     bool mergeDeletionsOnFlush)
 {
     switch (rowMergerType) {
         case ERowMergerType::Legacy:
             return CreateLegacyVersionedRowMerger(
-                rowBuffer,
-                columnCount,
-                keyColumnCount,
+                std::move(rowBuffer),
+                tableSchema->GetColumnCount(),
+                tableSchema->GetKeyColumnCount(),
                 columnFilter,
-                config,
+                std::move(config),
                 currentTimestamp,
                 majorTimestamp,
-                columnEvaluator,
+                std::move(columnEvaluator),
                 lookup,
                 mergeRowsOnFlush,
-                ttlColumnIndex,
+                useTtlColumn ? tableSchema->GetTtlColumnIndex() : std::nullopt,
                 mergeDeletionsOnFlush);
+
+        case ERowMergerType::Watermark: {
+            std::optional<TWatermarkRuntimeData> watermarkRuntimeData;
+
+            if (customRuntimeData) {
+                try {
+                    auto watermarkRuntimeDataConfig = ConvertTo<TWatermarkRuntimeDataConfig>(customRuntimeData);
+
+                    auto columnSchema = tableSchema->GetColumnOrThrow(watermarkRuntimeDataConfig.ColumnName);
+                    if (!columnSchema.IsOfV1Type(ESimpleLogicalValueType::Uint64)) {
+                        THROW_ERROR_EXCEPTION(
+                            "Unexpected type for watermark column %Qv: expected %Qlv, got %Qlv",
+                            columnSchema.Name(),
+                            EValueType::Uint64,
+                            *columnSchema.LogicalType());
+                    }
+
+                    watermarkRuntimeData = TWatermarkRuntimeData{
+                        .Watermark = watermarkRuntimeDataConfig.Watermark,
+                        .ColumnIndex = tableSchema->GetColumnIndex(watermarkRuntimeDataConfig.ColumnName)
+                    };
+                } catch (const std::exception& ex) {
+                    YT_LOG_ERROR(ex, "Failed to prepare watermark runtime data");
+                    watermarkRuntimeData = std::nullopt;
+                }
+            }
+
+            return std::make_unique<TVersionedRowMerger>(
+                std::move(rowBuffer),
+                tableSchema->GetColumnCount(),
+                tableSchema->GetKeyColumnCount(),
+                columnFilter,
+                std::move(config),
+                currentTimestamp,
+                majorTimestamp,
+                std::move(columnEvaluator),
+                lookup,
+                mergeRowsOnFlush,
+                useTtlColumn ? tableSchema->GetTtlColumnIndex() : std::nullopt,
+                mergeDeletionsOnFlush,
+                std::move(watermarkRuntimeData));
+        }
+
         default:
             YT_ABORT();
     }

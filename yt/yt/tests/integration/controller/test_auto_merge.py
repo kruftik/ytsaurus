@@ -412,36 +412,50 @@ class TestSchedulerAutoMerge(TestSchedulerAutoMergeBase):
         assert content[:1] == init_content
         assert normalize_schema(get("//tmp/t_out/@schema")) == schema_out
 
-    @authors("max42", "psushin")
+    @authors("yuryalekseev", "psushin")
     @pytest.mark.timeout(60)
-    def test_teleport_large_chunks(self):
+    @pytest.mark.parametrize("teleport_by", ["size", "weight"])
+    def test_teleport_large_chunks(self, teleport_by):
+        max_chunk_size_or_weight = 1024
+
+        spec = {
+            "auto_merge": {
+                "mode": "manual",
+                "max_intermediate_chunk_count": 5,
+                "chunk_count_per_merge_job": 5,
+            },
+            "data_size_per_job": 1,
+            "mapper": {"format": yson.loads(b"<columns=[a]>schemaful_dsv")},
+        }
+
+        if teleport_by == "size":
+            # Chunks are teleported because of chunk_size_threshold.
+            spec["auto_merge"].update({"chunk_size_threshold": max_chunk_size_or_weight})
+            spec["auto_merge"].update({"job_io": {"table_writer": {"desired_chunk_weight": 4 * max_chunk_size_or_weight}}})
+        else:
+            # Chunks are teleported because of desired_chunk_weight.
+            spec["auto_merge"].update({"chunk_size_threshold": max_chunk_size_or_weight})
+            spec["auto_merge"].update({"job_io": {"table_writer": {"desired_chunk_weight": max_chunk_size_or_weight}}})
+
         create("table", "//tmp/t_in")
-        create("table", "//tmp/t_out1")
-        create("table", "//tmp/t_out2")
+        create("table", "//tmp/t_out")
         for i in range(15):
             write_table("<append=%true>//tmp/t_in", [{"a": i}])
 
         # For even lines output a long random string, for odd lines output a single character.
         op = map(
             in_="//tmp/t_in",
-            out=["//tmp/t_out1", "//tmp/t_out2"],
+            out="//tmp/t_out",
             # First 8 jobs produce teleportable output, to ensure that teleports are handled correctly and operation doesn't get stuck.
-            command="read x; if (($YT_JOB_INDEX < 8)); then head -c 1000000 /dev/urandom | base64 -w 0; echo -ne '\n'; else echo $x; fi >&4",
-            spec={
-                "auto_merge": {
-                    "mode": "manual",
-                    "max_intermediate_chunk_count": 5,
-                    "chunk_count_per_merge_job": 5,
-                    "chunk_size_threshold": 100 * 1024,
-                },
-                "data_size_per_job": 1,
-                "mapper": {"format": yson.loads(b"<columns=[a]>schemaful_dsv")},
-            },
+            command="read x; if (($YT_JOB_INDEX < 8)); then head -c {} /dev/urandom | base64 -w 0; echo -ne '\n'; else echo $x; fi".format(10 * max_chunk_size_or_weight),
+            spec=spec,
         )
+
+        op.track()
+
         self._verify_auto_merge_job_types(op)
-        assert get("//tmp/t_out1/@chunk_count") == 0
-        assert get("//tmp/t_out2/@chunk_count") == 10
-        chunk_ids = get("//tmp/t_out2/@chunk_ids")
+        assert get("//tmp/t_out/@chunk_count") == 10
+        chunk_ids = get("//tmp/t_out/@chunk_ids")
         row_counts = []
         for chunk_id in chunk_ids:
             row_counts.append(get("#{0}/@row_count".format(chunk_id)))
@@ -463,6 +477,71 @@ class TestSchedulerAutoMerge(TestSchedulerAutoMergeBase):
         assert directions[("map", merge_vertex)]["teleport_data_statistics"]["chunk_count"] == 0
         assert directions[(merge_vertex, "output")]["job_data_statistics"]["chunk_count"] == 2
         assert directions[(merge_vertex, "output")]["teleport_data_statistics"]["chunk_count"] == 8
+
+    @authors("yuryalekseev", "psushin")
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("single_chunk_teleport_strategy", ["enabled", "disabled"])
+    def test_teleport_single_chunk(self, single_chunk_teleport_strategy):
+        create("table", "//tmp/t_in")
+        create("table", "//tmp/t_out")
+
+        write_table("<append=%true>//tmp/t_in", [{"a": 1}])
+
+        op = map(
+            in_="//tmp/t_in",
+            out="//tmp/t_out",
+            command="cat",
+            spec={
+                "auto_merge": {
+                    "mode": "manual",
+                    "max_intermediate_chunk_count": 5,
+                    "chunk_count_per_merge_job": 5,
+                    "single_chunk_teleport_strategy": single_chunk_teleport_strategy,
+                },
+                "data_size_per_job": 1,
+                "mapper": {"format": yson.loads(b"<columns=[a]>schemaful_dsv")},
+            },
+        )
+
+        assert get("//tmp/t_out/@chunk_count") == 1
+
+        data_flow = get_operation(op.id, attributes=["progress"])["progress"]["data_flow"]
+        directions = {
+            (direction["source_name"], direction["target_name"]) : direction
+            for direction in data_flow
+        }
+        merge_vertex = "shallow_auto_merge" if self.ENABLE_SHALLOW_MERGE else "auto_merge"
+
+        assert len(directions) == 3
+
+        if single_chunk_teleport_strategy == "enabled":
+            assert directions[("input", "map")]["job_data_statistics"]["chunk_count"] == 0
+            assert directions[("input", "map")]["teleport_data_statistics"]["chunk_count"] == 1
+            assert directions[("map", merge_vertex)]["job_data_statistics"]["chunk_count"] == 1
+            assert directions[("map", merge_vertex)]["teleport_data_statistics"]["chunk_count"] == 0
+            assert directions[(merge_vertex, "output")]["job_data_statistics"]["chunk_count"] == 0
+            assert directions[(merge_vertex, "output")]["teleport_data_statistics"]["chunk_count"] == 1
+
+            assert directions[("input", "map")]["job_data_statistics"]["row_count"] == 0
+            assert directions[("input", "map")]["teleport_data_statistics"]["row_count"] == 1
+            assert directions[("map", merge_vertex)]["job_data_statistics"]["row_count"] == 1
+            assert directions[("map", merge_vertex)]["teleport_data_statistics"]["row_count"] == 0
+            assert directions[(merge_vertex, "output")]["job_data_statistics"]["row_count"] == 0
+            assert directions[(merge_vertex, "output")]["teleport_data_statistics"]["row_count"] == 1
+        else:
+            assert directions[("input", "map")]["job_data_statistics"]["chunk_count"] == 0
+            assert directions[("input", "map")]["teleport_data_statistics"]["chunk_count"] == 1
+            assert directions[("map", merge_vertex)]["job_data_statistics"]["chunk_count"] == 1
+            assert directions[("map", merge_vertex)]["teleport_data_statistics"]["chunk_count"] == 0
+            assert directions[(merge_vertex, "output")]["job_data_statistics"]["chunk_count"] == 1
+            assert directions[(merge_vertex, "output")]["teleport_data_statistics"]["chunk_count"] == 0
+
+            assert directions[("input", "map")]["job_data_statistics"]["row_count"] == 0
+            assert directions[("input", "map")]["teleport_data_statistics"]["row_count"] == 1
+            assert directions[("map", merge_vertex)]["job_data_statistics"]["row_count"] == 1
+            assert directions[("map", merge_vertex)]["teleport_data_statistics"]["row_count"] == 0
+            assert directions[(merge_vertex, "output")]["job_data_statistics"]["row_count"] == 1
+            assert directions[(merge_vertex, "output")]["teleport_data_statistics"]["row_count"] == 0
 
     @authors("max42")
     @pytest.mark.timeout(60)

@@ -87,6 +87,12 @@ DB::ASTPtr WrapTableExpressionWithSubquery(
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void HandleBreakpoint(
+    const NYPath::TYPath& breakpointFilename,
+    const NApi::IClientPtr& client);
+
+////////////////////////////////////////////////////////////////////////////////
+
 } // namespace NYT::NClickHouseServer
 
 namespace DB {
@@ -97,8 +103,10 @@ void Serialize(const QueryStatusInfo& queryStatusInfo, NYT::NYson::IYsonConsumer
 void Serialize(const ProcessListForUserInfo& processListForUserInfo, NYT::NYson::IYsonConsumer* consumer);
 
 TString ToString(const Field& field);
-
 TString ToString(const Block& block);
+
+void FormatValue(NYT::TStringBuilderBase* builder, const Field& field, TStringBuf spec);
+void FormatValue(NYT::TStringBuilderBase* builder, const Block& block, TStringBuf spec);
 
 void PrintTo(const Field& field, ::std::ostream* os);
 

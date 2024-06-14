@@ -4,7 +4,7 @@ from yt_chaos_test_base import ChaosTestBase
 from yt_commands import (get, set, ls, wait, create, remove, sync_mount_table, sync_unmount_table, sync_create_cells, exists,
                          select_rows, sync_reshard_table, print_debug, get_driver, register_queue_consumer,
                          sync_freeze_table, sync_unfreeze_table, create_table_replica, sync_enable_table_replica,
-                         advance_consumer, insert_rows)
+                         advance_consumer, insert_rows, wait_for_tablet_state)
 
 from yt.common import YtError, update_inplace, update
 
@@ -366,19 +366,17 @@ class TestQueueAgentBase(YTEnvSetup):
         wait(config_updated_on_all_instances)
 
     def _prepare_tables(self, queue_table_schema=None, consumer_table_schema=None, **kwargs):
+        assert queue_table_schema is None and consumer_table_schema is None, \
+            "Current implementation of init_queue_agent_state does not support custom schemas"
         sync_create_cells(1)
         self.client = self.Env.create_native_client()
-        init_queue_agent_state.create_tables(
+        init_queue_agent_state.create_tables_latest_version(
             self.client,
-            queue_table_schema=queue_table_schema,
-            consumer_table_schema=consumer_table_schema,
-            create_registration_table=True,
-            create_replicated_table_mapping_table=True,
-            tablet_cell_bundle="default",
+            override_tablet_cell_bundle="default",
             **kwargs)
 
     def _drop_tables(self):
-        init_queue_agent_state.delete_tables(self.client)
+        init_queue_agent_state.delete_all_tables(self.client)
 
     def _create_queue(self, path, partition_count=1, enable_timestamp_column=True,
                       enable_cumulative_data_weight_column=True, mount=True, **kwargs):
@@ -401,7 +399,7 @@ class TestQueueAgentBase(YTEnvSetup):
         return schema, queue_id
 
     @staticmethod
-    def _create_consumer(path, mount=True, without_meta=False, **kwargs):
+    def _create_consumer(path, mount=True, without_meta=False, driver=None, **kwargs):
         if without_meta:
             attributes = {
                 "dynamic": True,
@@ -409,13 +407,14 @@ class TestQueueAgentBase(YTEnvSetup):
                 "treat_as_queue_consumer": True,
             }
             attributes.update(kwargs)
-            create("table", path, attributes=attributes)
+            create("table", path, attributes=attributes, driver=driver)
             if mount:
-                sync_mount_table(path)
+                sync_mount_table(path, driver=driver)
         else:
-            create("queue_consumer", path, attributes=kwargs)
+            create("queue_consumer", path, driver=driver, attributes=kwargs)
             if not mount:
-                sync_unmount_table(path)
+                wait_for_tablet_state(path, "mounted", driver=driver)
+                sync_unmount_table(path, driver=driver)
 
     def _create_registered_consumer(self, consumer_path, queue_path, vital=False, without_meta=False, **kwargs):
         self._create_consumer(consumer_path, **kwargs)
@@ -435,6 +434,10 @@ class TestQueueAgentBase(YTEnvSetup):
         else:
             for partition_index, offset in partition_index_to_offset.items():
                 advance_consumer(consumer_path, queue_path, partition_index=partition_index, old_offset=None, new_offset=offset, client_side=client_side)
+
+    def _create_producer(self, producer_path, wait_for_mount=True, **kwargs):
+        create("queue_producer", producer_path, attributes=kwargs)
+        wait_for_tablet_state(producer_path, "mounted")
 
     @staticmethod
     def _flush_table(path, first_tablet_index=None, last_tablet_index=None):
@@ -575,5 +578,11 @@ class TestQueueAgentBase(YTEnvSetup):
         cls._wait_for_object_passes(instances)
 
         print_debug("Synced all state; elapsed time:", time.time() - start_time)
+
+    def _should_skip_queue_producer_attributes_tests(self):
+        should_skip = "23_2" in self.ARTIFACT_COMPONENTS and "master" in self.ARTIFACT_COMPONENTS["23_2"]
+        if should_skip:
+            print_debug("Skipping test with queue producer attributes because master version is too old")
+        return should_skip
 
 ##################################################################

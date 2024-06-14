@@ -50,6 +50,8 @@
 
 #include <yt/yt/library/query/base/query.h>
 
+#include <yt/yt/library/query/distributed/public.h>
+
 #include <yt/yt/library/query/engine_api/evaluator.h>
 
 #include <yt/yt/ytlib/query_client/query_service_proxy.h>
@@ -204,7 +206,7 @@ public:
                 DefaultQLExecutionPoolName,
                 DefaultQLExecutionTag),
             TQueryServiceProxy::GetDescriptor(),
-            QueryAgentLogger,
+            QueryAgentLogger(),
             NullRealmId,
             bootstrap->GetNativeAuthenticator())
         , Config_(config)
@@ -215,7 +217,7 @@ public:
         , Evaluator_(CreateEvaluator(Config_, QueryAgentProfiler))
         , MemoryTracker_(
             Bootstrap_
-                ->GetMemoryUsageTracker()
+                ->GetNodeMemoryUsageTracker()
                 ->WithCategory(EMemoryCategory::Query))
         , DistributedSessionManager_(CreateDistributedSessionManager(
             bootstrap->GetQueryPoolInvoker(DefaultQLExecutionPoolName, DefaultQLExecutionTag)))
@@ -226,7 +228,8 @@ public:
         RegisterMethod(RPC_SERVICE_METHOD_DESC(Execute)
             .SetCancelable(true)
             .SetInvokerProvider(BIND(&TQueryService::GetExecuteInvoker, Unretained(this)))
-            .SetHandleMethodError(true));
+            .SetHandleMethodError(true)
+            .SetPooled(false));
         RegisterMethod(RPC_SERVICE_METHOD_DESC(Multiread)
             .SetCancelable(true)
             .SetInvoker(Bootstrap_->GetTabletLookupPoolInvoker())

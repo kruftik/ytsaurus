@@ -232,7 +232,7 @@ public:
             return;
         }
 
-        auto doInvoke = [=, this, this_ = MakeStrong(this), callback = std::move(callback)] () {
+        auto doInvoke = [=, this, this_ = MakeStrong(this), callback = std::move(callback)] {
             auto state = owner->GetState();
             if (state != EPeerState::Leading && state != EPeerState::Following) {
                 return;
@@ -267,7 +267,7 @@ public:
         , Timestamp_(Owner_->Timestamp_)
         , SelfPeerId_(owner->GetEpochContext()->CellManager->GetSelfPeerId())
     {
-        Logger = Owner_->Logger.WithTag("SnapshotId: %v", SnapshotId_);
+        Logger = Owner_->Logger().WithTag("SnapshotId: %v", SnapshotId_);
     }
 
     ~TSnapshotBuilderBase()
@@ -1219,7 +1219,7 @@ TSharedRef TDecoratedAutomaton::SanitizeLocalHostName() const
         }
 
         if (auto sanitizedLocalHost = NHydra::SanitizeLocalHostName(hosts, localHost)) {
-            YT_LOG_INFO("Local host name sanitized (Hosts: %v, LocalHost: %v, SanitizedLocalHost)",
+            YT_LOG_INFO("Local host name sanitized (Hosts: %v, LocalHost: %v, SanitizedLocalHost: %v)",
                 hosts,
                 localHost,
                 *sanitizedLocalHost);

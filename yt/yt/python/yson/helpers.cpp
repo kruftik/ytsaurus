@@ -28,7 +28,7 @@ std::optional<TString> ParseEncodingArgument(Py::Tuple& args, Py::Dict& kwargs)
     return encoding;
 }
 
-Py::Bytes EncodeStringObject(const Py::Object& obj, const std::optional<TString>& encoding, TContext* context)
+YT_PREVENT_TLS_CACHING Py::Bytes EncodeStringObject(const Py::Object& obj, const std::optional<TString>& encoding, TContext* context)
 {
     if (PyUnicode_Check(obj.ptr())) {
         if (!encoding) {
@@ -44,8 +44,7 @@ Py::Bytes EncodeStringObject(const Py::Object& obj, const std::optional<TString>
                     Format(
                         "Cannot encode unicode object %v to bytes "
                         "since \"encoding\" parameter is None",
-                        Py::Repr(obj)
-                    ),
+                        Py::Repr(obj)),
                     context);
             } else {
                 return Py::Bytes(bytesString, true);
@@ -55,8 +54,8 @@ Py::Bytes EncodeStringObject(const Py::Object& obj, const std::optional<TString>
     } else if (PyBytes_Check(obj.ptr())) {
         return Py::Bytes(PyObject_Bytes(*obj), true);
     } else {
-        YT_THREAD_LOCAL(auto) YsonStringProxyClass = PyObjectPtr(FindYsonTypeClass("YsonStringProxy"));
-        auto& ysonStringProxyClass = GetTlsRef(YsonStringProxyClass);
+        thread_local auto YsonStringProxyClass = PyObjectPtr(FindYsonTypeClass("YsonStringProxy"));
+        auto& ysonStringProxyClass = YsonStringProxyClass;
         if (ysonStringProxyClass && PyObject_IsInstance(obj.ptr(), ysonStringProxyClass.get())) {
             return Py::Bytes(obj.getAttr("_bytes"));
         }

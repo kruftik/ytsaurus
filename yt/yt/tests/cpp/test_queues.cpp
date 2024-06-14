@@ -220,6 +220,14 @@ public:
         return std::tuple{queue, consumer, queueNameTable};
     }
 
+    void CreateQueueProducer(const TRichYPath& path)
+    {
+        WaitFor(Client_->CreateNode(path.GetPath(), EObjectType::QueueProducer, TCreateNodeOptions{}))
+            .ThrowOnError();
+
+        WaitUntilEqual(path.GetPath() + "/@tablet_state", "mounted");
+    }
+
     // NB: Only creates user once per test YT instance.
     IClientPtr CreateUser(const TString& name) const
     {
@@ -310,6 +318,7 @@ TEST_W(TQueueApiPermissionsTest, PullQueue)
         auto rowsetOrError = WaitFor(userClient->PullQueue(queue->GetPath(), 0, 0, {}));
         EXPECT_FALSE(rowsetOrError.IsOK());
         EXPECT_TRUE(rowsetOrError.FindMatching(NSecurityClient::EErrorCode::AuthorizationError));
+        EXPECT_TRUE(ToString(rowsetOrError).Contains("No Read permission for //tmp/queue"));
 
         WaitFor(Client_->SetNode(
             queue->GetPath() + "/@acl/end",
@@ -341,13 +350,13 @@ TEST_W(TQueueApiPermissionsTest, PullQueue)
     }
 }
 
-TEST_W(TQueueApiPermissionsTest, PullConsumer)
+TEST_W(TQueueApiPermissionsTest, PullQueueConsumer)
 {
     auto testUser = "u1";
     auto userClient = CreateUser(testUser);
 
     auto [queue, consumer, queueNameTable] =
-        CreateQueueAndConsumer("PullConsumer");
+        CreateQueueAndConsumer("PullQueueConsumer");
 
     WriteSingleRow(queue->GetPath(), queueNameTable, {"42u", "a"});
     WriteSingleRow(queue->GetPath(), queueNameTable, {"43u", "b"});
@@ -361,9 +370,10 @@ TEST_W(TQueueApiPermissionsTest, PullConsumer)
     AssertPermissionDenied(testUser, queue->GetPath(), EPermission::Read);
     AssertPermissionDenied(testUser, consumer->GetPath(), EPermission::Read);
 
-    auto rowsetOrError = WaitFor(userClient->PullConsumer(consumer->GetPath(), queue->GetPath(), 0, 0, {}));
+    auto rowsetOrError = WaitFor(userClient->PullQueueConsumer(consumer->GetPath(), queue->GetPath(), 0, 0, {}));
     EXPECT_FALSE(rowsetOrError.IsOK());
     EXPECT_TRUE(rowsetOrError.FindMatching(NSecurityClient::EErrorCode::AuthorizationError));
+    EXPECT_TRUE(ToString(rowsetOrError).Contains("No Read permission for //tmp/consumer"));
 
     WaitFor(Client_->SetNode(
         consumer->GetPath() + "/@acl/end",
@@ -373,21 +383,21 @@ TEST_W(TQueueApiPermissionsTest, PullConsumer)
             EPermission::Read))))
         .ThrowOnError();
 
-    rowsetOrError = WaitFor(userClient->PullConsumer(consumer->GetPath(), queue->GetPath(), 0, 0, {}));
+    rowsetOrError = WaitFor(userClient->PullQueueConsumer(consumer->GetPath(), queue->GetPath(), 0, 0, {}));
     EXPECT_FALSE(rowsetOrError.IsOK());
     EXPECT_TRUE(rowsetOrError.FindMatching(NSecurityClient::EErrorCode::AuthorizationError));
 
     WaitFor(Client_->RegisterQueueConsumer(queue->GetPath(), consumer->GetRichPath(), /*vital*/ false))
         .ThrowOnError();
 
-    auto rowset = WaitFor(userClient->PullConsumer(consumer->GetRichPath(), queue->GetPath(), 0, 0, {}))
+    auto rowset = WaitFor(userClient->PullQueueConsumer(consumer->GetRichPath(), queue->GetPath(), 0, 0, {}))
         .ValueOrThrow();
     EXPECT_FALSE(rowset->GetRows().empty());
 
     WaitFor(Client_->UnregisterQueueConsumer(queue->GetRichPath(), consumer->GetPath()))
         .ThrowOnError();
 
-    rowsetOrError = WaitFor(userClient->PullConsumer(consumer->GetPath(), queue->GetPath(), 0, 0, {}));
+    rowsetOrError = WaitFor(userClient->PullQueueConsumer(consumer->GetPath(), queue->GetPath(), 0, 0, {}));
     EXPECT_FALSE(rowsetOrError.IsOK());
     EXPECT_TRUE(rowsetOrError.FindMatching(NSecurityClient::EErrorCode::AuthorizationError));
 }
@@ -416,29 +426,25 @@ TEST_W(TListRegistrationsTest, ListQueueConsumerRegistrations)
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
         testing::FieldsAre(firstQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), false, std::nullopt),
-        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), true, std::nullopt)
-    ));
+        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), true, std::nullopt)));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(/*queuePath*/ {}, /*consumerPath*/ {}))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
         testing::FieldsAre(firstQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), false, std::nullopt),
         testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), true, std::nullopt),
-        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::vector{1, 5, 4, 3})
-    ));
+        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::vector{1, 5, 4, 3})));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(/*queuePath*/ {}, secondConsumer->GetRichPath()))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
         testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), true, std::nullopt),
-        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::vector{1, 5, 4, 3})
-    ));
+        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::vector{1, 5, 4, 3})));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(firstQueue->GetRichPath(), secondConsumer->GetRichPath()))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
-        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), true, std::nullopt)
-    ));
+        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), true, std::nullopt)));
 
     WaitFor(Client_->UnregisterQueueConsumer(firstQueue->GetRichPath(), secondConsumer->GetPath()))
         .ThrowOnError();
@@ -454,26 +460,22 @@ TEST_W(TListRegistrationsTest, ListQueueConsumerRegistrations)
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(firstQueue->GetRichPath(), /*consumerPath*/ {}))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
-        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::nullopt)
-    ));
+        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::nullopt)));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(secondQueue->GetRichPath(), /*consumerPath*/ {}))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
-        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), true, std::nullopt)
-    ));
+        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), true, std::nullopt)));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(/*queuePath*/ {}, firstConsumer->GetRichPath()))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
-        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), true, std::nullopt)
-    ));
+        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), true, std::nullopt)));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(/*queuePath*/ {}, secondConsumer->GetRichPath()))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
-        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::nullopt)
-    ));
+        testing::FieldsAre(firstQueue->GetRichPathWithCluster(), secondConsumer->GetRichPathWithCluster(), false, std::nullopt)));
 
     WaitFor(Client_->UnregisterQueueConsumer(firstQueue->GetRichPath(), secondConsumer->GetPath()))
         .ThrowOnError();
@@ -485,8 +487,7 @@ TEST_W(TListRegistrationsTest, ListQueueConsumerRegistrations)
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(secondQueue->GetRichPath(), /*consumerPath*/ {}))
         .ValueOrThrow();
     EXPECT_THAT(registrations, testing::UnorderedElementsAre(
-        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), true, std::nullopt)
-    ));
+        testing::FieldsAre(secondQueue->GetRichPathWithCluster(), firstConsumer->GetRichPathWithCluster(), true, std::nullopt)));
 
     registrations = WaitFor(Client_->ListQueueConsumerRegistrations(/*queuePath*/ {}, secondConsumer->GetRichPath()))
         .ValueOrThrow();
@@ -957,6 +958,207 @@ TEST_W(TPartitionReaderTest, EmptyQueue)
         ASSERT_EQ(partitions.size(), 1u);
         EXPECT_EQ(partitions[0].NextRowIndex, 4);
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TConsumerApiTest
+    : public TQueueTestBase
+{
+public:
+    static void TearDownTestCase();
+
+    static void SetUpTestCase();
+
+protected:
+    void CreateConsumer(const TRichYPath& path)
+    {
+        TCreateNodeOptions options;
+        options.Force = true;
+        options.Attributes = CreateEphemeralAttributes();
+        options.Attributes->Set("dynamic", true);
+        options.Attributes->Set("schema", GetConsumerSchema());
+
+        WaitFor(Client_->CreateNode(path.GetPath(), EObjectType::Table, options))
+            .ThrowOnError();
+
+        YT_UNUSED_FUTURE(Client_->MountTable(path.GetPath()));
+        WaitUntilEqual(path.GetPath() + "/@tablet_state", "mounted");
+    }
+
+    void CreateQueue(const TRichYPath& path)
+    {
+        TCreateNodeOptions options;
+        options.Force = true;
+        options.Attributes = CreateEphemeralAttributes();
+        options.Attributes->Set("dynamic", true);
+        options.Attributes->Set("schema", New<TTableSchema>(std::vector<TColumnSchema>{
+            TColumnSchema("data", EValueType::String).SetRequired(true),
+            TColumnSchema("$timestamp", EValueType::Uint64).SetRequired(true),
+            TColumnSchema("$cumulative_data_weight", EValueType::Int64).SetRequired(true),
+        }, /*strict*/ true, /*uniqueKeys*/ false));
+
+        WaitFor(Client_->CreateNode(path.GetPath(), EObjectType::Table, options))
+            .ThrowOnError();
+
+        YT_UNUSED_FUTURE(Client_->MountTable(path.GetPath()));
+        WaitUntilEqual(path.GetPath() + "/@tablet_state", "mounted");
+    }
+};
+
+void TConsumerApiTest::TearDownTestCase()
+{
+    WaitFor(Client_->SetNode(TYPath("//sys/accounts/tmp/@resource_limits/tablet_count"), ConvertToYsonString(0)))
+        .ThrowOnError();
+
+    TQueueTestBase::TearDownTestCase();
+}
+
+void TConsumerApiTest::SetUpTestCase()
+{
+    TQueueTestBase::SetUpTestCase();
+
+    auto cellId = WaitFor(Client_->CreateObject(EObjectType::TabletCell))
+        .ValueOrThrow();
+    WaitUntilEqual(TYPath("#") + ToString(cellId) + "/@health", "good");
+
+    WaitFor(Client_->SetNode(TYPath("//sys/accounts/tmp/@resource_limits/tablet_count"), ConvertToYsonString(1000)))
+        .ThrowOnError();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(TConsumerApiTest, TestAdvanceConsumerViaProxy)
+{
+    TRichYPath consumerPath;
+    consumerPath.SetPath("//tmp/test_consumer");
+
+    TRichYPath queuePath;
+    queuePath.SetPath("//tmp/test_queue");
+
+    CreateConsumer(consumerPath);
+    CreateQueue(queuePath);
+
+    TRichYPath queueLinkPath;
+    queueLinkPath.SetPath("//tmp/test_queue_link");
+
+    WaitFor(Client_->LinkNode(queuePath.GetPath(), queueLinkPath.GetPath()))
+        .ValueOrThrow();
+
+    auto consumerClient = NQueueClient::CreateSubConsumerClient(Client_, Client_, consumerPath.GetPath(), queuePath);
+
+    auto partitions = WaitFor(consumerClient->CollectPartitions(1))
+        .ValueOrThrow();
+    ASSERT_EQ(partitions.size(), 1u);
+    EXPECT_EQ(partitions[0].PartitionIndex, 0);
+    EXPECT_EQ(partitions[0].NextRowIndex, 0);
+
+    WaitFor(Client_->RegisterQueueConsumer(queuePath, consumerPath, true))
+        .ThrowOnError();
+
+    auto transaction = WaitFor(Client_->StartTransaction(NTransactionClient::ETransactionType::Tablet))
+        .ValueOrThrow();
+
+    WaitFor(transaction->AdvanceConsumer(consumerPath, queueLinkPath, 0, {}, 1, {}))
+        .ThrowOnError();
+    WaitFor(transaction->Commit())
+        .ThrowOnError();
+
+    partitions = WaitFor(consumerClient->CollectPartitions(1))
+        .ValueOrThrow();
+    ASSERT_EQ(partitions.size(), 1u);
+    EXPECT_EQ(partitions[0].PartitionIndex, 0);
+    EXPECT_EQ(partitions[0].NextRowIndex, 1);
+
+    transaction = WaitFor(Client_->StartTransaction(NTransactionClient::ETransactionType::Tablet))
+        .ValueOrThrow();
+
+    WaitFor(transaction->AdvanceConsumer(consumerPath, queueLinkPath, 0, {}, 10, {}))
+        .ThrowOnError();
+
+    WaitFor(transaction->Commit())
+        .ThrowOnError();
+
+    partitions = WaitFor(consumerClient->CollectPartitions(1))
+        .ValueOrThrow();
+    ASSERT_EQ(partitions.size(), 1u);
+    EXPECT_EQ(partitions[0].PartitionIndex, 0);
+    EXPECT_EQ(partitions[0].NextRowIndex, 10);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+using TProducerApiTest = TQueueTestBase;
+
+////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(TProducerApiTest, TestBasic)
+{
+    TRichYPath producerPath;
+    producerPath.SetPath("//tmp/test_producer");
+
+    TRichYPath queuePath;
+    queuePath.SetPath("//tmp/test_queue");
+
+    CreateQueueProducer(producerPath);
+
+    auto queueAttributes = CreateEphemeralAttributes();
+    queueAttributes->Set("tablet_count", 3);
+    auto queue = New<TDynamicTable>(
+            queuePath,
+            New<TTableSchema>(std::vector<TColumnSchema>{
+                TColumnSchema("a", EValueType::Uint64),
+                TColumnSchema("b", EValueType::String)}),
+            queueAttributes);
+
+    auto sessionId = "session_1";
+    i64 epoch = 0;
+
+    WaitFor(Client_->CreateQueueProducerSession(producerPath, queuePath, sessionId))
+        .ValueOrThrow();
+
+    auto transaction = WaitFor(Client_->StartTransaction(ETransactionType::Tablet))
+        .ValueOrThrow();
+
+    TUnversionedRowsBuilder rowsBuilder;
+    int rowCount = 10;
+    for (int rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
+        TUnversionedRowBuilder rowBuilder;
+
+        rowBuilder.AddValue(MakeUnversionedUint64Value(rowIndex, 0));
+
+        TString value = ToString(rowIndex * rowIndex);
+        rowBuilder.AddValue(MakeUnversionedStringValue(value, 1));
+
+        rowsBuilder.AddRow(rowBuilder.GetRow());
+    }
+    auto rows = rowsBuilder.Build();
+
+    auto nameTable = TNameTable::FromSchema(*queue->GetSchema());
+
+    auto result = WaitFor(transaction->PushQueueProducer(
+        producerPath, queuePath, sessionId, epoch, nameTable, rows, TPushQueueProducerOptions{.SequenceNumber = 0}))
+        .ValueOrThrow();
+
+    ASSERT_EQ(result.LastSequenceNumber, 9);
+
+    WaitFor(transaction->Commit())
+        .ThrowOnError();
+
+    auto allRowsResult = WaitFor(Client_->SelectRows(Format("* from [%v]", queuePath)))
+        .ValueOrThrow();
+
+    ASSERT_EQ(std::ssize(allRowsResult.Rowset->GetRows()), 10);
+
+    auto sessionRowsResult = WaitFor(Client_->SelectRows(Format("queue_cluster, queue_path, session_id, sequence_number, epoch from [%v]", producerPath)))
+        .ValueOrThrow();
+    auto sessionRows = sessionRowsResult.Rowset->GetRows();
+
+    auto actualSessionRow = ToString(sessionRows[0]);
+    auto expectedSessionRow = ToString(YsonToSchemalessRow(
+        "<id=0> \"primary\"; <id=1> \"//tmp/test_queue\"; <id=2> session_1; <id=3> 9; <id=4> 0;"));
+
+    ASSERT_EQ(actualSessionRow, expectedSessionRow);
 }
 
 ////////////////////////////////////////////////////////////////////////////////

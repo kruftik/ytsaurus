@@ -165,7 +165,7 @@ struct IFairShareTree
     virtual void TryRunAllPendingOperations() = 0;
 
     virtual TPoolName CreatePoolName(const std::optional<TString>& poolFromSpec, const TString& user) const = 0;
-    virtual const TOffloadingSettings& GetOffloadingSettingsFor(const TString& poolName) const = 0;
+    virtual const TOffloadingSettings& GetOffloadingSettingsFor(const TString& poolName, const TString& user) const = 0;
 
     virtual TPoolsUpdateResult UpdatePools(const NYTree::INodePtr& poolsNode, bool forceUpdate) = 0;
     virtual TError ValidateUserToDefaultPoolMap(const THashMap<TString, TString>& userToDefaultPoolMap) = 0;
@@ -194,6 +194,8 @@ struct IFairShareTree
     virtual void BuildFairShareInfo(NYTree::TFluentMap fluent) const = 0;
 
     virtual NYTree::IYPathServicePtr GetOrchidService() const = 0;
+
+    virtual const TJobResourcesByTagFilter& GetResourceLimitsByTagFilter() const = 0;
 
     //! Raised when operation considered running in tree.
     DECLARE_INTERFACE_SIGNAL(void(TOperationId), OperationRunning);

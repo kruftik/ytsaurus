@@ -20,6 +20,8 @@
 
 #include <yt/yt/library/monitoring/http_integration.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/orchid/orchid_service.h>
 
 #include <yt/yt/client/node_tracker_client/public.h>
@@ -50,7 +52,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletBalancerLogger;
+static constexpr auto& Logger = TabletBalancerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -63,9 +65,9 @@ public:
         , ConfigNode_(std::move(configNode))
     {
         if (Config_->AbortOnUnrecognizedOptions) {
-            AbortOnUnrecognizedOptions(Logger, Config_);
+            AbortOnUnrecognizedOptions(Logger(), Config_);
         } else {
-            WarnForUnrecognizedOptions(Logger, Config_);
+            WarnForUnrecognizedOptions(Logger(), Config_);
         }
     }
 
@@ -153,6 +155,7 @@ void TBootstrap::DoRun()
     Connection_ = NNative::CreateConnection(
         Config_->ClusterConnection,
         connectionOptions);
+    Connection_->GetMasterCellDirectorySynchronizer()->Start();
 
     NativeAuthenticator_ = NNative::CreateNativeAuthenticator(Connection_);
 
@@ -184,11 +187,6 @@ void TBootstrap::DoRun()
         &MonitoringManager_,
         &orchidRoot);
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
-
     if (CoreDumper_) {
         SetNodeByYPath(
             orchidRoot,
@@ -201,10 +199,16 @@ void TBootstrap::DoRun()
         "/tablet_balancer",
         CreateVirtualNode(TabletBalancer_->GetOrchidService()));
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/dynamic_config_manager",
-        CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+        SetNodeByYPath(
+            orchidRoot,
+            "/dynamic_config_manager",
+            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+    }
 
     RpcServer_->RegisterService(NAdmin::CreateAdminService(
         ControlInvoker_,

@@ -1,5 +1,5 @@
 #include "cypress_transaction_service.h"
-#include "private.h"
+
 #include "transaction_manager.h"
 
 #include <yt/yt/server/master/cell_master/bootstrap.h>
@@ -9,6 +9,10 @@
 #include <yt/yt/server/master/transaction_server/proto/transaction_manager.pb.h>
 
 #include <yt/yt/server/lib/hydra/persistent_response_keeper.h>
+
+#include <yt/yt/server/lib/transaction_server/private.h>
+
+#include <yt/yt/server/lib/transaction_supervisor/transaction_supervisor.h>
 
 #include <yt/yt/ytlib/cypress_transaction_client/cypress_transaction_service_proxy.h>
 #include <yt/yt/ytlib/cypress_transaction_client/proto/cypress_transaction_service.pb.h>
@@ -37,7 +41,7 @@ public:
             bootstrap,
             TCypressTransactionServiceProxy::GetDescriptor(),
             EAutomatonThreadQueue::CypressTransactionService,
-            TransactionServerLogger)
+            TransactionServerLogger())
         , TrackerInvoker_(bootstrap->GetHydraFacade()->GetTransactionTrackerInvoker())
     {
         RegisterMethod(RPC_SERVICE_METHOD_DESC(StartTransaction)
@@ -55,6 +59,13 @@ public:
 private:
     const IInvokerPtr TrackerInvoker_;
 
+    void SyncWithSequoiaTransactions()
+    {
+        const auto& transactionSupervisor = Bootstrap_->GetTransactionSupervisor();
+        WaitFor(transactionSupervisor->WaitUntilPreparedTransactionsFinished())
+            .ThrowOnError();
+    }
+
     DECLARE_RPC_SERVICE_METHOD(NCypressTransactionClient::NProto, StartTransaction)
     {
         ValidatePeer(EPeerKind::Leader);
@@ -64,15 +75,19 @@ private:
         auto title = request->has_title() ? std::optional(request->title()) : std::nullopt;
         auto parentId = FromProto<TTransactionId>(request->parent_id());
         auto prerequisiteTransactionIds = FromProto<std::vector<TTransactionId>>(request->prerequisite_transaction_ids());
+        auto replicateToCellTags = FromProto<TCellTagList>(request->replicate_to_cell_tags());
         auto timeout = FromProto<TDuration>(request->timeout());
         auto deadline = request->has_deadline() ? std::optional(FromProto<TInstant>(request->deadline())) : std::nullopt;
 
-        context->SetRequestInfo("Title: %v, ParentId: %v, PrerequisiteTransactionIds: %v, Timeout: %v, Deadline: %v",
+        context->SetRequestInfo("Title: %v, ParentId: %v, PrerequisiteTransactionIds: %v, ReplicateToCellTags: %v, Timeout: %v, Deadline: %v",
             title,
             parentId,
             prerequisiteTransactionIds,
+            replicateToCellTags,
             timeout,
             deadline);
+
+        SyncWithSequoiaTransactions();
 
         const auto& transactionManager = Bootstrap_->GetTransactionManager();
         transactionManager->StartCypressTransaction(context);
@@ -103,6 +118,8 @@ private:
             }
         }
 
+        SyncWithSequoiaTransactions();
+
         const auto& transactionManager = Bootstrap_->GetTransactionManager();
         transactionManager->CommitCypressTransaction(context);
     }
@@ -125,6 +142,8 @@ private:
                 return;
             }
         }
+
+        SyncWithSequoiaTransactions();
 
         const auto& transactionManager = Bootstrap_->GetTransactionManager();
         transactionManager->AbortCypressTransaction(context);

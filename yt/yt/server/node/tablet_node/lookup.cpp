@@ -150,13 +150,13 @@ protected:
         : Merger_(CreateVersionedRowMerger(
             tabletSnapshot->Settings.MountConfig->RowMergerType,
             New<TRowBuffer>(TLookupSessionBufferTag()),
-            tabletSnapshot->PhysicalSchema->GetColumnCount(),
-            tabletSnapshot->PhysicalSchema->GetKeyColumnCount(),
+            tabletSnapshot->PhysicalSchema,
             columnFilter,
             retentionConfig,
             timestampRange.Timestamp,
             MinTimestamp,
             tabletSnapshot->ColumnEvaluator,
+            tabletSnapshot->CustomRuntimeData,
             /*lookup*/ true,
             /*mergeRowsOnFlush*/ false))
     { }
@@ -268,13 +268,13 @@ protected:
         , CacheRowMerger_(CreateVersionedRowMerger(
             tabletSnapshot->Settings.MountConfig->RowMergerType,
             RowBuffer_,
-            tabletSnapshot->PhysicalSchema->GetColumnCount(),
-            tabletSnapshot->PhysicalSchema->GetKeyColumnCount(),
+            tabletSnapshot->PhysicalSchema,
             TColumnFilter::MakeUniversal(),
             tabletSnapshot->Settings.MountConfig,
             GetCompactionTimestamp(tabletSnapshot->Settings.MountConfig, RetainedTimestamp_, Logger),
             MaxTimestamp, // Do not consider major timestamp.
             tabletSnapshot->ColumnEvaluator,
+            tabletSnapshot->CustomRuntimeData,
             /*lookup*/ true, // Do not produce sentinel rows.
             /*mergeRowsOnFlush*/ true)) // Always merge rows on flush.
     { }
@@ -1125,7 +1125,7 @@ TLookupSession::TLookupSession(
     , SnapshotStore_(snapshotStore)
     , ProfilingUser_(std::move(profilingUser))
     , Invoker_(std::move(invoker))
-    , Logger(TabletNodeLogger.WithTag("ReadSessionId: %v", chunkReadOptions.ReadSessionId))
+    , Logger(TabletNodeLogger().WithTag("ReadSessionId: %v", chunkReadOptions.ReadSessionId))
     , ChunkReadOptions_(std::move(chunkReadOptions))
 {
     TabletRequests_.reserve(tabletRequestCount);
@@ -1585,7 +1585,7 @@ TTabletLookupSession<TPipeline>::TTabletLookupSession(
     , ColumnFilter_(std::move(columnFilter))
     , LookupKeys_(std::move(lookupKeys))
     , ChunkLookupKeys_(TPipeline::Initialize(LookupKeys_))
-    , Logger(LookupSession_->Logger.WithTag("TabletId: %v", TabletSnapshot_->TabletId))
+    , Logger(LookupSession_->Logger().WithTag("TabletId: %v", TabletSnapshot_->TabletId))
 { }
 
 template <class TPipeline>

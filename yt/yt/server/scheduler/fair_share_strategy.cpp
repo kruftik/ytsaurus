@@ -654,7 +654,7 @@ public:
         }
 
         for (const auto& [treeName, options] : runtimeParameters->SchedulingOptionsPerPoolTree) {
-            const auto& offloadingSettings = GetTree(treeName)->GetOffloadingSettingsFor(options->Pool.GetSpecifiedPoolName());
+            const auto& offloadingSettings = GetTree(treeName)->GetOffloadingSettingsFor(options->Pool.GetSpecifiedPoolName(), user);
             if (!offloadingSettings.empty() && !spec->SchedulingTagFilter.IsEmpty()) {
                 YT_LOG_DEBUG("Ignoring offloading since operation has scheduling tag filter (SchedulingTagFilter: %v, OperationId: %v)",
                     spec->SchedulingTagFilter.GetFormula(),
@@ -676,7 +676,10 @@ public:
                         } else {
                             auto treeParams = New<TOperationFairShareTreeRuntimeParameters>();
                             treeParams->Weight = offloadingPoolSettings->Weight;
-                            treeParams->Pool = tree->CreatePoolName(offloadingPoolSettings->Pool, user);
+                            treeParams->Pool = offloadingPoolSettings->Pool
+                                && !offloadingPoolSettings->Pool->empty()  // COMPAT(renadeen): remove when this commit will be on hahn's master.
+                                ? tree->CreatePoolName(offloadingPoolSettings->Pool, user)
+                                : tree->CreatePoolName(options->Pool.GetSpecifiedPoolName(), user);
                             treeParams->Tentative = offloadingPoolSettings->Tentative;
                             treeParams->ResourceLimits = offloadingPoolSettings->ResourceLimits;
                             treeParams->Offloading = true;
@@ -1300,7 +1303,7 @@ public:
         return bestTree;
     }
 
-    TError OnOperationMaterialized(TOperationId operationId) override
+    TError OnOperationMaterialized(TOperationId operationId, bool revivedFromSnapshot) override
     {
         VERIFY_INVOKERS_AFFINITY(FeasibleInvokers_);
 
@@ -1310,7 +1313,10 @@ public:
             auto tree = GetTree(treeId);
             tree->OnOperationMaterialized(operationId);
 
-            if (auto error = tree->CheckOperationNecessaryResourceDemand(operationId); !error.IsOK()) {
+            if (auto error = tree->CheckOperationNecessaryResourceDemand(operationId);
+                !error.IsOK() &&
+                !revivedFromSnapshot)
+            {
                 return error;
             }
 
@@ -2263,6 +2269,21 @@ private:
         }
 
         Initialized_ = true;
+    }
+
+    // TODO(renadeen): we should move tagFilter to resourceLimits map into tree orchid and remove this method.
+    TJobResourcesByTagFilter GetResourceLimitsByTagFilter() override
+    {
+        VERIFY_INVOKERS_AFFINITY(FeasibleInvokers_);
+
+        TJobResourcesByTagFilter result;
+        for (const auto& [_, tree] : IdToTree_) {
+            for (const auto& [tagFilter, resourceLimits] : tree->GetResourceLimitsByTagFilter()) {
+                result.emplace(tagFilter, resourceLimits);
+            }
+        }
+
+        return result;
     }
 
     class TPoolTreeService

@@ -24,6 +24,8 @@
 #include <yt/yt/ytlib/api/native/connection.h>
 #include <yt/yt/ytlib/api/native/helpers.h>
 
+#include <yt/yt/ytlib/cell_master_client/cell_directory_synchronizer.h>
+
 #include <yt/yt/ytlib/hive/cluster_directory_synchronizer.h>
 
 #include <yt/yt/ytlib/node_tracker_client/node_directory_synchronizer.h>
@@ -90,7 +92,7 @@ using namespace NAdmin;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = HttpProxyLogger;
+static constexpr auto& Logger = HttpProxyLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -99,9 +101,9 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
     , ConfigNode_(std::move(configNode))
 {
     if (Config_->AbortOnUnrecognizedOptions) {
-        AbortOnUnrecognizedOptions(Logger, Config_);
+        AbortOnUnrecognizedOptions(Logger(), Config_);
     } else {
-        WarnForUnrecognizedOptions(Logger, Config_);
+        WarnForUnrecognizedOptions(Logger(), Config_);
     }
 
     // TODO(gepardo): Pass native authenticator here.
@@ -119,10 +121,6 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
         &MonitoringManager_,
         &orchidRoot);
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/config",
-        CreateVirtualNode(ConfigNode_));
     SetBuildAttributes(
         orchidRoot,
         "http_proxy");
@@ -134,7 +132,7 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
     DiskChangeChecker_ = New<TDiskChangeChecker>(
         DiskInfoProvider_,
         GetControlInvoker(),
-        Logger);
+        Logger());
 
     NNative::TConnectionOptions connectionOptions;
     connectionOptions.RetryRequestQueueSizeLimitExceeded = Config_->RetryRequestQueueSizeLimitExceeded;
@@ -144,12 +142,13 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
         Connection_,
         Config_->ClusterConnectionDynamicConfigPolicy,
         ConfigNode_->AsMap()->GetChildOrThrow("cluster_connection"),
-        Logger);
+        Logger());
 
     Connection_->GetClusterDirectorySynchronizer()->Start();
     // Force-start node directory synchronizer.
     Connection_->GetNodeDirectorySynchronizer()->Start();
     Connection_->GetQueueConsumerRegistrationManager()->StartSync();
+    Connection_->GetMasterCellDirectorySynchronizer()->Start();
     SetupClients();
 
     Coordinator_ = New<TCoordinator>(Config_, this);
@@ -158,19 +157,25 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
         TSolomonRegistry::Get()->SetDynamicTags({TTag{"proxy_role", role}});
     };
     setGlobalRoleTag(Coordinator_->GetSelf()->Role);
-    Coordinator_->SubscribeOnSelfRoleChanged(BIND(setGlobalRoleTag));
+    Coordinator_->SubscribeOnSelfRoleChanged(BIND_NO_PROPAGATE(setGlobalRoleTag));
 
     DynamicConfigManager_ = CreateDynamicConfigManager(this);
-    DynamicConfigManager_->SubscribeConfigChanged(BIND(&TBootstrap::OnDynamicConfigChanged, MakeWeak(this)));
+    DynamicConfigManager_->SubscribeConfigChanged(BIND_NO_PROPAGATE(&TBootstrap::OnDynamicConfigChanged, MakeWeak(this)));
 
-    SetNodeByYPath(
-        orchidRoot,
-        "/dynamic_config_manager",
-        CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
-    SetNodeByYPath(
-        orchidRoot,
-        "/cluster_connection",
-        CreateVirtualNode(Connection_->GetOrchidService()));
+    if (Config_->ExposeConfigInOrchid) {
+        SetNodeByYPath(
+            orchidRoot,
+            "/config",
+            CreateVirtualNode(ConfigNode_));
+        SetNodeByYPath(
+            orchidRoot,
+            "/dynamic_config_manager",
+            CreateVirtualNode(DynamicConfigManager_->GetOrchidService()));
+        SetNodeByYPath(
+            orchidRoot,
+            "/cluster_connection",
+            CreateVirtualNode(Connection_->GetOrchidService()));
+    }
     SetNodeByYPath(
         orchidRoot,
         "/disk_monitoring",
@@ -267,7 +272,7 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
 
     if (Config_->HttpsServer) {
         Config_->HttpsServer->ServerName = "HttpsApi";
-        ApiHttpsServer_ = NHttps::CreateServer(Config_->HttpsServer, Poller_, Acceptor_);
+        ApiHttpsServer_ = NHttps::CreateServer(Config_->HttpsServer, Poller_, Acceptor_, GetControlInvoker());
         RegisterRoutes(ApiHttpsServer_);
     }
 
@@ -279,7 +284,7 @@ TBootstrap::TBootstrap(TProxyConfigPtr config, INodePtr configNode)
 
     if (Config_->TvmOnlyHttpsServer) {
         Config_->TvmOnlyHttpsServer->ServerName = "TvmOnlyHttpsApi";
-        TvmOnlyApiHttpsServer_ = NHttps::CreateServer(Config_->TvmOnlyHttpsServer, Poller_, Acceptor_);
+        TvmOnlyApiHttpsServer_ = NHttps::CreateServer(Config_->TvmOnlyHttpsServer, Poller_, Acceptor_, GetControlInvoker());
         RegisterRoutes(TvmOnlyApiHttpsServer_);
     }
 

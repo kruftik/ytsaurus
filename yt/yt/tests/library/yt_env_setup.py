@@ -26,9 +26,11 @@ from yt.environment.helpers import (  # noqa
     NODES_SERVICE,
     CHAOS_NODES_SERVICE,
     MASTERS_SERVICE,
+    MASTER_CACHES_SERVICE,
     QUEUE_AGENTS_SERVICE,
     RPC_PROXIES_SERVICE,
     HTTP_PROXIES_SERVICE,
+    KAFKA_PROXIES_SERVICE,
 )
 
 from yt.sequoia_tools import DESCRIPTORS
@@ -39,6 +41,7 @@ import yt.test_helpers.cleanup as test_cleanup
 from yt.common import YtResponseError, format_error, update_inplace
 import yt.logger
 
+from yt_commands import print_debug
 from yt_driver_bindings import reopen_logs
 from yt_helpers import master_exit_read_only_sync
 
@@ -246,6 +249,7 @@ class YTEnvSetup(object):
     NUM_CELL_BALANCERS = 0
     ENABLE_BUNDLE_CONTROLLER = False
     NUM_QUEUE_AGENTS = 0
+    NUM_KAFKA_PROXIES = 0
     NUM_TABLET_BALANCERS = 0
     NUM_CYPRESS_PROXIES = 0
     NUM_REPLICATED_TABLE_TRACKERS = 0
@@ -256,7 +260,10 @@ class YTEnvSetup(object):
     ENABLE_DYNAMIC_DROP_COLUMN = True
     ENABLE_TLS = False
 
+    DELTA_NODE_FLAVORS = []
+
     DELTA_DRIVER_CONFIG = {}
+    DELTA_DRIVER_LOGGING_CONFIG = {}
     DELTA_RPC_DRIVER_CONFIG = {}
     DELTA_MASTER_CONFIG = {}
     DELTA_DYNAMIC_MASTER_CONFIG = {}
@@ -281,6 +288,7 @@ class YTEnvSetup(object):
     DELTA_TABLET_BALANCER_CONFIG = {}
     DELTA_MASTER_CACHE_CONFIG = {}
     DELTA_QUEUE_AGENT_CONFIG = {}
+    DELTA_KAFKA_PROXY_CONFIG = {}
     DELTA_CYPRESS_PROXY_CONFIG = {}
 
     USE_PORTO = False  # Enables use_slot_user_id, use_porto_for_servers, jobs_environment_type="porto"
@@ -294,6 +302,7 @@ class YTEnvSetup(object):
     USE_PRIMARY_CLOCKS = True
 
     USE_SEQUOIA = False
+    ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA = False
     VALIDATE_SEQUOIA_TREE_CONSISTENCY = False
 
     # Ground cluster should be lean by default.
@@ -331,6 +340,8 @@ class YTEnvSetup(object):
     # COMPAT(kvk1920)
     TEST_MAINTENANCE_FLAGS = False
 
+    WAIT_FOR_DYNAMIC_CONFIG = True
+
     @classmethod
     def is_multicell(cls):
         return cls.NUM_SECONDARY_MASTER_CELLS > 0
@@ -345,11 +356,19 @@ class YTEnvSetup(object):
         pass
 
     @classmethod
+    def modify_clock_config(cls, config, cluster_index, master_cell_tag):
+        pass
+
+    @classmethod
     def modify_scheduler_config(cls, config, cluster_index):
         pass
 
     @classmethod
     def modify_queue_agent_config(cls, config):
+        pass
+
+    @classmethod
+    def modify_kafka_proxy_config(cls, config):
         pass
 
     @classmethod
@@ -370,6 +389,10 @@ class YTEnvSetup(object):
 
     @classmethod
     def modify_rpc_proxy_config(cls, config):
+        pass
+
+    @classmethod
+    def modify_driver_config(cls, config):
         pass
 
     @classmethod
@@ -426,6 +449,15 @@ class YTEnvSetup(object):
         return name
 
     @classmethod
+    def find_node_with_flavors(self, required_flavors):
+        for node in yt_commands.get("//sys/cluster_nodes"):
+            flavors = yt_commands.get("//sys/cluster_nodes/{}/@flavors".format(node))
+            found = (sorted(flavors) == sorted(required_flavors))
+            if found:
+                return node
+        return None
+
+    @classmethod
     def get_param(cls, name, cluster_index):
         actual_name = cls._get_param_real_name(name, cluster_index)
 
@@ -444,9 +476,14 @@ class YTEnvSetup(object):
         return partitions
 
     @classmethod
+    def modify_driver_logging_config(cls, config):
+        update_inplace(config, cls.DELTA_DRIVER_LOGGING_CONFIG)
+
+    @classmethod
     def create_yt_cluster_instance(cls, index, path):
         modify_configs_func = functools.partial(cls.apply_config_patches, cluster_index=index, cluster_path=path)
         modify_dynamic_configs_func = functools.partial(cls.apply_dynamic_config_patches, cluster_index=index)
+        modify_driver_logging_config_func = cls.modify_driver_logging_config
 
         yt.logger.info("Creating cluster instance")
 
@@ -484,6 +521,7 @@ class YTEnvSetup(object):
             enable_bundle_controller=cls.get_param("ENABLE_BUNDLE_CONTROLLER", index),
             discovery_server_count=cls.get_param("NUM_DISCOVERY_SERVERS", index),
             queue_agent_count=cls.get_param("NUM_QUEUE_AGENTS", index),
+            kafka_proxy_count=cls.get_param("NUM_KAFKA_PROXIES", index),
             node_count=cls.get_param("NUM_NODES", index),
             defer_node_start=cls.get_param("DEFER_NODE_START", index),
             chaos_node_count=cls.get_param("NUM_CHAOS_NODES", index),
@@ -519,6 +557,7 @@ class YTEnvSetup(object):
             enable_tvm_only_proxies=cls.get_param("ENABLE_TVM_ONLY_PROXIES", index),
             mock_tvm_id=(1000 + index if use_native_auth else None),
             enable_tls=cls.ENABLE_TLS,
+            wait_for_dynamic_config=cls.WAIT_FOR_DYNAMIC_CONFIG,
         )
 
         if yt_config.jobs_environment_type == "porto" and not porto_available():
@@ -541,7 +580,8 @@ class YTEnvSetup(object):
                 "yt_stderrs",
                 cls.run_name,
                 str(index)),
-            external_bin_path=cls.bin_path
+            external_bin_path=cls.bin_path,
+            modify_driver_logging_config_func=modify_driver_logging_config_func,
         )
 
         instance._cluster_name = cls.get_cluster_name(index)
@@ -640,9 +680,10 @@ class YTEnvSetup(object):
             raise
 
     @classmethod
-    def _setup_cluster_configuration(cls, index, clusters):
+    def _setup_cluster_configuration(cls, index, clusters, driver=None):
         cluster_name = cls.get_cluster_name(index)
-        driver = yt_commands.get_driver(cluster=cluster_name)
+
+        driver = driver or yt_commands.get_driver(cluster=cluster_name)
         if driver is None:
             return
 
@@ -655,6 +696,17 @@ class YTEnvSetup(object):
         responses = yt_commands.execute_batch(requests, driver=driver)
         for response in responses:
             yt_commands.raise_batch_error(response)
+
+    @classmethod
+    def _on_sequoia_started(cls, cluster_index, driver=None):
+        clusters = {}
+        for instance in cls.combined_envs:
+            clusters[instance._cluster_name] = instance.get_cluster_configuration()["cluster_connection"]
+
+        cls._setup_cluster_configuration(cluster_index, clusters, driver=driver)
+        if cls.get_param("USE_SEQUOIA", cluster_index):
+            cls._setup_cluster_configuration(cluster_index + cls.get_ground_index_offset(), clusters)
+            cls._setup_sequoia_tables(cluster_index)
 
     @classmethod
     def start_envs(cls):
@@ -700,10 +752,12 @@ class YTEnvSetup(object):
         for env in cls.ground_envs:
             env.start()
 
-        cls.Env.start(on_masters_started_func=cls.on_masters_started)
+        cls.Env.start(
+            on_sequoia_started_func=lambda driver: cls._on_sequoia_started(cluster_index=0, driver=driver),
+            on_masters_started_func=cls.on_masters_started)
 
-        for env in cls.remote_envs:
-            env.start()
+        for index, env in enumerate(cls.remote_envs):
+            env.start(on_sequoia_started_func=lambda driver: cls._on_sequoia_started(cluster_index=index + 1, driver=driver))
 
         yt_commands.wait_drivers()
 
@@ -713,16 +767,6 @@ class YTEnvSetup(object):
             liveness_checker.start()
             cls.liveness_checkers.append(liveness_checker)
 
-        if len(cls.Env.configs["master"]) > 0:
-            clusters = {}
-            for instance in cls.combined_envs:
-                clusters[instance._cluster_name] = instance.get_cluster_configuration()["cluster_connection"]
-
-            for cluster_index in range(cls.NUM_REMOTE_CLUSTERS + 1):
-                cls._setup_cluster_configuration(cluster_index, clusters)
-                if cls.USE_SEQUOIA:
-                    cls._setup_cluster_configuration(cluster_index + cls.get_ground_index_offset(), clusters)
-
         # TODO(babenko): wait for cluster sync
         if cls.remote_envs:
             sleep(1.0)
@@ -730,11 +774,6 @@ class YTEnvSetup(object):
         if yt_commands.is_multicell and not cls.DEFER_SECONDARY_CELL_START:
             yt_commands.remove("//sys/operations")
             yt_commands.create("portal_entrance", "//sys/operations", attributes={"exit_cell_tag": 11})
-
-        if cls.USE_SEQUOIA:
-            for cluster_index in range(cls.NUM_REMOTE_CLUSTERS + 1):
-                if cls.get_param("USE_SEQUOIA", cluster_index):
-                    cls.setup_sequoia_tables(cluster_index)
 
         if cls.USE_DYNAMIC_TABLES:
             for cluster_index in range(cls.NUM_REMOTE_CLUSTERS + 1):
@@ -771,7 +810,7 @@ class YTEnvSetup(object):
             yt_commands.write_file("//layers/rootfs.tar.gz", open("rootfs/rootfs.tar.gz", "rb").read())
 
     @classmethod
-    def setup_sequoia_tables(cls, cluster_index):
+    def _setup_sequoia_tables(cls, cluster_index):
         ground_driver = yt_sequoia_helpers.get_ground_driver(cluster=cls.get_cluster_name(cluster_index))
         if ground_driver is None:
             return
@@ -811,6 +850,10 @@ class YTEnvSetup(object):
         if "node" in cls.ARTIFACT_COMPONENTS.get("23_2", []):
             config["%true"]["exec_node"]["controller_agent_connector"]["use_job_tracker_service_to_settle_jobs"] = True
 
+        # COMPAT(arkady-e1ppa)
+        if any(component in cls.ARTIFACT_COMPONENTS.get("23_2", []) for component in ["scheduler", "controller_agent"]):
+            config["%true"]["exec_node"]["job_controller"]["disable_legacy_allocation_preparation"] = False
+
         return config
 
     @classmethod
@@ -820,6 +863,7 @@ class YTEnvSetup(object):
                 config = update_inplace(config, cls.get_param("DELTA_MASTER_CONFIG", cluster_index))
                 configs["master"][tag][peer_index] = cls.update_timestamp_provider_config(cluster_index, config)
                 configs["master"][tag][peer_index] = cls.update_sequoia_connection_config(cluster_index, config)
+                configs["master"][tag][peer_index] = cls.update_transaction_supervisor_config(cluster_index, config)
                 cls.modify_master_config(configs["master"][tag][peer_index], tag, peer_index, cluster_index)
 
         for index, config in enumerate(configs["scheduler"]):
@@ -834,10 +878,16 @@ class YTEnvSetup(object):
 
             configs["scheduler"][index] = cls.update_timestamp_provider_config(cluster_index, config)
             cls.modify_scheduler_config(configs["scheduler"][index], cluster_index)
+        for config in configs["clock"][configs["clock"]["cell_tag"]]:
+            cls.modify_clock_config(config, cluster_index, configs["master"]["primary_cell_tag"])
         for index, config in enumerate(configs["queue_agent"]):
             config = update_inplace(config, cls.get_param("DELTA_QUEUE_AGENT_CONFIG", cluster_index))
             configs["queue_agent"][index] = cls.update_timestamp_provider_config(cluster_index, config)
             cls.modify_queue_agent_config(configs["queue_agent"][index])
+        for index, config in enumerate(configs["kafka_proxy"]):
+            config = update_inplace(config, cls.get_param("DELTA_KAFKA_PROXY_CONFIG", cluster_index))
+            configs["kafka_proxy"][index] = cls.update_timestamp_provider_config(cluster_index, config)
+            cls.modify_kafka_proxy_config(configs["kafka_proxy"][index])
         for index, config in enumerate(configs["cell_balancer"]):
             config = update_inplace(config, cls.get_param("DELTA_CELL_BALANCER_CONFIG", cluster_index))
             configs["cell_balancer"][index] = cls.update_timestamp_provider_config(cluster_index, config)
@@ -873,8 +923,16 @@ class YTEnvSetup(object):
             if "nodes" not in artifact_components_23_2:
                 config["controller_agent"]["job_tracker"]["enable_graceful_abort"] = True
 
+            if "node" in artifact_components_23_2:
+                print_debug("Turning off job_id_unequal_to_allocation_id flag")
+                config["controller_agent"]["job_id_unequal_to_allocation_id"] = False
+
             configs["controller_agent"][index] = cls.update_timestamp_provider_config(cluster_index, config)
             cls.modify_controller_agent_config(configs["controller_agent"][index], cluster_index)
+
+        node_flavors_length = len(cls.DELTA_NODE_FLAVORS)
+        assert node_flavors_length == 0 or cls.NUM_NODES == node_flavors_length
+
         for index, config in enumerate(configs["node"]):
             config = update_inplace(config, cls.get_param("DELTA_NODE_CONFIG", cluster_index))
             if cls.USE_CUSTOM_ROOTFS:
@@ -893,6 +951,10 @@ class YTEnvSetup(object):
             })
 
             config = cls.update_timestamp_provider_config(cluster_index, config)
+
+            if node_flavors_length != 0:
+                config["flavors"] = cls.DELTA_NODE_FLAVORS[index]
+
             configs["node"][index] = config
             cls.modify_node_config(configs["node"][index], cluster_index)
 
@@ -930,11 +992,20 @@ class YTEnvSetup(object):
             config = update_inplace(config, cls.get_param("DELTA_DRIVER_CONFIG", cluster_index))
 
             configs["driver"][key] = cls.update_timestamp_provider_config(cluster_index, config)
+            cls.modify_driver_config(configs["driver"][key])
 
         configs["rpc_driver"] = update_inplace(
             configs["rpc_driver"],
             cls.get_param("DELTA_RPC_DRIVER_CONFIG", cluster_index),
         )
+
+    @classmethod
+    def update_transaction_supervisor_config(cls, cluster_index, config):
+        if not cls.get_param("USE_SEQUOIA", cluster_index) or cls._is_ground_cluster(cluster_index):
+            return config
+        config.setdefault("transaction_supervisor", {})
+        config["transaction_supervisor"]["enable_wait_until_prepared_transactions_finished"] = True
+        return config
 
     @classmethod
     def update_sequoia_connection_config(cls, cluster_index, config):
@@ -1114,13 +1185,13 @@ class YTEnvSetup(object):
 
         if self.get_param("ENABLE_TMP_ROOTSTOCK", cluster_index) and not self._is_ground_cluster(cluster_index):
             assert self.get_param("USE_SEQUOIA", cluster_index)
-            yt_commands.create(
+            # NB: Sometimes roles will not be applied to cells yet, which can lead to an error. Just retrying helps.
+            wait(lambda: yt_commands.create(
                 "rootstock",
                 "//tmp",
-                attributes={"scion_cell_tag": 10},
                 force=True,
-                driver=driver
-            )
+                driver=driver),
+                ignore_exceptions=True)
         elif self.ENABLE_TMP_PORTAL and cluster_index == 0:
             yt_commands.create(
                 "portal_entrance",
@@ -1229,6 +1300,9 @@ class YTEnvSetup(object):
                 wait(lambda: yt_commands.select_rows(f"* from [{DESCRIPTORS.node_id_to_path.get_default_path()}] where not is_substr('//sys', path)", driver=driver) == [])
                 wait(lambda: yt_commands.select_rows(f"* from [{DESCRIPTORS.child_node.get_default_path()}]", driver=driver) == [])
 
+                for table in DESCRIPTORS.get_group("transactions"):
+                    wait(lambda: yt_commands.select_rows(f"* from [{table.get_default_path()}]", driver=driver) == [])
+
         # Ground cluster can't have rootstocks or portals.
         # Do not remove tmp if ENABLE_TMP_ROOTSTOCK, since it will be removed with scions.
         if not self.get_param("ENABLE_TMP_ROOTSTOCK", cluster_index) and not self._is_ground_cluster(cluster_index):
@@ -1266,7 +1340,7 @@ class YTEnvSetup(object):
             exists_action=lambda *args, **kwargs: yt_commands.exists(*args, driver=driver, **kwargs),
             get_action=lambda *args, **kwargs: yt_commands.get(*args, driver=driver, **kwargs))
 
-        yt_commands.execute_batch(requests)
+        yt_commands.execute_batch(requests, driver=driver)
 
     def _reset_nodes(self, wait_for_nodes=True, driver=None):
         use_maintenance_requests = yt_commands.get(
@@ -1491,7 +1565,12 @@ class YTEnvSetup(object):
 
         if self.USE_SEQUOIA:
             dynamic_master_config["sequoia_manager"]["enable"] = True
-            dynamic_master_config["sequoia_manager"]["fetch_chunk_meta_from_sequoia"] = True
+            if self.ENABLE_CYPRESS_TRANSACTIONS_IN_SEQUOIA:
+                dynamic_master_config["sequoia_manager"]["enable_cypress_transactions_in_sequoia"] = True
+
+        # COMPAT(kvk1920)
+        if self.Env.get_component_version("ytserver-master").abi >= (24, 2):
+            dynamic_master_config["transaction_manager"]["alert_transaction_is_not_compatible_with_method"] = True
 
         if self.TEST_LOCATION_AWARE_REPLICATOR:
             assert dynamic_master_config["node_tracker"].pop("enable_real_chunk_locations")
@@ -1513,7 +1592,7 @@ class YTEnvSetup(object):
             },
             # Make default settings suitable for starvation and preemption.
             "preemptive_scheduling_backoff": 500,
-            "max_unpreemptible_running_allocation_count": 0,
+            "non_preemptible_resource_usage_threshold": {"user_slots": 0},
             "fair_share_starvation_timeout": 1000,
             "enable_conditional_preemption": True,
             "check_operation_for_liveness_in_preschedule": False,
@@ -1582,6 +1661,9 @@ class YTEnvSetup(object):
             self._wait_for_scheduler_state_restored(driver=driver)
 
     def _wait_for_dynamic_config(self, root_path, config, instances, driver=None):
+        if not self.WAIT_FOR_DYNAMIC_CONFIG:
+            return
+
         def check():
             responses = yt_commands.execute_batch(
                 [
@@ -1817,3 +1899,18 @@ def get_custom_rootfs_delta_node_config():
             },
         }
     }
+
+
+def get_service_component_name(service):
+    return {
+        SCHEDULERS_SERVICE: "scheduler",
+        CONTROLLER_AGENTS_SERVICE: "controller-agent",
+        NODES_SERVICE: "node",
+        CHAOS_NODES_SERVICE: "node",
+        MASTERS_SERVICE: "master",
+        MASTER_CACHES_SERVICE: "master-cache",
+        QUEUE_AGENTS_SERVICE: "queue-agent",
+        RPC_PROXIES_SERVICE: "proxy",
+        HTTP_PROXIES_SERVICE: "http-proxy",
+        KAFKA_PROXIES_SERVICE: "kafka-proxy",
+    }[service]

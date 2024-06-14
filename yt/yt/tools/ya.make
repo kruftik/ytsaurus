@@ -8,11 +8,12 @@ RECURSE(
     dynamic_tables
     force_commit_tx
     hunk_chunk_advisor
-    importer
+    import_table
     journal_reader
     offline_controller
     offline_read
     offline_read_fmt_write
+    parse_rpc_header
     prepare_scheduling_usage
     print_column_statistics
     read_arrow

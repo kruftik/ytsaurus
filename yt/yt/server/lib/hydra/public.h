@@ -34,8 +34,6 @@ DECLARE_REFCOUNTED_STRUCT(IFileChangelog)
 DECLARE_REFCOUNTED_STRUCT(IChangelogStore)
 DECLARE_REFCOUNTED_STRUCT(IChangelogStoreFactory)
 DECLARE_REFCOUNTED_STRUCT(IFileChangelogDispatcher)
-// COMPAT(shakurov)
-DECLARE_REFCOUNTED_STRUCT(ILegacySnapshotStore)
 
 struct ICheckpointableInputStream;
 struct ICheckpointableOutputStream;
@@ -57,7 +55,6 @@ DECLARE_REFCOUNTED_STRUCT(ILocalHydraJanitor)
 DECLARE_REFCOUNTED_CLASS(TSerializationDumperConfig)
 
 struct TDistributedHydraManagerOptions;
-struct TSnapshotValidationOptions;
 
 class THydraContext;
 
@@ -74,6 +71,7 @@ class TSaveContext;
 class TLoadContext;
 
 DECLARE_REFCOUNTED_CLASS(TDistributedHydraManagerConfig)
+DECLARE_REFCOUNTED_CLASS(TDynamicLocalHydraJanitorConfig)
 DECLARE_REFCOUNTED_CLASS(TDynamicDistributedHydraManagerConfig)
 DECLARE_REFCOUNTED_CLASS(TFileChangelogConfig)
 DECLARE_REFCOUNTED_CLASS(TFileChangelogDispatcherConfig)

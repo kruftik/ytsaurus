@@ -75,7 +75,6 @@ static_assert(sizeof(TReplicationPolicy) == 1, "sizeof(TReplicationPolicy) != 1"
 bool operator==(TReplicationPolicy lhs, TReplicationPolicy rhs);
 
 void FormatValue(TStringBuilderBase* builder, TReplicationPolicy policy, TStringBuf /*spec*/);
-TString ToString(TReplicationPolicy policy);
 
 void Serialize(TReplicationPolicy policy, NYson::IYsonConsumer* consumer);
 void Deserialize(TReplicationPolicy& policy, NYTree::INodePtr node);
@@ -210,7 +209,10 @@ public:
     bool GetVital() const;
     void SetVital(bool vital);
 
-    bool IsDurabilityRequired(const IChunkManagerPtr& chunkManager) const;
+    //! The difference between the two methods below is in whether or not the `Vital` flag itself is considered.
+    bool IsDurable(const IChunkManagerPtr& chunkManager, bool isErasureChunk) const;
+    //! This method always returns `false` for non-vital chunks.
+    bool IsDurabilityRequired(const IChunkManagerPtr& chunkManager, bool isErasureChunk) const;
 
     //! Returns |true| iff this replication settings would not result in a data
     //! loss (i.e. on at least on medium, replication factor is non-zero and
@@ -242,7 +244,6 @@ static_assert(sizeof(TChunkReplication) == 40, "TChunkReplication's size is wron
 bool operator==(const TChunkReplication& lhs, const TChunkReplication& rhs);
 
 void FormatValue(TStringBuilderBase* builder, const TChunkReplication& replication, TStringBuf /*spec*/);
-TString ToString(const TChunkReplication& replication);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -263,7 +264,7 @@ public:
 
     void ToChunkReplication(
         TChunkReplication* replication,
-        const IChunkManagerPtr& chunkManager);
+        const IChunkManagerPtr& chunkManager) const;
 
     void Serialize(NYson::IYsonConsumer* consumer) const;
     void Deserialize(NYTree::INodePtr node);
@@ -329,7 +330,6 @@ struct TRequisitionEntry
 };
 
 void FormatValue(TStringBuilderBase* builder, const TRequisitionEntry& entry, TStringBuf /*spec*/ = {});
-TString ToString(const TRequisitionEntry& entry);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -439,8 +439,7 @@ void ToProto(
     NProto::TReqUpdateChunkRequisition::TChunkRequisition* protoRequisition,
     const TChunkRequisition& requisition);
 
-void FormatValue(TStringBuilderBase* builder, const TChunkRequisition& requisition, TStringBuf /*spec*/ = {});
-TString ToString(const TChunkRequisition& requisition);
+void FormatValue(TStringBuilderBase* builder, const TChunkRequisition& requisition, TStringBuf /*spec*/ = TStringBuf{"v"});
 
 ////////////////////////////////////////////////////////////////////////////////
 

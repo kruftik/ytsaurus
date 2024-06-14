@@ -472,7 +472,7 @@ Example:
 
 ```bash
 PARAMETERS { "path" = "//tmp/node" }
-OUTPUT { 
+OUTPUT {
 OUTPUT   "lock_id" = "0-1-3fe00c8-353e9ba4";
 OUTPUT   "node_id" = "0-1-3fe012f-9ad48d90";
 OUTPUT }
@@ -2207,7 +2207,7 @@ Output data:
 | `events` | `list<map>` | List of events (state changes) that occurred with the operation. |
 | `alerts` | `map` | Alerts (in the format of a dictionary `<alert_name> : <map_with_attributes>`) set up for the operation at the moment. |
 | `result` | `map` | A map with an `error` field that can include an error if the operation failed. |
-| `commited` | `bool` | Whether the operation results were committed. |
+| `committed` | `bool` | Whether the operation results were committed. |
 | `suspended` | `bool` | Whether the operation is currently suspended. |
 
 Example:
@@ -2558,35 +2558,6 @@ OUTPUT         "running" = 208;
 OUTPUT         "failed" = 200;
 OUTPUT     };
 OUTPUT }
-```
-
-### signal_job
-
-Command properties: **Mutating**, **Light**.
-
-Semantics:
-
-- Send a signal to the job.
-
-Parameters:
-
-| **Parameter** | **Mandatory** | **Default value** | **Description** |
-| ------------ | ------------- | ------------------------- | ------------------------------------------------------------ |
-| `job_id` | Yes |                           | Job ID. |
-| `signal_name` | Yes |                           | Type of the signal to be sent to the job: `SIGHUP`, `SIGINT`, `SIGALRM`, `SIGKILL`, `SIGTERM`, `SIGUSR1`, `SIGUSR2`. |
-
-Input data:
-
-- Type: `null`.
-
-Output data:
-
-- Type: `null`.
-
-Example:
-
-```bash
-PARAMETERS { "`job_id`" = "1225d-1f2fb8c4-f1075d39-5fb7cdff"; "signal_name" = "SIGUSR1" }
 ```
 
 ### abandon_job

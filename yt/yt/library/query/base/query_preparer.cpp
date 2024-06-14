@@ -120,7 +120,7 @@ std::vector<TString> ExtractFunctionNames(
     ExtractFunctionNames(query.SelectExprs, &functions);
 
     if (query.GroupExprs) {
-        for (const auto& expr : query.GroupExprs->first) {
+        for (const auto& expr : *query.GroupExprs) {
             ExtractFunctionNames(expr, &functions);
         }
     }
@@ -156,12 +156,14 @@ std::vector<TString> ExtractFunctionNames(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-TTypeSet ComparableTypes({
+auto ComparableTypes = TTypeSet{
     EValueType::Boolean,
     EValueType::Int64,
     EValueType::Uint64,
     EValueType::Double,
-    EValueType::String});
+    EValueType::String,
+    EValueType::Any,
+};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -418,7 +420,7 @@ std::optional<TUnversionedValue> FoldConstants(
         auto lhs = static_cast<TUnversionedValue>(lhsLiteral->Value);
         auto rhs = static_cast<TUnversionedValue>(rhsLiteral->Value);
 
-        auto checkType = [&] () {
+        auto checkType = [&] {
             if (lhs.Type != rhs.Type) {
                 if (IsArithmeticType(lhs.Type) && IsArithmeticType(rhs.Type)) {
                     auto targetType = std::max(lhs.Type, rhs.Type);
@@ -430,7 +432,7 @@ std::optional<TUnversionedValue> FoldConstants(
             }
         };
 
-        auto checkTypeIfNotNull = [&] () {
+        auto checkTypeIfNotNull = [&] {
             if (lhs.Type != EValueType::Null && rhs.Type != EValueType::Null) {
                 checkType();
             }
@@ -723,6 +725,17 @@ struct TCastEliminator
 
             if (*functionExpr->LogicalType == *functionExpr->Arguments[0]->LogicalType) {
                 return Visit(functionExpr->Arguments[0]);
+            }
+        }
+
+        if (functionExpr->FunctionName == "yson_string_to_any") {
+            YT_VERIFY(functionExpr->Arguments.size() == 1);
+            if (auto* literal = functionExpr->Arguments[0]->As<TLiteralExpression>()) {
+                YT_VERIFY(literal->Value.Type() == EValueType::String);
+                auto asUnversionedValue = TUnversionedValue(literal->Value);
+                asUnversionedValue.Type = EValueType::Any;
+                ValidateYson(TYsonStringBuf(asUnversionedValue.AsStringBuf()), /*nestingLevelLimit*/ 256);
+                return New<TLiteralExpression>(EValueType::Any, TOwningValue(asUnversionedValue));
             }
         }
 
@@ -1534,7 +1547,7 @@ public:
             } else {
                 auto argExpression = typer.second(type);
                 TConstAggregateFunctionExpressionPtr expr = New<TAggregateFunctionExpression>(
-                    MakeLogicalType(GetLogicalType(type), false),
+                    MakeLogicalType(GetLogicalType(type), /*required*/ false),
                     subexpressionName,
                     std::vector{argExpression},
                     type,
@@ -1545,7 +1558,7 @@ public:
             }
         };
 
-        return TUntypedExpression{typer.first, std::move(generator), false};
+        return TUntypedExpression{.FeasibleTypes=typer.first, .Generator=std::move(generator), .IsConstant=false};
     }
 
 
@@ -1673,7 +1686,7 @@ TUntypedExpression TBuilderCtx::OnExpression(
                 type,
                 CastValueWithCheck(GetValue(literalValue), type));
         };
-        return TUntypedExpression{resultTypes, std::move(generator), true};
+        return TUntypedExpression{.FeasibleTypes=resultTypes, .Generator=std::move(generator), .IsConstant=true};
     } else if (auto aliasExpr = expr->As<NAst::TAliasExpression>()) {
         return OnReference(NAst::TReference(aliasExpr->Name));
     } else if (auto referenceExpr = expr->As<NAst::TReferenceExpression>()) {
@@ -1822,7 +1835,7 @@ TUntypedExpression TBuilderCtx::UnwrapCompositeMemberAccessor(
             return columnReference;
         };
 
-        return {TTypeSet({GetWireType(columnType)}), std::move(generator), false};
+        return {TTypeSet({GetWireType(columnType)}), std::move(generator), /*IsConstant*/ false};
     }
 
     auto resolved = ResolveNestedTypes(columnType, reference);
@@ -1959,7 +1972,7 @@ TUntypedExpression TBuilderCtx::OnFunction(const NAst::TFunctionExpression* func
                 type);
 
             TConstAggregateFunctionExpressionPtr expr = New<TAggregateFunctionExpression>(
-                MakeLogicalType(GetLogicalType(type), false),
+                MakeLogicalType(GetLogicalType(type), /*required*/ false),
                 subexpressionName,
                 typedOperands,
                 stateType,
@@ -1970,7 +1983,7 @@ TUntypedExpression TBuilderCtx::OnFunction(const NAst::TFunctionExpression* func
             return expr;
         };
 
-        return TUntypedExpression{resultTypes, std::move(generator), false};
+        return TUntypedExpression{resultTypes, std::move(generator), /*IsConstant*/ false};
     } else if (const auto* aggregateItem = descriptor->As<TAggregateTypeInferrer>()) {
         auto subexpressionName = InferColumnName(*functionExpr);
 
@@ -2033,7 +2046,7 @@ TUntypedExpression TBuilderCtx::OnFunction(const NAst::TFunctionExpression* func
             return New<TFunctionExpression>(type, functionName, std::move(typedOperands));
         };
 
-        return TUntypedExpression{resultTypes, std::move(generator), false};
+        return TUntypedExpression{.FeasibleTypes=resultTypes, .Generator=std::move(generator), .IsConstant=false};
     } else {
         YT_ABORT();
     }
@@ -2064,7 +2077,7 @@ TUntypedExpression TBuilderCtx::OnUnaryOp(const NAst::TUnaryOpExpression* unaryE
                     type,
                     CastValueWithCheck(*foldedExpr, type));
             };
-            return TUntypedExpression{resultTypes, std::move(generator), true};
+            return TUntypedExpression{.FeasibleTypes=resultTypes, .Generator=std::move(generator), .IsConstant=true};
         }
     }
 
@@ -2081,7 +2094,7 @@ TUntypedExpression TBuilderCtx::OnUnaryOp(const NAst::TUnaryOpExpression* unaryE
             opSource);
         return New<TUnaryOpExpression>(type, op, untypedOperand.Generator(argType));
     };
-    return TUntypedExpression{resultTypes, std::move(generator), false};
+    return TUntypedExpression{.FeasibleTypes=resultTypes, .Generator=std::move(generator), .IsConstant=false};
 }
 
 TUntypedExpression TBuilderCtx::MakeBinaryExpr(
@@ -2113,7 +2126,7 @@ TUntypedExpression TBuilderCtx::MakeBinaryExpr(
                     type,
                     CastValueWithCheck(*foldedExpr, type));
             };
-            return TUntypedExpression{resultTypes, std::move(generator), true};
+            return TUntypedExpression{.FeasibleTypes=resultTypes, .Generator=std::move(generator), .IsConstant=true};
         }
     }
 
@@ -2142,7 +2155,7 @@ TUntypedExpression TBuilderCtx::MakeBinaryExpr(
             lhs.Generator(argTypes.first),
             rhs.Generator(argTypes.second));
     };
-    return TUntypedExpression{resultTypes, std::move(generator), false};
+    return TUntypedExpression{resultTypes, std::move(generator), /*IsConstant*/ false};
 }
 
 struct TBinaryOpGenerator
@@ -2280,6 +2293,13 @@ TUntypedExpression TBuilderCtx::OnInOp(
         "IN",
         inExpr->GetSource(Source));
 
+    for (auto type : argTypes) {
+        if (IsAnyOrComposite(type)) {
+            THROW_ERROR_EXCEPTION("Cannot use expression of type %Qlv with IN operator", type)
+                << TErrorAttribute("source", source);
+        }
+    }
+
     auto capturedRows = LiteralTupleListToRows(inExpr->Values, argTypes, source);
     auto result = New<TInExpression>(std::move(typedArguments), std::move(capturedRows));
 
@@ -2287,7 +2307,7 @@ TUntypedExpression TBuilderCtx::OnInOp(
     TExpressionGenerator generator = [result] (EValueType /*type*/) mutable {
         return result;
     };
-    return TUntypedExpression{resultTypes, std::move(generator), false};
+    return TUntypedExpression{resultTypes, std::move(generator), /*IsConstant*/ false};
 }
 
 TUntypedExpression TBuilderCtx::OnBetweenOp(
@@ -2312,7 +2332,7 @@ TUntypedExpression TBuilderCtx::OnBetweenOp(
     TExpressionGenerator generator = [result] (EValueType /*type*/) mutable {
         return result;
     };
-    return TUntypedExpression{resultTypes, std::move(generator), false};
+    return TUntypedExpression{resultTypes, std::move(generator), /*IsConstant*/ false};
 }
 
 TUntypedExpression TBuilderCtx::OnTransformOp(
@@ -2441,7 +2461,7 @@ TUntypedExpression TBuilderCtx::OnTransformOp(
     TExpressionGenerator generator = [result] (EValueType /*type*/) mutable {
         return result;
     };
-    return TUntypedExpression{TTypeSet({resultType}), std::move(generator), false};
+    return TUntypedExpression{TTypeSet({resultType}), std::move(generator), /*IsConstant*/ false};
 }
 
 TUntypedExpression TBuilderCtx::OnCaseOp(const NAst::TCaseExpression* caseExpr)
@@ -2584,7 +2604,7 @@ TUntypedExpression TBuilderCtx::OnCaseOp(const NAst::TCaseExpression* caseExpr)
         return result;
     };
 
-    return TUntypedExpression{TTypeSet({resultType}), std::move(generator), /*IsConstant=*/ false};
+    return TUntypedExpression{TTypeSet({resultType}), std::move(generator), /*IsConstant*/ false};
 }
 
 TUntypedExpression TBuilderCtx::OnLikeOp(const NAst::TLikeExpression* likeExpr)
@@ -2638,7 +2658,7 @@ TUntypedExpression TBuilderCtx::OnLikeOp(const NAst::TLikeExpression* likeExpr)
         return result;
     };
 
-    return TUntypedExpression{TTypeSet({EValueType::Boolean}), std::move(generator), /*IsConstant=*/ false};
+    return TUntypedExpression{TTypeSet({EValueType::Boolean}), std::move(generator), /*IsConstant*/ false};
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2713,7 +2733,7 @@ void PrepareQuery(
     }
 
     if (ast.GroupExprs) {
-        auto groupClause = BuildGroupClause(ast.GroupExprs->first, ast.GroupExprs->second, builder);
+        auto groupClause = BuildGroupClause(*ast.GroupExprs, ast.TotalsMode, builder);
 
         auto keyColumns = query->GetKeyColumns();
 
@@ -2983,20 +3003,21 @@ THashMap<TString, TString> ConvertYsonPlaceholdersToQueryLiterals(TYsonStringBuf
     return queryLiterals;
 }
 
-void ParseQueryString(
-    NAst::TAstHead* astHead,
+NAst::TAstHead ParseQueryString(
     const TString& source,
     NAst::TParser::token::yytokentype strayToken,
     TYsonStringBuf placeholderValues = {},
     int syntaxVersion = 1)
 {
+    auto head = NAst::TAstHead();
+
     THashMap<TString, TString> queryLiterals;
     if (placeholderValues) {
         queryLiterals = ConvertYsonPlaceholdersToQueryLiterals(placeholderValues);
     }
 
     NAst::TLexer lexer(source, strayToken, std::move(queryLiterals), syntaxVersion);
-    NAst::TParser parser(lexer, astHead, source);
+    NAst::TParser parser(lexer, &head, source);
 
     int result = parser.parse();
 
@@ -3004,6 +3025,8 @@ void ParseQueryString(
         THROW_ERROR_EXCEPTION("Parse failure")
             << TErrorAttribute("source", source);
     }
+
+    return head;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3014,16 +3037,6 @@ NAst::TParser::token::yytokentype GetStrayToken(EParseMode mode)
         case EParseMode::Query:      return NAst::TParser::token::StrayWillParseQuery;
         case EParseMode::JobQuery:   return NAst::TParser::token::StrayWillParseJobQuery;
         case EParseMode::Expression: return NAst::TParser::token::StrayWillParseExpression;
-        default:                     YT_ABORT();
-    }
-}
-
-NAst::TAstHead MakeAstHead(EParseMode mode)
-{
-    switch (mode) {
-        case EParseMode::Query:
-        case EParseMode::JobQuery:   return NAst::TAstHead::MakeQuery();
-        case EParseMode::Expression: return NAst::TAstHead::MakeExpression();
         default:                     YT_ABORT();
     }
 }
@@ -3050,16 +3063,13 @@ std::unique_ptr<TParsedSource> ParseSource(
     TYsonStringBuf placeholderValues,
     int syntaxVersion)
 {
-    auto parsedSource = std::make_unique<TParsedSource>(
+    return std::make_unique<TParsedSource>(
         source,
-        MakeAstHead(mode));
-    ParseQueryString(
-        &parsedSource->AstHead,
-        source,
-        GetStrayToken(mode),
-        placeholderValues,
-        syntaxVersion);
-    return parsedSource;
+        ParseQueryString(
+            source,
+            GetStrayToken(mode),
+            placeholderValues,
+            syntaxVersion));
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3083,7 +3093,6 @@ TJoinClausePtr BuildJoinClause(
     auto joinClause = New<TJoinClause>();
     joinClause->Schema.Original = foreignTableSchema;
     joinClause->ForeignObjectId = foreignDataSplit.ObjectId;
-    joinClause->ForeignCellId = foreignDataSplit.CellId;
     joinClause->IsLeft = tableJoin.IsLeft;
 
     // BuildPredicate and BuildTypedExpression are used with foreignBuilder.
@@ -3124,12 +3133,18 @@ TJoinClausePtr BuildJoinClause(
                 << TErrorAttribute("foreign_type", foreignColumn->LogicalType);
         }
 
-        selfEquations.push_back({New<TReferenceExpression>(selfColumn->LogicalType, selfColumn->Name), false});
+        selfEquations.push_back({
+            .Expression=New<TReferenceExpression>(selfColumn->LogicalType, selfColumn->Name),
+            .Evaluated=false,
+        });
         foreignEquations.push_back(New<TReferenceExpression>(foreignColumn->LogicalType, foreignColumn->Name));
     }
 
     for (const auto& argument : tableJoin.Lhs) {
-        selfEquations.push_back({builder.BuildTypedExpression(argument, ComparableTypes), false});
+        selfEquations.push_back({
+            .Expression=builder.BuildTypedExpression(argument, ComparableTypes),
+            .Evaluated=false,
+        });
     }
 
     for (const auto& argument : tableJoin.Rhs) {
@@ -3220,7 +3235,7 @@ TJoinClausePtr BuildJoinClause(
             break;
         }
 
-        keySelfEquations[keyPrefix] = {evaluatedColumnExpression, true};
+        keySelfEquations[keyPrefix] = {.Expression=evaluatedColumnExpression, .Evaluated=true};
 
         auto reference = NAst::TReference(
             foreignTableSchema->Columns()[keyPrefix].Name(),
@@ -3468,8 +3483,6 @@ std::unique_ptr<TPlanFragment> PreparePlanFragment(
                     functions,
                     builder));
             });
-
-
     }
 
     PrepareQuery(query, ast, builder);
@@ -3533,11 +3546,6 @@ std::unique_ptr<TPlanFragment> PreparePlanFragment(
     auto fragment = std::make_unique<TPlanFragment>();
     fragment->Query = query;
     fragment->DataSource.ObjectId = selfDataSplit.ObjectId;
-    fragment->DataSource.CellId = selfDataSplit.CellId;
-    fragment->DataSource.Ranges = MakeSingletonRowRange(
-        selfDataSplit.LowerBound,
-        selfDataSplit.UpperBound,
-        std::move(rowBuffer));
 
     return fragment;
 }
@@ -3547,12 +3555,7 @@ TQueryPtr PrepareJobQuery(
     const TTableSchemaPtr& tableSchema,
     const TFunctionsFetcher& functionsFetcher)
 {
-    auto astHead = NAst::TAstHead::MakeQuery();
-    ParseQueryString(
-        &astHead,
-        source,
-        NAst::TParser::token::StrayWillParseJobQuery);
-
+    auto astHead = ParseQueryString(source, NAst::TParser::token::StrayWillParseJobQuery);
     const auto& ast = std::get<NAst::TQuery>(astHead.Ast);
     const auto& aliasMap = astHead.AliasMap;
 

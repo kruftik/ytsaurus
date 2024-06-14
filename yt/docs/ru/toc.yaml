@@ -1,5 +1,12 @@
 title: "{{product-name}}"
 href: index.md
+analytics:
+  text: 'Мы используем <a href="https://yandex.ru/legal/cookies_policy">файлы cookie</a>, чтобы вы могли наилучшим образом пользоваться нашим веб-сайтом. Если вы продолжаете использовать наш веб-сайт, мы полагаем, что вы согласны с таким использованием.'
+  buttons:
+    accept:
+      text: "Ок"
+      theme: "accent"
+      size: "xl"
 items:
   - include: { mode: merge, path: yandex-specific/toc-internal.yaml }
     when: audience == "internal"
@@ -121,6 +128,8 @@ items:
           href: user-guide/dynamic-tables/transactions.md
         - name: Шардирование
           href: user-guide/dynamic-tables/resharding.md
+        - name: Автоматическое шардирование и балансировка таблиц
+          href: user-guide/dynamic-tables/tablet-balancing.md
         - name: Фоновая компактификация
           href: user-guide/dynamic-tables/compaction.md
         - name: MapReduce по динамическим таблицам
@@ -211,7 +220,7 @@ items:
           href: user-guide/data-processing/operations/recommendations.md
         - name: Образы ФС
           when: audience == "public"
-          href: user-guide/data-processing/porto/layer-paths.md
+          href: user-guide/data-processing/layers/layer-paths.md
         - name: Переключение таблиц
           when: audience == "public"
           href: user-guide/data-processing/operations/table-switch.md
@@ -358,6 +367,8 @@ items:
                 href: api/cli/install.md
               - name: Примеры
                 href: api/cli/examples.md
+              - name: CLI commands
+                href: api/cli/commands.md
           - name: Python API
             items:
               - name: Введение
@@ -398,9 +409,9 @@ items:
     items:
       - name: Компоненты кластера
         href: admin-guide/components.md
-      - name: Установка YTsaurus
+      - name: Установка {{product-name}}
         href: admin-guide/install-ytsaurus.md
-      - name: Подготовка спецификации YTsaurus
+      - name: Подготовка спецификации {{product-name}}
         items:
           - name: Описание
             href: admin-guide/prepare-spec.md
@@ -428,6 +439,8 @@ items:
           #        href: admin-guide/production.md
       - name: Тегирование нод кластера
         href: admin-guide/node-tags.md
+      - name: Расширение мастер-сервера
+        href: admin-guide/cell-addition.md
       - name: Возможные проблемы
         href: admin-guide/problems.md
   - name: Релизы

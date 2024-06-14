@@ -2,8 +2,7 @@
 
 #include "bootstrap.h"
 #include "private.h"
-
-#include <yt/yt/server/node/data_node/chunk_store.h>
+#include "chunk_store.h"
 
 #include <yt/yt/server/lib/misc/restart_manager.h>
 
@@ -29,7 +28,7 @@ using namespace NYson;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = DataNodeLogger;
+static constexpr auto& Logger = DataNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 

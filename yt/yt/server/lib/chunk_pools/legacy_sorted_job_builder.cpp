@@ -441,7 +441,7 @@ private:
             }
         };
 
-        auto addBarrier = [&] () {
+        auto addBarrier = [&] {
             Jobs_.back()->SetIsBarrier(true);
             Jobs_.emplace_back(std::make_unique<TLegacyJobStub>());
         };
@@ -584,7 +584,7 @@ private:
                         job->AddDataSlice(
                             exactForeignDataSlice,
                             inputCookie,
-                            /*isPrimary=*/false);
+                            /*isPrimary*/ false);
                         ++jobIndex;
                     } else {
                         // This job and all the subsequent jobs are entirely to the right of foreign data slice.

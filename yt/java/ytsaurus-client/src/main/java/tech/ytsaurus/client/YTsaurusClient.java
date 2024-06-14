@@ -21,6 +21,7 @@ import javax.annotation.Nullable;
 import com.google.protobuf.MessageLite;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import tech.ytsaurus.client.bus.BusConnector;
 import tech.ytsaurus.client.bus.DefaultBusConnector;
 import tech.ytsaurus.client.rpc.DataCenterMetricsHolderImpl;
@@ -312,7 +313,7 @@ public class YTsaurusClient extends CompoundClientImpl implements BaseYTsaurusCl
                                     .setBalancerPort(curCluster.port)
                                     .setRole(proxyRole)
                                     .setProxyNetworkName(proxyNetworkName)
-                                    .setUseTLS(useTLS)
+                                    .setUseTLS(useTLS || curCluster.useTLS)
                                     .setTvmOnly(tvmOnly)
                                     .setIgnoreBalancers(ignoreBalancers)
                                     .setToken(auth.getToken().orElse(null))
@@ -611,6 +612,8 @@ public class YTsaurusClient extends CompoundClientImpl implements BaseYTsaurusCl
          * @param cluster address of YT cluster http balancer, examples:
          *                "hahn"
          *                "localhost:8054"
+         *                "http://my.ytsaurus.cluster/"
+         *                "https://my.ytsaurus.cluster/"
          */
         public TBuilder setCluster(String cluster) {
             setClusters(cluster);
@@ -632,7 +635,11 @@ public class YTsaurusClient extends CompoundClientImpl implements BaseYTsaurusCl
          * Create and use default connector with specified working thread count.
          */
         public TBuilder setDefaultBusConnectorWithThreadCount(int threadCount) {
-            setOwnBusConnector(new DefaultBusConnector(new NioEventLoopGroup(threadCount), true));
+            NioEventLoopGroup nioGroup = new NioEventLoopGroup(
+                    threadCount,
+                    new DefaultThreadFactory(DefaultBusConnector.class, true, Thread.NORM_PRIORITY)
+            );
+            setOwnBusConnector(new DefaultBusConnector(nioGroup, true));
             isBusConnectorOwner = true;
             return self();
         }

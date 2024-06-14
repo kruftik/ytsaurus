@@ -98,12 +98,12 @@ Py::Object TSkiffRecord::GetSparseField(ui16 index)
 }
 
 
-void CheckFieldType(const Py::Object& value, NSkiff::EWireType wireType, bool required)
+YT_PREVENT_TLS_CACHING void CheckFieldType(const Py::Object& value, NSkiff::EWireType wireType, bool required)
 {
-    YT_THREAD_LOCAL(PyObject*) Zero = PyLong_FromLongLong(0);
-    YT_THREAD_LOCAL(PyObject*) SignedInt64Min = PyLong_FromLongLong(std::numeric_limits<i64>::min());
-    YT_THREAD_LOCAL(PyObject*) SignedInt64Max = PyLong_FromLongLong(std::numeric_limits<i64>::max());
-    YT_THREAD_LOCAL(PyObject*) UnsignedInt64Max = PyLong_FromUnsignedLongLong(std::numeric_limits<ui64>::max());
+    thread_local PyObject* Zero = PyLong_FromLongLong(0);
+    thread_local PyObject* SignedInt64Min = PyLong_FromLongLong(std::numeric_limits<i64>::min());
+    thread_local PyObject* SignedInt64Max = PyLong_FromLongLong(std::numeric_limits<i64>::max());
+    thread_local PyObject* UnsignedInt64Max = PyLong_FromUnsignedLongLong(std::numeric_limits<ui64>::max());
 
     if (value.isNone()) {
         if (required) {
@@ -119,9 +119,7 @@ void CheckFieldType(const Py::Object& value, NSkiff::EWireType wireType, bool re
             if (wireType == NSkiff::EWireType::Uint64 &&
                 (
                     PyObject_RichCompareBool(Zero, valueAsLongLong.ptr(), Py_LE) != 1 ||
-                    PyObject_RichCompareBool(valueAsLongLong.ptr(), UnsignedInt64Max, Py_LT) != 1
-                )
-            )
+                    PyObject_RichCompareBool(valueAsLongLong.ptr(), UnsignedInt64Max, Py_LT) != 1))
             {
                 THROW_ERROR_EXCEPTION("Invalid value passed to SkiffRecord, it must be in range [0, 2^64 - 1]")
                     << TErrorAttribute("expected_type", "uint64")
@@ -130,9 +128,7 @@ void CheckFieldType(const Py::Object& value, NSkiff::EWireType wireType, bool re
             if (wireType == NSkiff::EWireType::Int64 &&
                 (
                     PyObject_RichCompareBool(SignedInt64Min, valueAsLongLong.ptr(), Py_LE) != 1 ||
-                    PyObject_RichCompareBool(valueAsLongLong.ptr(), SignedInt64Max, Py_LE) != 1
-                )
-            )
+                    PyObject_RichCompareBool(valueAsLongLong.ptr(), SignedInt64Max, Py_LE) != 1))
             {
                 THROW_ERROR_EXCEPTION("Invalid value passed to SkiffRecord, it must be in range [0, 2^64 - 1]")
                     << TErrorAttribute("expected_type", "int64")

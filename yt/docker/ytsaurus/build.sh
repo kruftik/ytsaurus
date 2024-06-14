@@ -6,6 +6,7 @@ image_tag=""
 ytsaurus_source_path="."
 ytsaurus_build_path="."
 output_path="."
+image_cr=""
 
 print_usage() {
     cat << EOF
@@ -14,6 +15,7 @@ Usage: $script_name [-h|--help]
                     [--ytsaurus-build-path /path/to/ytsaurus.build (default: $ytsaurus_build_path)]
                     [--output-path /path/to/output (default: $output_path)]
                     [--image-tag some-tag (default: $image_tag)]
+                    [--image-cr some-cr/ (default: '$image_cr')]
 EOF
     exit 1
 }
@@ -38,6 +40,10 @@ while [[ $# -gt 0 ]]; do
         image_tag="$2"
         shift 2
         ;;
+        --image-cr)
+        image_cr="$2"
+        shift 2
+        ;;
         -h|--help)
         print_usage
         shift
@@ -51,14 +57,12 @@ done
 
 
 ytserver_all="${ytsaurus_build_path}/yt/yt/server/all/ytserver-all"
-chyt_controller="${ytsaurus_source_path}/yt/chyt/controller/cmd/chyt-controller/chyt-controller"
 init_queue_agent_state="${ytsaurus_source_path}/yt/python/yt/environment/init_queue_agent_state.py"
 init_operations_archive="${ytsaurus_source_path}/yt/python/yt/environment/init_operations_archive.py"
 credits="${ytsaurus_source_path}/yt/docker/ytsaurus/credits"
 dockerfile="${ytsaurus_source_path}/yt/docker/ytsaurus/Dockerfile"
 
 cp ${ytserver_all} ${output_path}
-cp ${chyt_controller} ${output_path}
 cp ${init_queue_agent_state} ${output_path}
 cp ${init_operations_archive} ${output_path}
 
@@ -69,4 +73,4 @@ cp -r ${credits} ${output_path}
 
 cd ${output_path}
 
-docker build -t ytsaurus/ytsaurus:${image_tag} .
+docker build -t ${image_cr}ytsaurus/ytsaurus:${image_tag} .

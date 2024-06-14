@@ -27,11 +27,9 @@ struct IBootstrap
 
     // Chaos cells stuff.
     virtual const NCellarAgent::ICellarManagerPtr& GetCellarManager() const = 0;
-    virtual const IShortcutSnapshotStorePtr& GetShortcutSnapshotStore() const = 0;
     virtual const IInvokerPtr& GetSnapshotStoreReadPoolInvoker() const = 0;
 
     // Replicated table tracker stuff.
-    virtual void SubscribeReplicatedTableTrackerConfigChanged(TReplicatedTableTrackerConfigUpdateCallback callback) const = 0;
     virtual NTabletServer::TDynamicReplicatedTableTrackerConfigPtr GetReplicatedTableTrackerConfig() const = 0;
 
     // Master connection stuff.

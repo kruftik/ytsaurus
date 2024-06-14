@@ -4,8 +4,6 @@
 
 #include <yt/yt/server/node/data_node/public.h>
 
-#include <yt/yt/server/node/exec_node/job.h>
-
 #include <yt/yt/core/actions/future.h>
 
 namespace NYT::NExecNode {
@@ -30,8 +28,6 @@ struct IJobDirectoryManager
     virtual TFuture<void> CreateTmpfsDirectory(
         const TString& path,
         const TJobDirectoryProperties& properties) = 0;
-
-    virtual bool UseVolumeQuota() = 0;
 
     //! Releases all managed directories with given path prefix.
     virtual TFuture<void> CleanDirectories(const TString& pathPrefix) = 0;

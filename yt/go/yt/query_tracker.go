@@ -2,6 +2,7 @@ package yt
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"golang.org/x/exp/slices"
@@ -9,6 +10,7 @@ import (
 	"go.ytsaurus.tech/library/go/core/log"
 	"go.ytsaurus.tech/library/go/core/log/nop"
 	"go.ytsaurus.tech/library/go/ptr"
+	"go.ytsaurus.tech/yt/go/schema"
 	"go.ytsaurus.tech/yt/go/yson"
 	"go.ytsaurus.tech/yt/go/yterrors"
 )
@@ -19,11 +21,11 @@ const (
 
 type (
 	QueryResult struct {
-		ID             QueryID          `yson:"id"`
-		ResultIndex    int64            `yson:"result_index"`
-		Err            yterrors.Error   `yson:"error"`
-		Schema         []map[string]any `yson:"schema"`
-		DataStatistics DataStatistics   `yson:"data_statistics"`
+		ID             QueryID        `yson:"id"`
+		ResultIndex    int64          `yson:"result_index"`
+		Err            yterrors.Error `yson:"error"`
+		Schema         schema.Schema  `yson:"schema"`
+		DataStatistics DataStatistics `yson:"data_statistics"`
 	}
 
 	Query struct {
@@ -107,7 +109,9 @@ func TrackQuery(
 		opts.Logger.Debug("Query", log.Any("query_id", id), log.Any("state", *state))
 
 		if slices.Contains([]QueryState{QueryStateFailed, QueryStateAborted}, *state) {
-			return false, query.Err.Unwrap()
+			opts.Logger.Debug(fmt.Sprintf("Query %s", *state), log.Error(query.Err.Unwrap()))
+
+			return true, query.Err.Unwrap()
 		}
 		if *state == QueryStateCompleted {
 			return true, nil

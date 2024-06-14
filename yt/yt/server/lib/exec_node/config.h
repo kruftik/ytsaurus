@@ -20,6 +20,8 @@
 
 #include <yt/yt/library/gpu/config.h>
 
+#include <yt/yt/library/tracing/jaeger/public.h>
+
 #include <yt/yt/core/concurrency/config.h>
 
 #include <yt/yt/core/ytree/node.h>
@@ -130,9 +132,6 @@ public:
     //! For testing purposes only.
     bool UseExecFromLayer;
 
-    //! Allow mounting /dev/fuse to user job containers.
-    bool AllowMountFuseDevice;
-
     //! Backoff time between container destruction attempts.
     TDuration ContainerDestructionBackoff;
 
@@ -173,10 +172,16 @@ class TSlotLocationConfig
     : public TDiskLocationConfig
 {
 public:
+    //! Maximum reported total disk capacity.
     std::optional<i64> DiskQuota;
+
+    //! Reserve subtracted from disk capacity.
     i64 DiskUsageWatermark;
 
     TString MediumName;
+
+    //! Enforce disk space limits using disk quota.
+    bool EnableDiskQuota;
 
     REGISTER_YSON_STRUCT(TSlotLocationConfig);
 
@@ -275,7 +280,7 @@ class TSlotManagerDynamicConfig
 public:
     bool DisableJobsOnGpuCheckFailure;
 
-    //! Enables disk usage checks in periodic disk resources update.
+    //! Enforce disk space limits in periodic disk resources update.
     bool CheckDiskSpaceLimit;
 
     //! How to distribute cpu resources between 'common' and 'idle' slots.
@@ -301,6 +306,10 @@ public:
     bool AbortOnFreeSlotSynchronizationFailed;
 
     bool AbortOnJobsDisabled;
+
+    bool EnableContainerDeviceChecker;
+
+    bool RestartContainerAfterFailedDeviceCheck;
 
     //! Polymorphic job environment configuration.
     NYTree::INodePtr JobEnvironment;
@@ -383,6 +392,8 @@ public:
 
     bool EnableTracing;
 
+    NTracing::TSamplerConfigPtr TracingSampler;
+
     REGISTER_YSON_STRUCT(THeartbeatReporterDynamicConfigBase);
 
     static void Register(TRegistrar registrar);
@@ -455,6 +466,28 @@ public:
 };
 
 DEFINE_REFCOUNTED_TYPE(TSchedulerConnectorDynamicConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TJobInputCacheDynamicConfig
+    : public NYTree::TYsonStruct
+{
+public:
+    bool Enabled;
+
+    std::optional<i64> JobCountThreshold;
+
+    NChunkClient::TBlockCacheDynamicConfigPtr BlockCache;
+    TSlruCacheDynamicConfigPtr MetaCache;
+
+    double FallbackTimeoutFraction;
+
+    REGISTER_YSON_STRUCT(TJobInputCacheDynamicConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TJobInputCacheDynamicConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -608,10 +641,14 @@ class TJobControllerDynamicConfig
 public:
     TConstantBackoffOptions OperationInfoRequestBackoffStrategy;
 
-    TDuration WaitingJobsTimeout;
+    TDuration WaitingForResourcesTimeout;
+    // COMPAT(arkady-e1ppa): Remove when CA&Sched are update to
+    // a proper version of 24.1/24.2
+    bool DisableLegacyAllocationPreparation;
 
     TDuration CpuOverdraftTimeout;
 
+    //! Default disk space request.
     i64 MinRequiredDiskSpace;
 
     TDuration MemoryOverdraftTimeout;
@@ -634,6 +671,14 @@ public:
     TJobCommonConfigPtr JobCommon;
 
     TDuration ProfilingPeriod;
+
+    bool ProfileJobProxyProcessExit;
+
+    //! This option is used for testing purposes only.
+    //! Adds delay before starting a job.
+    std::optional<TDuration> TestResourceAcquisitionDelay;
+
+    TJobProxyLogManagerDynamicConfigPtr JobProxyLogManager;
 
     REGISTER_YSON_STRUCT(TJobControllerDynamicConfig);
 
@@ -679,11 +724,31 @@ DEFINE_REFCOUNTED_TYPE(TNbdConfig)
 
 ////////////////////////////////////////////////////////////////////////////////
 
+class TJobProxyLoggingConfig
+    : public NYTree::TYsonStruct
+{
+public:
+    EJobProxyLoggingMode Mode;
+
+    NLogging::TLogManagerConfigPtr LogManagerTemplate;
+
+    std::optional<TString> JobProxyStderrPath;
+    std::optional<TString> ExecutorStderrPath;
+
+    REGISTER_YSON_STRUCT(TJobProxyLoggingConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TJobProxyLoggingConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
 class TJobProxyConfig
     : public NYTree::TYsonStruct
 {
 public:
-    NLogging::TLogManagerConfigPtr JobProxyLogging;
+    TJobProxyLoggingConfigPtr JobProxyLogging;
 
     NTracing::TJaegerTracerConfigPtr JobProxyJaeger;
 
@@ -692,9 +757,6 @@ public:
     NAuth::TAuthenticationManagerConfigPtr JobProxyAuthenticationManager;
 
     NJobProxy::TCoreWatcherConfigPtr CoreWatcher;
-
-    std::optional<TString> JobProxyStderrPath;
-    std::optional<TString> ExecutorStderrPath;
 
     TDuration SupervisorRpcTimeout;
 
@@ -718,12 +780,52 @@ public:
     //! Enables job abort on violated memory reserve.
     bool AlwaysAbortOnMemoryReserveOverdraft;
 
+    //! Forward variables from job proxy environment to user job.
+    bool ForwardAllEnvironmentVariables;
+
     REGISTER_YSON_STRUCT(TJobProxyConfig);
 
     static void Register(TRegistrar registrar);
 };
 
 DEFINE_REFCOUNTED_TYPE(TJobProxyConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TJobProxyLogManagerConfig
+    : public NYTree::TYsonStruct
+{
+public:
+    TString Directory;
+    int ShardingKeyLength;
+    TDuration LogsStoragePeriod;
+
+    // Value std::nullopt means unlimited concurrency.
+    std::optional<int> DirectoryTraversalConcurrency;
+
+    REGISTER_YSON_STRUCT(TJobProxyLogManagerConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TJobProxyLogManagerConfig)
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TJobProxyLogManagerDynamicConfig
+    : public NYTree::TYsonStruct
+{
+public:
+    TDuration LogsStoragePeriod;
+    // Value std::nullopt means unlimited concurrency.
+    std::optional<int> DirectoryTraversalConcurrency;
+
+    REGISTER_YSON_STRUCT(TJobProxyLogManagerDynamicConfig);
+
+    static void Register(TRegistrar registrar);
+};
+
+DEFINE_REFCOUNTED_TYPE(TJobProxyLogManagerDynamicConfig);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -742,6 +844,8 @@ public:
     NProfiling::TSolomonExporterConfigPtr JobProxySolomonExporter;
 
     TJobProxyConfigPtr JobProxy;
+
+    TJobProxyLogManagerConfigPtr JobProxyLogManager;
 
     REGISTER_YSON_STRUCT(TExecNodeConfig);
 
@@ -775,6 +879,8 @@ public:
     NConcurrency::TThroughputThrottlerConfigPtr UserJobContainerCreationThrottler;
 
     TChunkCacheDynamicConfigPtr ChunkCache;
+
+    TJobInputCacheDynamicConfigPtr JobInputCache;
 
     // NB(yuryalekseev): At the moment dynamic NBD config is used only to create
     // NBD server during startup or to dynamically enable/disable creation of NBD volumes.

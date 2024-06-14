@@ -7,6 +7,7 @@
 #include "tablet_slot.h"
 #include "transaction.h"
 #include "transaction_manager.h"
+#include "serialize.h"
 
 #include <yt/yt/server/lib/hive/avenue_directory.h>
 #include <yt/yt/server/lib/hive/helpers.h>
@@ -71,19 +72,19 @@ public:
 
         RegisterLoader(
             "HunkTabletManager.Keys",
-            BIND(&THunkTabletManager::LoadKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&THunkTabletManager::LoadKeys, Unretained(this)));
         RegisterLoader(
             "HunkTabletManager.Values",
-            BIND(&THunkTabletManager::LoadValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&THunkTabletManager::LoadValues, Unretained(this)));
 
         RegisterSaver(
             ESyncSerializationPriority::Keys,
             "HunkTabletManager.Keys",
-            BIND(&THunkTabletManager::SaveKeys, Unretained(this)));
+            BIND_NO_PROPAGATE(&THunkTabletManager::SaveKeys, Unretained(this)));
         RegisterSaver(
             ESyncSerializationPriority::Values,
             "HunkTabletManager.Values",
-            BIND(&THunkTabletManager::SaveValues, Unretained(this)));
+            BIND_NO_PROPAGATE(&THunkTabletManager::SaveValues, Unretained(this)));
 
         RegisterMethod(BIND_NO_PROPAGATE(&THunkTabletManager::HydraMountHunkTablet, Unretained(this)));
         RegisterMethod(BIND_NO_PROPAGATE(&THunkTabletManager::HydraUnmountHunkTablet, Unretained(this)));

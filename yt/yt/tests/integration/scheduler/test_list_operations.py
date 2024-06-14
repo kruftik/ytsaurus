@@ -221,7 +221,7 @@ class _TestListOperationsBase(ListOperationsSetup):
     #  6. sort       - pending    - user5 -  pool_no_running - False       - []            - []              - {}
     # Moreover, |self.op3| is expected to have title "op3 title".
 
-    @authors("halin-george", "levysotsky")
+    @authors("omgronny")
     def test_invalid_arguments(self):
         # Should fail when limit is invalid.
         with pytest.raises(YtError):
@@ -250,7 +250,7 @@ class _TestListOperationsBase(ListOperationsSetup):
                 cursor_time=self.before_all_operations,
             )
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_time_filter(self, read_from):
         self._test_time_ranges(read_from)
         self._test_with_cursor(read_from)
@@ -393,7 +393,7 @@ class _TestListOperationsBase(ListOperationsSetup):
             assert res["failed_jobs_count"] == 1
         assert [op["id"] for op in res["operations"]] == [self.op2.id, self.op1.id]
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_filters(self, read_from):
         self._test_type_filter(read_from)
         self._test_state_filter(read_from)
@@ -655,7 +655,7 @@ class _TestListOperationsBase(ListOperationsSetup):
         assert res["state_counts"] == {"completed": 2}
         assert res["type_counts"] == {"reduce": 1}
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_with_limit(self, read_from):
         res = list_operations(
             include_archive=self.include_archive,
@@ -687,7 +687,7 @@ class _TestListOperationsBase(ListOperationsSetup):
         ]
         assert not res["incomplete"]
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_attribute_filter(self, read_from):
         attributes = [
             "id",
@@ -718,7 +718,7 @@ class _TestListOperationsBase(ListOperationsSetup):
         ]
         assert all(sorted(op.keys()) == sorted(attributes) for op in res["operations"])
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_access_filter(self, read_from):
         access = {"subject": "user3", "permissions": ["read", "manage"]}
         res = list_operations(
@@ -983,7 +983,7 @@ class TestListOperationsCypressOnly(_TestListOperationsBase):
         self.op6.before_start_time = before_start_time
         wait(lambda: get(self.op6.get_path() + "/@state") == "pending")
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_no_filters(self, read_from):
         res = list_operations(include_archive=self.include_archive)
         assert res["pool_counts"] == {
@@ -1018,7 +1018,7 @@ class TestListOperationsCypressOnly(_TestListOperationsBase):
             self.op1.id,
         ]
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_has_failed_jobs_with_pending(self, read_from):
         res = list_operations(
             include_archive=self.include_archive,
@@ -1061,7 +1061,7 @@ class TestListOperationsCypressArchive(_TestListOperationsBase):
         }
     }
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_time_range_missing(self):
         with pytest.raises(YtError):
             list_operations(include_archive=True, to_time=self.op5.after_start_time)
@@ -1082,14 +1082,42 @@ class TestListOperationsArchiveOnly(_TestListOperationsBase):
                 "enable": False,
                 # Analyze all operations each 100ms
                 "analysis_period": 100,
+                # Wait each batch to remove not more than 100ms
+                "remove_batch_timeout": 100,
+                # Wait each batch to archive not more than 100ms
+                "archive_batch_timeout": 100,
+                # Retry sleeps
+                "min_archivation_retry_sleep_delay": 100,
+                "max_archivation_retry_sleep_delay": 110,
                 # Cleanup all operations
                 "hard_retained_operation_count": 0,
                 "clean_delay": 0,
             },
+            "fair_share_update_period": 100,
             "static_orchid_cache_update_period": 100,
             "alerts_update_period": 100,
             "watchers_update_period": 100,
         },
+    }
+
+    DELTA_NODE_CONFIG = {
+        "exec_node": {
+            "job_proxy": {
+                "job_proxy_heartbeat_period": 100,
+            },
+        },
+    }
+
+    DELTA_DYNAMIC_NODE_CONFIG = {
+        "%true": {
+            "exec_node": {
+                "scheduler_connector": {
+                    "heartbeat_executor": {
+                        "period": 100,  # 100 msec
+                    },
+                },
+            }
+        }
     }
 
     def setup_method(self, method):
@@ -1128,7 +1156,7 @@ class TestListOperationsArchiveHacks(ListOperationsSetup):
         super(TestListOperationsArchiveHacks, self).setup_method(method)
         clean_operations()
 
-    @authors("levysotsky")
+    @authors("omgronny")
     def test_list_operation_sorting(self):
         clear_start_time("//sys/operations_archive/ordered_by_start_time")
         clear_start_time("//sys/operations_archive/ordered_by_id")

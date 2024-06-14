@@ -1,13 +1,12 @@
 #include "incumbent_detail.h"
 
-#include "incumbent_manager.h"
 #include "private.h"
 
 namespace NYT::NIncumbentServer {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = IncumbentServerLogger;
+static constexpr auto& Logger = IncumbentServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 

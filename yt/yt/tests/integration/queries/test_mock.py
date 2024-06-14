@@ -1,7 +1,7 @@
 from yt_env_setup import YTEnvSetup
 
 from yt_commands import (
-    add_member, authors, create_access_control_object, create_access_control_object_namespace, remove,
+    add_member, authors, create_access_control_object, remove,
     make_ace, raises_yt_error, wait, create_user, print_debug, select_rows)
 
 from yt_error_codes import AuthorizationErrorCode, ResolveErrorCode
@@ -243,7 +243,7 @@ class TestAccessControl(YTEnvSetup):
         remove("//sys/access_control_object_namespaces/queries/aco1")
         q_u1.get(authenticated_user="u1")
         q_u1.get(authenticated_user="superuser_u3")
-        with raises_yt_error("Error while fetching access control object queries/aco1"):
+        with raises_yt_error():
             q_u1.get(authenticated_user="u2")
 
     @authors("krock21")
@@ -455,20 +455,111 @@ class TestAccessControl(YTEnvSetup):
 
     @authors("aleksandr.gaev")
     def test_get_query_tracker_info(self, query_tracker):
-        assert get_query_tracker_info() == {'cluster_name': 'primary', 'supported_features': {'access_control': True}, 'access_control_objects': ['nobody']}
-
-        remove("//sys/access_control_object_namespaces/queries/nobody")
-        remove("//sys/access_control_object_namespaces/queries")
-
-        assert get_query_tracker_info() == {'cluster_name': 'primary', 'supported_features': {'access_control': False}, 'access_control_objects': []}
-
-        create_access_control_object_namespace("queries")
-        create_access_control_object("nobody", "queries")
+        assert get_query_tracker_info() == \
+            {'cluster_name': 'primary', 'supported_features': {'access_control': True, 'multiple_aco': True}, 'access_control_objects': ['everyone-share', 'nobody']}
 
         assert get_query_tracker_info(attributes=[]) == {'cluster_name': '', 'supported_features': {}, 'access_control_objects': []}
         assert get_query_tracker_info(attributes=["cluster_name"]) == {'cluster_name': 'primary', 'supported_features': {}, 'access_control_objects': []}
-        assert get_query_tracker_info(attributes=["supported_features"]) == {'cluster_name': '', 'supported_features': {'access_control': True}, 'access_control_objects': []}
-        assert get_query_tracker_info(attributes=["access_control_objects"]) == {'cluster_name': '', 'supported_features': {}, 'access_control_objects': ['nobody']}
+        assert get_query_tracker_info(attributes=["supported_features"]) == \
+            {'cluster_name': '', 'supported_features': {'access_control': True, 'multiple_aco': True}, 'access_control_objects': []}
+        assert get_query_tracker_info(attributes=["access_control_objects"]) == {'cluster_name': '', 'supported_features': {}, 'access_control_objects': ['everyone-share', 'nobody']}
+
+
+class TestShare(YTEnvSetup):
+    DELTA_DRIVER_CONFIG = {
+        "cluster_connection_dynamic_config_policy": "from_cluster_directory",
+    }
+
+    @authors("mpereskokova")
+    def test_share(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+
+        q = start_query("mock", "run_forever", authenticated_user="u1", access_control_object="everyone-share")
+
+        q.get(authenticated_user="u2")
+        expect_queries([q], list_queries(authenticated_user="u1"))
+        expect_queries([], list_queries(authenticated_user="u2"))
+
+
+class TestMultipleAccessControl(YTEnvSetup):
+    DELTA_DRIVER_CONFIG = {
+        "cluster_connection_dynamic_config_policy": "from_cluster_directory",
+    }
+
+    @authors("mpereskokova")
+    def test_start_query(self, query_tracker):
+        create_user("u1")
+
+        start_query("mock", "run_forever", authenticated_user="u1", access_control_object="nobody")
+        start_query("mock", "run_forever", authenticated_user="u1", access_control_objects=["nobody"])
+        with raises_yt_error():
+            start_query("mock", "run_forever", authenticated_user="u1", access_control_objects=["nobody"], access_control_object="nobody")
+
+    @authors("mpereskokova")
+    def test_alter_aco(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_access_control_object(
+            "aco",
+            "queries",
+            attributes={
+                "principal_acl": [
+                    make_ace("allow", "u1", "read"),
+                    make_ace("allow", "u1", "use"),
+                ]
+            })
+
+        q = start_query("mock", "run_forever", authenticated_user="u2", access_control_object="nobody")
+        with raises_yt_error(AuthorizationErrorCode):
+            q.get(authenticated_user="u1")
+
+        with raises_yt_error(AuthorizationErrorCode):
+            q.alter(authenticated_user="u1", access_control_objects=["aco", "nobody"])
+        q.alter(authenticated_user="u2", access_control_objects=["aco", "nobody"])
+
+        q.get(authenticated_user="u1")
+
+        q.alter(authenticated_user="u2", access_control_objects=[])
+        with raises_yt_error(AuthorizationErrorCode):
+            q.get(authenticated_user="u1")
+
+    @authors("mpereskokova")
+    def test_get_query(self, query_tracker):
+        create_user("u1")
+        create_access_control_object("yet_another_nobody", "queries")
+
+        q1 = start_query("mock", "run_forever", authenticated_user="u1", access_control_object="nobody")
+        q2 = start_query("mock", "run_forever", authenticated_user="u1", access_control_objects=["nobody", "yet_another_nobody"])
+
+        query = q1.get(authenticated_user="u1")
+        assert query["access_control_object"] == "nobody"
+        assert query["access_control_objects"] == ["nobody"]
+
+        query = q2.get(authenticated_user="u1")
+        assert "access_control_object" not in query
+        assert query["access_control_objects"] == ["nobody", "yet_another_nobody"]
+
+    @authors("mpereskokova")
+    def test_list_queries(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_access_control_object("yet_another_nobody", "queries")
+        create_access_control_object(
+            "aco",
+            "queries",
+            attributes={
+                "principal_acl": [
+                    make_ace("allow", "u1", "read"),
+                    make_ace("allow", "u1", "use"),
+                ]
+            })
+
+        q1 = start_query("mock", "run_forever", authenticated_user="u1", access_control_objects=["nobody", "yet_another_nobody"])
+        q2 = start_query("mock", "run_forever", authenticated_user="u2", access_control_objects=["aco"])
+
+        expect_queries([q1, q2], list_queries(authenticated_user="u1"))
+        expect_queries([q2], list_queries(authenticated_user="u2"))
 
 
 # Separate list to fit 480 seconds limit for a test class.
@@ -635,6 +726,17 @@ class TestAccessControlList(YTEnvSetup):
         expect_queries([q_u3], list_queries(filter="aco_list_by_aco3"))
         expect_queries([q_u3], list_queries(filter="aco:aco_list_by_aco3"))
 
+    @authors("mpereskokova")
+    def test_list_sql_injection(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        q0 = start_query("mock", "fail", authenticated_user="u1")
+        q1 = start_query("mock", "fail", authenticated_user="u2")
+
+        expect_queries([q0], list_queries(cursor_direction="future", attributes=["id"], user="u1"))
+        expect_queries([q1], list_queries(cursor_direction="future", attributes=["id"], user="u2"))
+        expect_queries([], list_queries(cursor_direction="future", attributes=["id"], user="u1\") OR ([user]=\"u2"))
+
 
 ##################################################################
 
@@ -643,15 +745,32 @@ class TestAccessControlList(YTEnvSetup):
 class TestQueriesMockRpcProxy(TestQueriesMock):
     DRIVER_BACKEND = "rpc"
     ENABLE_RPC_PROXY = True
+    NUM_RPC_PROXIES = 1
 
 
 @authors("apollo1321")
 class TestAccessControlRpcProxy(TestAccessControl):
     DRIVER_BACKEND = "rpc"
     ENABLE_RPC_PROXY = True
+    NUM_RPC_PROXIES = 1
+
+
+@authors("mpereskokova")
+class TestShareRpcProxy(TestShare):
+    DRIVER_BACKEND = "rpc"
+    ENABLE_RPC_PROXY = True
+    NUM_RPC_PROXIES = 1
 
 
 @authors("apollo1321")
 class TestAccessControlListRpcProxy(TestAccessControlList):
     DRIVER_BACKEND = "rpc"
     ENABLE_RPC_PROXY = True
+    NUM_RPC_PROXIES = 1
+
+
+@authors("mpereskokova")
+class TestMultipleAccessControlRpcProxy(TestMultipleAccessControl):
+    DRIVER_BACKEND = "rpc"
+    ENABLE_RPC_PROXY = True
+    NUM_RPC_PROXIES = 1

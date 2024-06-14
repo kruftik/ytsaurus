@@ -23,7 +23,7 @@ using namespace NYTree;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ContainersLogger;
+static constexpr auto& Logger = ContainersLogger;
 static const TString CGroupRootPath("/sys/fs/cgroup");
 #ifdef _linux_
 static const int ReadByAll = S_IRUSR | S_IRGRP | S_IROTH;
@@ -443,10 +443,12 @@ const TString TCpuAccounting::Name = "cpuacct";
 TCpuAccounting::TStatistics& operator-=(TCpuAccounting::TStatistics& lhs, const TCpuAccounting::TStatistics& rhs)
 {
     #define XX(name) lhs.name = lhs.name.ValueOrThrow() - rhs.name.ValueOrThrow();
+    XX(BurstUsageTime)
     XX(UserUsageTime)
     XX(SystemUsageTime)
     XX(WaitTime)
     XX(ThrottledTime)
+    XX(CfsThrottledTime)
     XX(ContextSwitchesDelta)
     XX(PeakThreadCount)
     #undef XX

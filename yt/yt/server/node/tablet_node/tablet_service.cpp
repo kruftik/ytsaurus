@@ -79,7 +79,7 @@ public:
             slot->GetHydraManager(),
             slot->GetGuardedAutomatonInvoker(EAutomatonThreadQueue::Write),
             TTabletServiceProxy::GetDescriptor(),
-            TabletNodeLogger,
+            TabletNodeLogger(),
             slot->GetCellId(),
             CreateHydraManagerUpstreamSynchronizer(slot->GetHydraManager()),
             bootstrap->GetNativeAuthenticator())
@@ -138,16 +138,10 @@ private:
                 << TErrorAttribute("estimated_throttler_wait_time", waitTime);
         }
 
-        auto throttlerFuture = throttler->Throttle(count)
-            .WithTimeout(maxThrottleTime);
+        auto throttlerFuture = throttler->Throttle(count);
 
-        auto throttleResult = WaitForFast(throttlerFuture);
-        if (!throttleResult.IsOK()) {
-            THROW_ERROR_EXCEPTION(NTabletClient::EErrorCode::RequestThrottled,
-                "Journal media write is throttled")
-                << TErrorAttribute("max_throttle_wait_timeout", maxThrottleTime)
-                << throttleResult;
-        }
+        WaitForFast(throttlerFuture)
+            .ThrowOnError();
     }
 
     DECLARE_RPC_SERVICE_METHOD(NTabletClient::NProto, Write)
@@ -255,16 +249,26 @@ private:
                 if (era == InvalidReplicationEra) {
                     THROW_ERROR_EXCEPTION("Direct write is not allowed: replica is identifying replication era");
                 }
-                THROW_ERROR_EXCEPTION("Replication era mismatch: expected %v, got %v",
-                    era,
-                    *replicationEra);
+
+                if (*replicationEra > era) {
+                    const auto& chaosAgent = Slot_->GetTabletManager()->GetTabletOrThrow(tabletId)->GetChaosAgent();
+                    chaosAgent->RefreshEra(*replicationEra);
+                    era = tabletSnapshot->TabletRuntimeData->ReplicationEra.load();
+                }
+
+                if (*replicationEra != era) {
+                    THROW_ERROR_EXCEPTION("Replication era mismatch: expected %v, got %v",
+                        era,
+                        *replicationEra);
+                }
             }
 
             auto writeMode = tabletSnapshot->TabletRuntimeData->WriteMode.load();
             if (writeMode != ETabletWriteMode::Direct &&
                 context->GetAuthenticationIdentity().User != NSecurityClient::ReplicatorUserName)
             {
-                THROW_ERROR_EXCEPTION("Direct write is not allowed: replica is probably catching up")
+                THROW_ERROR_EXCEPTION(NTabletClient::EErrorCode::SyncReplicaNotInSync,
+                    "Direct write is not allowed: replica is probably catching up")
                     << TErrorAttribute("upstream_replica_id", tabletSnapshot->UpstreamReplicaId);
             }
 

@@ -25,10 +25,14 @@ public:
     TString RuntimeHandler;
 
     //! Common parent cgroup for all pods.
+    //! Should be absolute and follow slice notation for systemd setup.
     TString BaseCgroup;
 
     //! Cpu quota period for cpu limits.
     TDuration CpuPeriod;
+
+    //! Retry requests on generic error with these message prefixes.
+    std::vector<TString> RetryErrorPrefixes;
 
     REGISTER_YSON_STRUCT(TCriExecutorConfig);
 

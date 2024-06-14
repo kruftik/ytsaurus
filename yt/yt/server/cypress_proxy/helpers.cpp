@@ -1,11 +1,19 @@
 #include "private.h"
 #include "helpers.h"
 #include "action_helpers.h"
+#include "path_resolver.h"
+#include "sequoia_service_detail.h"
 
+#include <yt/yt/server/lib/misc/interned_attributes.h>
+
+#include <yt/yt/ytlib/sequoia_client/client.h>
 #include <yt/yt/ytlib/sequoia_client/helpers.h>
 #include <yt/yt/ytlib/sequoia_client/transaction.h>
+#include <yt/yt/ytlib/sequoia_client/ypath_detail.h>
 
 #include <yt/yt/ytlib/sequoia_client/records/child_node.record.h>
+
+#include <yt/yt/ytlib/cypress_client/proto/cypress_ypath.pb.h>
 
 #include <yt/yt/client/object_client/helpers.h>
 
@@ -17,69 +25,239 @@
 
 namespace NYT::NCypressProxy {
 
+using namespace NApi;
 using namespace NConcurrency;
 using namespace NCypressClient;
+using namespace NCypressClient::NProto;
 using namespace NObjectClient;
 using namespace NSequoiaClient;
 using namespace NYPath;
+using namespace NRpc;
+using namespace NYTree;
 
-using TYPath = NYPath::TYPath;
-using TYPathBuf = NYPath::TYPathBuf;
+using NYT::FromProto;
+
+using TYPath = NSequoiaClient::TYPath;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = CypressProxyLogger;
+static constexpr auto& Logger = CypressProxyLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-std::vector<TYPathBuf> TokenizeUnresolvedSuffix(const TYPath& unresolvedSuffix)
+namespace {
+
+struct TSequoiaTransactionActionSequencer
+    : public ISequoiaTransactionActionSequencer
+{
+    int GetActionPriority(TStringBuf actionType) const override
+    {
+        #define HANDLE_ACTION_TYPE(TAction, priority) \
+            if (actionType == NCypressServer::NProto::TAction::GetDescriptor()->full_name()) { \
+                return priority; \
+            }
+
+        HANDLE_ACTION_TYPE(TReqCloneNode, 100)
+        HANDLE_ACTION_TYPE(TReqDetachChild, 200)
+        HANDLE_ACTION_TYPE(TReqRemoveNode, 300)
+        HANDLE_ACTION_TYPE(TReqCreateNode, 400)
+        HANDLE_ACTION_TYPE(TReqAttachChild, 500)
+        HANDLE_ACTION_TYPE(TReqSetNode, 600)
+
+        #undef HANDLE_ACTION_TYPE
+
+        YT_ABORT();
+    }
+};
+
+static const TSequoiaTransactionActionSequencer TransactionActionSequencer;
+
+static const TSequoiaTransactionSequencingOptions SequencingOptions = {
+    .TransactionActionSequencer = &TransactionActionSequencer,
+    .RequestPriorities = TSequoiaTransactionRequestPriorities{
+        .DatalessLockRow = 100,
+        .LockRow = 200,
+        .WriteRow = 400,
+        .DeleteRow = 300,
+    },
+};
+
+} // namespace
+
+TFuture<ISequoiaTransactionPtr> StartCypressProxyTransaction(
+    const ISequoiaClientPtr& sequoiaClient,
+    const TTransactionStartOptions& options)
+{
+    return sequoiaClient->StartTransaction(options, SequencingOptions);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+bool IsLinkType(NCypressClient::EObjectType type)
+{
+    return type == EObjectType::Link || type == EObjectType::SequoiaLink;
+}
+
+void ValidateLinkNodeCreation(
+    const ISequoiaServiceContextPtr& context,
+    const NCypressClient::NProto::TReqCreate& request)
+{
+    auto explicitAttributes = request.has_node_attributes()
+        ? NYTree::FromProto(request.node_attributes())
+        : CreateEphemeralAttributes();
+    // TODO(danilalexeev): In case of a master-object designator the following resolve will not produce
+    // a meaningful result. Such YPath has to be resolved by master first.
+    auto originalTargetPath = explicitAttributes->GetAndRemove<TRawYPath>(EInternedAttributeKey::TargetPath.Unintern());
+
+    auto getCanonicalYPathView = [] (const TResolveResult& result) {
+        return Visit(result,
+            [&] (const TSequoiaResolveResult& result) {
+                TTokenizer tokenizer(result.UnresolvedSuffix.Underlying());
+                tokenizer.Advance();
+                tokenizer.Skip(ETokenType::Ampersand);
+                return result.ResolvedPrefix + TYPath(tokenizer.GetInput());
+            },
+            [&] (const TCypressResolveResult& result) {
+                return TAbsoluteYPath(result.Path);
+            });
+    };
+    auto linkPath = getCanonicalYPathView(context->GetResolveResultOrThrow());
+
+    auto checkAcyclicity = [&] (const TRawYPath& pathToResolve, const TAbsoluteYPath& forbiddenPrefix) {
+        // TODO(danilalexeev): rewrite this once resolve context is seperated from rpc context.
+        auto resolveContext = CreateSequoiaContext(
+            context->GetRequestMessage(),
+            context->GetSequoiaTransaction());
+
+        ResolvePath(
+            resolveContext.Get(),
+            /*method*/ {},
+            pathToResolve);
+        const auto& resolveResult = resolveContext->GetResolveResultOrThrow();
+
+        for (const auto& resolveStep : resolveContext->GetResolveHistory()) {
+            if (IsLinkType(TypeFromId(resolveStep.ResolvedPrefixNodeId)) &&
+                resolveStep.ResolvedPrefix == forbiddenPrefix)
+            {
+                return false;
+            }
+        }
+
+        return getCanonicalYPathView(resolveResult) != forbiddenPrefix;
+    };
+
+    if (!checkAcyclicity(originalTargetPath, linkPath)) {
+        THROW_ERROR_EXCEPTION("Failed to create link: link is cyclic")
+            << TErrorAttribute("target_path", originalTargetPath)
+            << TErrorAttribute("path", linkPath);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+TFuture<TSharedRefArray> ExecuteVerb(
+    const ISequoiaServicePtr& service,
+    TSharedRefArray* requestMessage,
+    const ISequoiaClientPtr& client,
+    NLogging::TLogger logger,
+    NLogging::ELogLevel logLevel)
+{
+    YT_VERIFY(requestMessage);
+
+    TIntrusivePtr<TSequoiaServiceContext> context;
+    try {
+        auto transaction = WaitFor(StartCypressProxyTransaction(client))
+            .ValueOrThrow();
+
+        context = CreateSequoiaContext(
+            *requestMessage,
+            transaction,
+            std::move(logger),
+            logLevel);
+        ResolvePath(
+            context.Get(),
+            context->GetMethod(),
+            TRawYPath(GetRequestTargetYPath(context->GetRequestHeader())));
+    } catch (const std::exception& ex) {
+        return MakeFuture(CreateErrorResponseMessage(ex));
+    }
+
+    // Resolve history is not empty iff we have encountered a symlink or a scion during
+    // the resolving process, target path must be modified accordingly.
+    if (auto resolveStep = context->TryGetLastResolveStep()) {
+        auto requestHeader = std::make_unique<NRpc::NProto::TRequestHeader>();
+        if (!ParseRequestHeader(*requestMessage, requestHeader.get())) {
+            THROW_ERROR_EXCEPTION("Error parsing request header");
+        }
+        auto newTargetPath = Visit(context->GetResolveResultOrThrow(),
+            [&] (const TSequoiaResolveResult& result) {
+                return TRawYPath(result.UnresolvedSuffix.ToString());
+            },
+            [&] (const TCypressResolveResult& result) {
+                return result.Path;
+            });
+        SetRequestTargetYPath(requestHeader.get(), newTargetPath.Underlying());
+        context->SetRequestHeader(std::move(requestHeader));
+        *requestMessage = context->GetRequestMessage();
+    }
+
+    auto asyncResponseMessage = context->GetAsyncResponseMessage();
+
+    service->Invoke(context);
+
+    return asyncResponseMessage;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+std::vector<TString> TokenizeUnresolvedSuffix(const TYPath& unresolvedSuffix)
 {
     constexpr auto TypicalPathTokenCount = 3;
-    std::vector<TYPathBuf> pathTokens;
+    std::vector<TString> pathTokens;
     pathTokens.reserve(TypicalPathTokenCount);
 
-    TTokenizer tokenizer(unresolvedSuffix);
+    TTokenizer tokenizer(unresolvedSuffix.Underlying());
     tokenizer.Advance();
 
     while (tokenizer.GetType() != ETokenType::EndOfStream) {
         tokenizer.Expect(ETokenType::Slash);
         tokenizer.Advance();
         tokenizer.Expect(ETokenType::Literal);
-        pathTokens.push_back(tokenizer.GetToken());
+        pathTokens.push_back(tokenizer.GetLiteralValue());
         tokenizer.Advance();
     };
 
     return pathTokens;
 }
 
-TYPath JoinNestedNodesToPath(
-    const TYPath& parentPath,
-    const std::vector<TYPathBuf>& childKeys)
+TAbsoluteYPath JoinNestedNodesToPath(
+    const TAbsoluteYPath& parentPath,
+    const std::vector<TString>& childKeys)
 {
     TStringBuilder builder;
 
-    auto nestedLength = std::accumulate(
-        childKeys.begin(),
-        childKeys.end(),
-        size_t(0),
-        [] (size_t result, TYPathBuf childKey) {
-            return result + childKey.size() + 1;
-        });
-    builder.Reserve(parentPath.size() + nestedLength);
+    auto nestedLength = 0;
+    for (const auto& childKey : childKeys) {
+        nestedLength += std::ssize(childKey) + 1;
+    }
+    builder.Reserve(std::ssize(parentPath.Underlying()) + nestedLength);
 
-    builder.AppendString(parentPath);
+    builder.AppendString(parentPath.Underlying());
     for (auto childKey : childKeys) {
         builder.AppendChar('/');
-        builder.AppendString(childKey);
+        AppendYPathLiteral(&builder, childKey);
     }
-    return builder.Flush();
+    return TAbsoluteYPath(builder.Flush());
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
 bool IsSupportedSequoiaType(EObjectType type)
 {
-    return IsSequoiaCompositeNodeType(type) || IsScalarType(type) || IsChunkOwnerType(type);
+    return IsSequoiaCompositeNodeType(type) ||
+        IsScalarType(type) ||
+        IsChunkOwnerType(type) ||
+        type == EObjectType::SequoiaLink;
 }
 
 bool IsSequoiaCompositeNodeType(EObjectType type)
@@ -96,7 +274,7 @@ void ValidateSupportedSequoiaType(EObjectType type)
     }
 }
 
-void ThrowAlreadyExists(const TYPath& path)
+void ThrowAlreadyExists(const TAbsoluteYPath& path)
 {
     THROW_ERROR_EXCEPTION(
         NYTree::EErrorCode::AlreadyExists,
@@ -104,7 +282,7 @@ void ThrowAlreadyExists(const TYPath& path)
         path);
 }
 
-void ThrowNoSuchChild(const TYPath& existingPath, const TYPathBuf& missingPath)
+void ThrowNoSuchChild(const TAbsoluteYPath& existingPath, TStringBuf missingPath)
 {
     THROW_ERROR_EXCEPTION(
         NYTree::EErrorCode::ResolveError,
@@ -117,12 +295,12 @@ void ThrowNoSuchChild(const TYPath& existingPath, const TYPathBuf& missingPath)
 
 // TODO(h0pless): Change this to TFuture<std::vector>.
 std::vector<NRecords::TPathToNodeId> SelectSubtree(
-    const TYPath& path,
+    const TAbsoluteYPath& path,
     const ISequoiaTransactionPtr& transaction)
 {
-    auto mangledPath = MangleSequoiaPath(path);
+    auto mangledPath = path.ToMangledSequoiaPath();
     return WaitFor(transaction->SelectRows<NRecords::TPathToNodeIdKey>({
-        .Where = {
+        .WhereConjuncts = {
             Format("path >= %Qv", mangledPath),
             Format("path <= %Qv", MakeLexicographicallyMaximalMangledSequoiaPathForPrefix(mangledPath))
         },
@@ -132,11 +310,11 @@ std::vector<NRecords::TPathToNodeId> SelectSubtree(
 }
 
 TNodeId LookupNodeId(
-    const TYPath& path,
+    TAbsoluteYPathBuf path,
     const ISequoiaTransactionPtr& transaction)
 {
     NRecords::TPathToNodeIdKey nodeKey{
-        .Path = MangleSequoiaPath(path),
+        .Path = path.ToMangledSequoiaPath(),
     };
     auto rows = WaitFor(transaction->LookupRows<NRecords::TPathToNodeIdKey>({nodeKey}))
         .ValueOrThrow();
@@ -154,9 +332,9 @@ TNodeId LookupNodeId(
 }
 
 TNodeId CreateIntermediateNodes(
-    const TYPath& parentPath,
+    const TAbsoluteYPath& parentPath,
     TNodeId parentId,
-    const std::vector<TYPathBuf>& nodeKeys,
+    const std::vector<TString>& nodeKeys,
     const ISequoiaTransactionPtr& transaction)
 {
     auto currentNodePath = parentPath;
@@ -171,8 +349,9 @@ TNodeId CreateIntermediateNodes(
             EObjectType::SequoiaMapNode,
             currentNodeId,
             currentNodePath,
+            /*explicitAttributes*/ nullptr,
             transaction);
-        AttachChild(prevNodeId, currentNodeId, TYPath(key), transaction);
+        AttachChild(prevNodeId, currentNodeId, key, transaction);
         prevNodeId = currentNodeId;
     }
     return prevNodeId;
@@ -180,18 +359,21 @@ TNodeId CreateIntermediateNodes(
 
 TNodeId CopySubtree(
     const std::vector<NRecords::TPathToNodeId>& sourceNodes,
-    const TYPath& sourceRootPath,
-    const TYPath& destinationRootPath,
+    const TAbsoluteYPath& sourceRootPath,
+    const TAbsoluteYPath& destinationRootPath,
     const TCopyOptions& options,
     const ISequoiaTransactionPtr& transaction)
 {
-    THashMap<TYPath, std::vector<std::pair<TString, TNodeId>>> nodePathToChildren;
+    THashMap<TAbsoluteYPath, std::vector<std::pair<TString, TNodeId>>> nodePathToChildren;
     TNodeId destinationNodeId;
     for (auto it = sourceNodes.rbegin(); it != sourceNodes.rend(); ++it) {
-        auto destinationNodePath = DemangleSequoiaPath(it->Key.Path);
-        destinationNodePath.replace(0, sourceRootPath.size(), destinationRootPath);
+        TAbsoluteYPath destinationNodePath(it->Key.Path);
+        destinationNodePath.Underlying().replace(
+            0,
+            sourceRootPath.Underlying().size(),
+            destinationRootPath.Underlying());
         destinationNodeId = CopyNode(
-            it->NodeId,
+            *it,
             destinationNodePath,
             options,
             transaction);
@@ -204,7 +386,8 @@ TNodeId CopySubtree(
             nodePathToChildren.erase(nodeIt);
         }
 
-        auto [parentPath, childKey] = DirNameAndBaseName(destinationNodePath);
+        TAbsoluteYPath parentPath(destinationNodePath.GetDirPath());
+        auto childKey = destinationNodePath.GetBaseName();
         nodePathToChildren[std::move(parentPath)].emplace_back(std::move(childKey), destinationNodeId);
     }
 
@@ -220,10 +403,10 @@ void RemoveSelectedSubtree(
 {
     YT_VERIFY(!subtreeNodes.empty());
 
-    THashMap<TYPath, TNodeId> pathToNodeId;
+    THashMap<TAbsoluteYPath, TNodeId> pathToNodeId;
     pathToNodeId.reserve(subtreeNodes.size());
     for (const auto& node : subtreeNodes) {
-        pathToNodeId[DemangleSequoiaPath(node.Key.Path)] = node.NodeId;
+        pathToNodeId[TAbsoluteYPath(node.Key.Path)] = node.NodeId;
     }
 
     for (auto nodeIt = subtreeNodes.begin() + (removeRoot ? 0 : 1); nodeIt < subtreeNodes.end(); ++nodeIt) {
@@ -231,9 +414,9 @@ void RemoveSelectedSubtree(
     }
 
     for (auto it = subtreeNodes.rbegin(); it < subtreeNodes.rend(); ++it) {
-        auto [parentPath, childKey] = DirNameAndBaseName(DemangleSequoiaPath(it->Key.Path));
-        if (auto parentIt = pathToNodeId.find(parentPath)) {
-            DetachChild(parentIt->second, childKey, transaction);
+        TAbsoluteYPath path(it->Key.Path);
+        if (auto parentIt = pathToNodeId.find(path.GetDirPath())) {
+            DetachChild(parentIt->second, path.GetBaseName(), transaction);
         }
     }
 
@@ -242,28 +425,27 @@ void RemoveSelectedSubtree(
         return;
     }
 
-    auto subtreeRootPath = DemangleSequoiaPath(subtreeNodes.front().Key.Path);
-    auto [subtreeRootParentPath, subtreeRootKey] = DirNameAndBaseName(subtreeRootPath);
+    TAbsoluteYPath subtreeRootPath(subtreeNodes.front().Key.Path);
     if (!subtreeParentIdHint) {
-        subtreeParentIdHint = LookupNodeId(subtreeRootParentPath, transaction);
+        subtreeParentIdHint = LookupNodeId(subtreeRootPath.GetDirPath(), transaction);
     }
-    DetachChild(subtreeParentIdHint, subtreeRootKey, transaction);
+    DetachChild(subtreeParentIdHint, subtreeRootPath.GetBaseName(), transaction);
 }
 
 TFuture<void> RemoveSubtree(
-    const TYPath& path,
+    const TAbsoluteYPath& path,
     const ISequoiaTransactionPtr& transaction,
     bool removeRoot,
     TNodeId subtreeParentIdHint)
 {
     if (!subtreeParentIdHint && removeRoot) {
-        auto subtreeParentPath = removeRoot ? DirNameAndBaseName(path).first : path;
+        auto subtreeParentPath = removeRoot ? TAbsoluteYPath(path.GetDirPath()) : path;
         subtreeParentIdHint = LookupNodeId(subtreeParentPath, transaction);
     }
 
-    auto mangledPath = MangleSequoiaPath(path);
+    auto mangledPath = path.ToMangledSequoiaPath();
     return transaction->SelectRows<NRecords::TPathToNodeIdKey>({
-        .Where = {
+        .WhereConjuncts = {
             Format("path >= %Qv", mangledPath),
             Format("path <= %Qv", MakeLexicographicallyMaximalMangledSequoiaPathForPrefix(mangledPath))
         },

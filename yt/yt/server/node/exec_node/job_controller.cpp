@@ -5,6 +5,7 @@
 #include "helpers.h"
 #include "job.h"
 #include "job_info.h"
+#include "job_proxy_log_manager.h"
 #include "private.h"
 #include "scheduler_connector.h"
 #include "slot_manager.h"
@@ -43,6 +44,7 @@
 
 #include <yt/yt/core/misc/backoff_strategy.h>
 #include <yt/yt/core/misc/statistics.h>
+#include <yt/yt/core/misc/process_exit_profiler.h>
 
 #include <yt/yt/core/ytree/ypath_resolver.h>
 
@@ -74,7 +76,7 @@ using TJobStartInfo = TControllerAgentConnectorPool::TControllerAgentConnector::
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = ExecNodeLogger;
+static constexpr auto& Logger = ExecNodeLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -104,8 +106,9 @@ public:
     TJobController(IBootstrapBase* bootstrap)
         : Bootstrap_(bootstrap)
         , DynamicConfig_(New<TJobControllerDynamicConfig>())
-        , OperationInfoRequestBackoffStrategy_(DynamicConfig_.Acquire()->OperationInfoRequestBackoffStrategy)
+        , OperationInfoRequestBackoffStrategy_(GetDynamicConfig()->OperationInfoRequestBackoffStrategy)
         , Profiler_("/job_controller")
+        , JobProxyExitProfiler_(Profiler_, "/job_proxy_process_exit")
         , CacheHitArtifactsSizeCounter_(Profiler_.Counter("/chunk_cache/cache_hit_artifacts_size"))
         , CacheMissArtifactsSizeCounter_(Profiler_.Counter("/chunk_cache/cache_miss_artifacts_size"))
         , CacheBypassedArtifactsSizeCounter_(Profiler_.Counter("/chunk_cache/cache_bypassed_artifacts_size"))
@@ -131,8 +134,8 @@ public:
             BIND_NO_PROPAGATE(&TJobController::OnResourceReleased, MakeWeak(this))
                 .Via(Bootstrap_->GetJobInvoker()),
             EResourcesConsumerType::SchedulerAllocation);
-        JobResourceManager_->SubscribeReservedMemoryOvercommited(
-            BIND_NO_PROPAGATE(&TJobController::OnReservedMemoryOvercommited, MakeWeak(this))
+        JobResourceManager_->SubscribeReservedMemoryOvercommitted(
+            BIND_NO_PROPAGATE(&TJobController::OnReservedMemoryOvercommitted, MakeWeak(this))
                 .Via(Bootstrap_->GetJobInvoker()));
         JobResourceManager_->SubscribeResourceUsageOverdraftOccurred(
             BIND_NO_PROPAGATE(&TJobController::OnResourceUsageOverdraftOccurred, MakeWeak(this))
@@ -152,6 +155,7 @@ public:
         JobProxyBuildInfoUpdater_ = New<TPeriodicExecutor>(
             Bootstrap_->GetJobInvoker(),
             BIND_NO_PROPAGATE(&TJobController::UpdateJobProxyBuildInfo, MakeWeak(this)));
+        JobProxyLogManager_ = CreateJobProxyLogManager(Bootstrap_->GetExecNodeBootstrap());
     }
 
     void Start() override
@@ -162,6 +166,7 @@ public:
         ResourceAdjustmentExecutor_->Start();
         RecentlyRemovedJobCleaner_->Start();
         JobProxyBuildInfoUpdater_->Start();
+        JobProxyLogManager_->Start();
 
         // Get ready event before actual start.
         auto buildInfoReadyEvent = JobProxyBuildInfoUpdater_->GetExecutedEvent();
@@ -274,13 +279,6 @@ public:
         return GetDynamicConfig()->JobProxy;
     }
 
-    TJobControllerDynamicConfigPtr GetDynamicConfig() const override
-    {
-        VERIFY_THREAD_AFFINITY_ANY();
-
-        return DynamicConfig_.Acquire();
-    }
-
     TBuildInfoPtr GetBuildInfo() const override
     {
         VERIFY_THREAD_AFFINITY_ANY();
@@ -299,7 +297,7 @@ public:
 
         const auto& slotManager = Bootstrap_->GetExecNodeBootstrap()->GetSlotManager();
 
-        return JobsDisabledByMaster_.load() || slotManager->HasFatalAlert();
+        return JobsDisabledByMaster_.load() || slotManager->IsJobSchedulingDisabled();
     }
 
     void ScheduleStartAllocations()
@@ -308,6 +306,12 @@ public:
 
         if (StartAllocationsScheduled_) {
             return;
+        }
+
+        if (auto delay = GetDynamicConfig()->TestResourceAcquisitionDelay) {
+            YT_LOG_DEBUG("Performing testing delay before resource acquisition (Delay: %v)", delay);
+            TDelayedExecutor::WaitForDuration(*delay);
+            YT_LOG_DEBUG("Finished testing delay before resource acquisition");
         }
 
         Bootstrap_->GetJobInvoker()->Invoke(BIND(
@@ -397,10 +401,16 @@ public:
     }
 
     void OnDynamicConfigChanged(
-        const TJobControllerDynamicConfigPtr& /*oldConfig*/,
+        const TJobControllerDynamicConfigPtr& oldConfig,
         const TJobControllerDynamicConfigPtr& newConfig) override
     {
         VERIFY_INVOKER_AFFINITY(Bootstrap_->GetControlInvoker());
+
+        if (newConfig->JobProxyLogManager) {
+            JobProxyLogManager_->OnDynamicConfigChanged(
+                oldConfig->JobProxyLogManager,
+                newConfig->JobProxyLogManager);
+        }
 
         DynamicConfig_.Store(newConfig);
 
@@ -439,10 +449,25 @@ public:
         return future;
     }
 
+    TJobControllerDynamicConfigPtr GetDynamicConfig() const override
+    {
+        VERIFY_THREAD_AFFINITY_ANY();
+
+        return DynamicConfig_.Acquire();
+    }
+
+    void OnJobProxyProcessFinished(const TError& error, std::optional<TDuration> delay) override
+    {
+        VERIFY_THREAD_AFFINITY(JobThread);
+
+        JobProxyExitProfiler_.OnProcessExit(error, delay);
+    }
+
     void EvictThrottlingRequest(TGuid id)
     {
         VERIFY_THREAD_AFFINITY(JobThread);
-        YT_LOG_DEBUG("Outstanding throttling request evicted (ThrottlingRequestId: %v)",
+        YT_LOG_DEBUG(
+            "Outstanding throttling request evicted (ThrottlingRequestId: %v)",
             id);
         YT_VERIFY(OutstandingThrottlingRequests_.erase(id) == 1);
     }
@@ -491,6 +516,7 @@ private:
     std::optional<TInstant> CpuOverdraftInstant_;
 
     TProfiler Profiler_;
+    TProcessExitProfiler JobProxyExitProfiler_;
     TBufferedProducerPtr GpuUtilizationBuffer_ = New<TBufferedProducer>();
     TBufferedProducerPtr ActiveJobCountBuffer_ = New<TBufferedProducer>();
     THashMap<EJobState, TCounter> JobFinalStateCounters_;
@@ -513,6 +539,8 @@ private:
     TAtomicObject<TErrorOr<TBuildInfoPtr>> CachedJobProxyBuildInfo_;
 
     THashMap<TGuid, TFuture<void>> OutstandingThrottlingRequests_;
+
+    IJobProxyLogManagerPtr JobProxyLogManager_;
 
     DECLARE_THREAD_AFFINITY_SLOT(JobThread);
 
@@ -579,11 +607,15 @@ private:
             auto incarnationId = FromProto<NScheduler::TIncarnationId>(
                 startInfoProto.controller_agent_descriptor().incarnation_id());
 
-            const auto& controllerAgentConnectorPool = Bootstrap_->GetExecNodeBootstrap()->GetControllerAgentConnectorPool();
-            auto maybeAgentDescriptor = controllerAgentConnectorPool->GetDescriptorByIncarnationId(incarnationId);
-            YT_VERIFY(maybeAgentDescriptor);
+            std::optional<NScheduler::TAllocationAttributes> allocationAttributes;
+            if (GetDynamicConfig()->DisableLegacyAllocationPreparation) {
+                YT_VERIFY(startInfoProto.has_allocation_attributes());
+                auto& attributes = allocationAttributes.emplace();
+                FromProto(&attributes, startInfoProto.allocation_attributes());
+            }
 
-            auto agentDescriptor = std::move(*maybeAgentDescriptor);
+            const auto& controllerAgentConnectorPool = Bootstrap_->GetExecNodeBootstrap()->GetControllerAgentConnectorPool();
+            auto agentDescriptor = controllerAgentConnectorPool->GetDescriptorByIncarnationId(incarnationId);
 
             // TODO(pogorelov): Move this logic to job resource manager.
             startInfoProto.mutable_resource_limits()->set_vcpu(
@@ -594,6 +626,7 @@ private:
                 allocationId,
                 operationId,
                 FromNodeResources(startInfoProto.resource_limits()),
+                std::move(allocationAttributes),
                 agentDescriptor,
                 Bootstrap_->GetExecNodeBootstrap());
 
@@ -605,36 +638,37 @@ private:
                     agentDescriptor);
 
                 allocation->Abort(MakeJobsDisabledError());
-            } else {
-                YT_LOG_INFO(
-                    "Allocation created (OperationId: %v, AllocationId: %v, ControllerAgentDescriptor: %v)",
-                    operationId,
-                    allocationId,
-                    agentDescriptor);
-
-                allocation->SubscribeAllocationPrepared(BIND_NO_PROPAGATE(
-                    &TJobController::OnAllocationPrepared,
-                    MakeStrong(this))
-                        .Via(Bootstrap_->GetJobInvoker()));
-
-                allocation->SubscribeAllocationFinished(
-                    BIND_NO_PROPAGATE(&TJobController::OnAllocationFinished, MakeStrong(this))
-                        .Via(Bootstrap_->GetJobInvoker()));
-
-                allocation->SubscribeJobSettled(
-                    BIND_NO_PROPAGATE(&TJobController::OnJobSettled, MakeStrong(this))
-                            .Via(Bootstrap_->GetJobInvoker()));
-                allocation->SubscribeJobPrepared(
-                    BIND_NO_PROPAGATE(&TJobController::OnJobPrepared, MakeStrong(this))
-                        .Via(Bootstrap_->GetJobInvoker()));
-                allocation->SubscribeJobFinished(
-                    BIND_NO_PROPAGATE(&TJobController::OnJobFinished, MakeStrong(this))
-                        .Via(Bootstrap_->GetJobInvoker()));
-
-                EmplaceOrCrash(IdToAllocations_, allocationId, allocation);
-
-                allocation->Start();
+                continue;
             }
+
+            YT_LOG_INFO(
+                "Allocation created (OperationId: %v, AllocationId: %v, ControllerAgentDescriptor: %v)",
+                operationId,
+                allocationId,
+                agentDescriptor);
+
+            allocation->SubscribeAllocationPrepared(BIND_NO_PROPAGATE(
+                &TJobController::OnAllocationPrepared,
+                MakeStrong(this))
+                    .Via(Bootstrap_->GetJobInvoker()));
+
+            allocation->SubscribeAllocationFinished(
+                BIND_NO_PROPAGATE(&TJobController::OnAllocationFinished, MakeStrong(this))
+                    .Via(Bootstrap_->GetJobInvoker()));
+
+            allocation->SubscribeJobSettled(
+                BIND_NO_PROPAGATE(&TJobController::OnJobSettled, MakeStrong(this))
+                        .Via(Bootstrap_->GetJobInvoker()));
+            allocation->SubscribeJobPrepared(
+                BIND_NO_PROPAGATE(&TJobController::OnJobPrepared, MakeStrong(this))
+                    .Via(Bootstrap_->GetJobInvoker()));
+            allocation->SubscribeJobFinished(
+                BIND_NO_PROPAGATE(&TJobController::OnJobFinished, MakeStrong(this))
+                    .Via(Bootstrap_->GetJobInvoker()));
+
+            EmplaceOrCrash(IdToAllocations_, allocationId, allocation);
+
+            allocation->Start();
         }
     }
 
@@ -665,15 +699,11 @@ private:
         }
 
         job->GetCleanupFinishedEvent()
-            .Subscribe(BIND_NO_PROPAGATE([=, this_ = MakeWeak(this), job_ = MakeWeak(job)] (const TError& result) {
+            .Subscribe(BIND_NO_PROPAGATE([this, this_ = MakeStrong(this), weakJob = MakeWeak(job)] (const TError& result) {
                 YT_LOG_FATAL_IF(!result.IsOK(), result, "Cleanup finish failed");
-
-                auto strongThis = this_.Lock();
-                if (!strongThis) {
-                    return;
+                if (auto strongJob = weakJob.Lock()) {
+                    OnJobCleanupFinished(strongJob);
                 }
-
-                strongThis->OnJobCleanupFinished(job_);
             })
                 .Via(Bootstrap_->GetJobInvoker()));
 
@@ -796,19 +826,28 @@ private:
 
         TForbidContextSwitchGuard guard;
 
-        auto currentAllocation = DynamicPointerCast<TAllocation>(std::move(resourceHolder));
-        YT_LOG_FATAL_UNLESS(
-            currentAllocation,
-            "Resource usage overdraft happened for the resource holder with no allocation (ResourceHolderId: %v)",
-            resourceHolder->GetIdAsGuid());
+        TAllocationPtr currentAllocation;
+        TAllocationId currentAllocationId;
 
-        auto allocationId = currentAllocation->GetId();
+        if (auto resourceOwner = resourceHolder->GetOwner()) {
+            if (currentAllocation = DynamicPointerCast<TAllocation>(std::move(resourceOwner))) {
+                currentAllocationId = currentAllocation->GetId();
 
-        YT_LOG_INFO(
-            "Handling resource usage overdraft caused by allocation resource usage update (AllocationId: %v)",
-            allocationId);
+                YT_LOG_INFO(
+                    "Handling resource usage overdraft caused by allocation resource usage update (AllocationId: %v)",
+                    currentAllocationId);
+            } else {
+                YT_LOG_INFO(
+                    "Resource usage overdraft happened for the resource holder with no allocation (ResourceHolderId: %v)",
+                    resourceHolder->GetId());
+            }
+        } else {
+            YT_LOG_INFO(
+                "Resources overdraft happened for the resource holder with no owner (ResourceHolderId: %v)",
+                resourceHolder->GetId());
+        }
 
-        if (currentAllocation->IsResourceUsageOverdraftOccurred()) {
+        if (currentAllocation && currentAllocation->IsResourceUsageOverdraftOccurred()) {
             currentAllocation->Abort(TError(
                 NExecNode::EErrorCode::ResourceOverdraft,
                 "Resource usage overdraft occurred")
@@ -824,16 +863,16 @@ private:
                         NExecNode::EErrorCode::ResourceOverdraft,
                         "Some other allocation with guarantee overdraft total node resource usage")
                         << TErrorAttribute("resource_usage", FormatResources(job->GetResourceUsage()))
-                        << TErrorAttribute("other_allocation_id", currentAllocation->GetId()));
+                        << TErrorAttribute("other_allocation_id", currentAllocationId));
                     foundJobToAbort = true;
                     break;
                 }
             }
 
             if (!foundJobToAbort) {
-                currentAllocation->Abort(TError(
-                    NExecNode::EErrorCode::NodeResourceOvercommit,
-                    "Resource usage on node overcommitted"));
+                YT_LOG_WARNING(
+                    "Resource overdraft occured, but no allocation with resource overdraft found (CurrentResourceHolderId: %v)",
+                    resourceHolder->GetId());
             }
         }
     }
@@ -855,7 +894,7 @@ private:
 
         const auto& agentDescriptor = context->ControllerAgentConnector->GetDescriptor();
 
-        auto Logger = NExecNode::Logger.WithTag("ControllerAgentDescriptor: %v", agentDescriptor);
+        auto Logger = NExecNode::Logger().WithTag("ControllerAgentDescriptor: %v", agentDescriptor);
 
         ToProto(request->mutable_controller_agent_incarnation_id(), agentDescriptor.IncarnationId);
 
@@ -1074,7 +1113,7 @@ private:
 
         const auto& agentDescriptor = context->ControllerAgentConnector->GetDescriptor();
 
-        auto Logger = NExecNode::Logger.WithTag("ControllerAgentDescriptor: %v", agentDescriptor);
+        auto Logger = NExecNode::Logger().WithTag("ControllerAgentDescriptor: %v", agentDescriptor);
 
         for (const auto& protoJobToStore : response->jobs_to_store()) {
             auto jobToStore = FromProto<NControllerAgent::TJobToStore>(protoJobToStore);
@@ -1237,7 +1276,10 @@ private:
         const auto& controllerAgentConnectorPool = Bootstrap_->GetExecNodeBootstrap()->GetControllerAgentConnectorPool();
 
         *request->mutable_resource_limits() = ToNodeResources(JobResourceManager_->GetResourceLimits());
-        *request->mutable_resource_usage() = ToNodeResources(JobResourceManager_->GetResourceUsage(/*includeWaiting*/ true));
+        *request->mutable_resource_usage() = ToNodeResources(JobResourceManager_->GetResourceUsage({
+            NJobAgent::EResourcesState::Pending,
+            NJobAgent::EResourcesState::Acquired,
+        }));
 
         *request->mutable_disk_resources() = JobResourceManager_->GetDiskResources();
 
@@ -1276,7 +1318,7 @@ private:
             // TODO(pogorelov): Move it to FillStatus.
             {
                 auto& resourceUsage = *allocationStatus->mutable_resource_usage();
-                resourceUsage = ToNodeResources(allocation->GetResourceUsage());
+                resourceUsage = ToNodeResources(allocation->GetResourceUsage(/*excludeReleasing*/ true));
                 ReplaceCpuWithVCpu(resourceUsage);
             }
         }
@@ -1406,8 +1448,7 @@ private:
 
             const auto& controllerAgentConnectorPool = Bootstrap_->GetExecNodeBootstrap()->GetControllerAgentConnectorPool();
             auto descriptor = controllerAgentConnectorPool->GetDescriptorByIncarnationId(incarnationId);
-            YT_VERIFY(descriptor);
-            UpdateOperationControllerAgent(operationId, std::move(*descriptor));
+            UpdateOperationControllerAgent(operationId, std::move(descriptor));
         }
 
         {
@@ -1455,16 +1496,17 @@ private:
             if (!IdToAllocations_.contains(allocationId) || allocation->GetState() != EAllocationState::Waiting) {
                 YT_LOG_DEBUG("No such allocation, it seems to be aborted (AllocationId: %v)", allocationId);
                 continue;
-            } else {
-                YT_LOG_DEBUG("Trying to start allocation (AllocationId: %v)", allocationId);
             }
 
+            YT_LOG_DEBUG("Trying to start allocation (AllocationId: %v)", allocationId);
+
             try {
-                if (!resourceAcquiringContext.TryAcquireResourcesFor(StaticPointerCast<TResourceHolder>(allocation))) {
+                if (!resourceAcquiringContext.TryAcquireResourcesFor(allocation->GetResourceHolder())) {
                     YT_LOG_DEBUG("Allocation was not started (AllocationId: %v)", allocationId);
                     AllocationsWaitingForResources_.push_back(std::move(allocation));
                 } else {
                     YT_LOG_DEBUG("Allocation started (AllocationId: %v)", allocationId);
+                    allocation->OnResourcesAcquired();
                 }
             } catch (const std::exception& ex) {
                 allocation->Abort(TError("Failed to acquire resources for job")
@@ -1477,14 +1519,8 @@ private:
         }
     }
 
-    void OnJobCleanupFinished(const TWeakPtr<TJob>& weakJob)
+    void OnJobCleanupFinished(const TJobPtr& job)
     {
-        auto job = weakJob.Lock();
-
-        if (!job) {
-            return;
-        }
-
         YT_VERIFY(job->GetPhase() == EJobPhase::Finished);
         if (JobsWaitingForCleanup_.erase(job)) {
             YT_LOG_DEBUG(
@@ -1498,6 +1534,8 @@ private:
         VERIFY_THREAD_AFFINITY(JobThread);
 
         auto operationId = job->GetOperationId();
+
+        JobProxyLogManager_->OnJobUnregistered(job->GetId());
 
         auto guard = WriterGuard(JobsLock_);
 
@@ -1656,11 +1694,14 @@ private:
         }
     }
 
-    void OnReservedMemoryOvercommited(i64 mappedMemory)
+    void OnReservedMemoryOvercommitted(i64 mappedMemory)
     {
         VERIFY_THREAD_AFFINITY(JobThread);
 
-        auto usage = JobResourceManager_->GetResourceUsage(false);
+        auto usage = JobResourceManager_->GetResourceUsage({
+            NJobAgent::EResourcesState::Acquired,
+                NJobAgent::EResourcesState::Releasing
+        });
         const auto limits = JobResourceManager_->GetResourceLimits();
         auto schedulerJobs = GetRunningJobsSortedByStartTime();
 
@@ -1679,7 +1720,10 @@ private:
     {
         VERIFY_THREAD_AFFINITY(JobThread);
 
-        auto usage = JobResourceManager_->GetResourceUsage(/*includeWaiting*/ false);
+        auto usage = JobResourceManager_->GetResourceUsage({
+            NJobAgent::EResourcesState::Acquired,
+            NJobAgent::EResourcesState::Releasing,
+        });
         auto limits = JobResourceManager_->GetResourceLimits();
 
         bool preemptMemoryOverdraft = false;
@@ -1753,14 +1797,13 @@ private:
         return schedulerJobs;
     }
 
-    void InterruptAllJobs(TError error)
+    void InterruptAllJobs(const TError& error)
     {
         VERIFY_THREAD_AFFINITY(JobThread);
 
         for (const auto& job : GetJobs()) {
-            const auto& Logger = job->GetLogger();
             try {
-                YT_LOG_DEBUG(error, "Trying to interrupt job");
+                YT_LOG_DEBUG(error, "Trying to interrupt job (JobId: %v)", job->GetId());
                 job->Interrupt(
                     GetDynamicConfig()->DisabledJobsInterruptionTimeout,
                     EInterruptReason::JobsDisabledOnNode,
@@ -2045,8 +2088,7 @@ private:
         YT_LOG_FATAL_UNLESS(
             snapshotOrError.IsOK(),
             snapshotOrError,
-            "Unexpected failure while making exec node job controller info snapshot"
-        );
+            "Unexpected failure while making exec node job controller info snapshot");
 
         return std::move(snapshotOrError.Value());
     }

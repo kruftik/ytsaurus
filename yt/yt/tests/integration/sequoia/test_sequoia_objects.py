@@ -14,9 +14,13 @@ from yt.sequoia_tools import DESCRIPTORS
 from yt_commands import (
     authors, create, get, remove, get_singular_chunk_id, write_table, read_table, wait,
     exists, create_domestic_medium, ls, set, get_account_disk_space_limit, set_account_disk_space_limit,
-    link, build_master_snapshots, start_transaction, abort_transaction)
+    link, build_master_snapshots, start_transaction, abort_transaction, get_active_primary_master_leader_address)
 
 from yt.wrapper import yson
+
+from yt_helpers import profiler_factory
+
+import pytest
 
 ##################################################################
 
@@ -37,6 +41,12 @@ class TestSequoiaReplicas(YTEnvSetup):
 
     TABLE_MEDIUM_1 = "table_medium_1"
     TABLE_MEDIUM_2 = "table_medium_2"
+
+    DELTA_MASTER_CONFIG = {
+        "chunk_manager": {
+            "allow_multiple_erasure_parts_per_node": True,
+        },
+    }
 
     DELTA_DYNAMIC_MASTER_CONFIG = {
         "chunk_manager": {
@@ -73,26 +83,29 @@ class TestSequoiaReplicas(YTEnvSetup):
         super(TestSequoiaReplicas, self).teardown_method(method)
 
     @authors("aleksandra-zh")
-    def test_chunk_replicas_node_offline1(self):
+    @pytest.mark.parametrize("erasure_codec", ["none", "lrc_12_2_2"])
+    def test_chunk_replicas_node_offline1(self, erasure_codec):
         set("//sys/accounts/tmp/@resource_limits/disk_space_per_medium/{}".format(self.TABLE_MEDIUM_1), 10000)
 
-        create("table", "//tmp/t",  attributes={"primary_medium": self.TABLE_MEDIUM_1})
+        create("table", "//tmp/t",  attributes={"primary_medium": self.TABLE_MEDIUM_1, "erasure_codec": erasure_codec})
 
         write_table("//tmp/t", [{"x": 1}])
         assert read_table("//tmp/t") == [{"x": 1}]
 
         chunk_id = get_singular_chunk_id("//tmp/t")
 
+        desired_replica_count = 3 if erasure_codec == "none" else 16
         assert len(select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}]")) > 0
         wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}]")) == 1)
-        wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.location_replicas.get_default_path()}]")) == 3)
+        wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.location_replicas.get_default_path()}]")) == desired_replica_count)
 
         rows = select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}]")
         assert len(rows) == 1
-        assert len(rows[0]["replicas"]) == 3
+        assert len(rows[0]["stored_replicas"]) == desired_replica_count
 
         with Restarter(self.Env, NODES_SERVICE, indexes=self.table_node_indexes):
-            pass
+            assert len(select_rows_from_ground(f"* from [{DESCRIPTORS.location_replicas.get_default_path()}]")) == 0
+            assert len(select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}] where yson_length(stored_replicas) > 0")) == 0
 
         remove("//tmp/t")
 
@@ -123,6 +136,62 @@ class TestSequoiaReplicas(YTEnvSetup):
 
         wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}]")) == 0)
         wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.location_replicas.get_default_path()}]")) == 0)
+
+    @authors("aleksandra-zh")
+    def test_chunk_replicas_purgatory(self):
+        set("//sys/accounts/tmp/@resource_limits/disk_space_per_medium/{}".format(self.TABLE_MEDIUM_1), 10000)
+        create("table", "//tmp/t",  attributes={"primary_medium": self.TABLE_MEDIUM_1})
+
+        write_table("//tmp/t", [{"x": 1}])
+        assert read_table("//tmp/t") == [{"x": 1}]
+
+        chunk_id = get_singular_chunk_id("//tmp/t")
+
+        assert len(select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}]")) > 0
+        wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.chunk_replicas.get_default_path()}]")) == 1)
+        wait(lambda: len(select_rows_from_ground(f"* from [{DESCRIPTORS.location_replicas.get_default_path()}]")) == 3)
+
+        def is_purgatory_empty():
+            total_purgatory_size = 0
+            secondary_masters = get("//sys/secondary_masters")
+            for cell_tag in secondary_masters:
+                for address in secondary_masters[cell_tag]:
+                    if not get("//sys/secondary_masters/{}/{}/orchid/monitoring/hydra/active_leader".format(cell_tag, address)):
+                        continue
+                    profiler = profiler_factory().at_secondary_master(cell_tag, address)
+                    total_purgatory_size += profiler.gauge("chunk_server/sequoia_chunk_purgatory_size").get()
+
+            profiler = profiler_factory().at_primary_master(get_active_primary_master_leader_address(self))
+            total_purgatory_size += profiler.gauge("chunk_server/sequoia_chunk_purgatory_size").get()
+            return total_purgatory_size == 0
+
+        set("//sys/@config/chunk_manager/enable_chunk_purgatory", False)
+        remove("//tmp/t")
+        wait(lambda: not exists("#{}".format(chunk_id)))
+        wait(lambda: not is_purgatory_empty())
+
+        with Restarter(self.Env, NODES_SERVICE, indexes=self.table_node_indexes):
+            pass
+
+        def no_destroyed_replicas():
+            for node_address in ls("//sys/cluster_nodes"):
+                if get("//sys/cluster_nodes/{0}/@destroyed_chunk_replica_count".format(node_address)) > 0:
+                    return False
+            return True
+        wait(no_destroyed_replicas)
+
+        def no_sequoia_chunk_replicas():
+            for node_address in ls("//sys/cluster_nodes"):
+                chunk_replica_count = get("//sys/cluster_nodes/{0}/@chunk_replica_count".format(node_address))
+                if chunk_replica_count.get(self.TABLE_MEDIUM_1, 0) > 0:
+                    return False
+            return True
+        wait(no_sequoia_chunk_replicas)
+
+        set("//sys/@config/chunk_manager/enable_chunk_purgatory", True)
+
+        wait(is_purgatory_empty)
+        wait(no_destroyed_replicas)
 
     @authors("aleksandra-zh")
     def test_replication(self):

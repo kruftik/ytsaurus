@@ -8,6 +8,8 @@
 
 #include <yt/yt/server/lib/hydra/entity_map.h>
 
+#include <yt/yt/server/lib/misc/assert_sizeof.h>
+
 #include <yt/yt/core/misc/pool_allocator.h>
 
 namespace NYT::NObjectServer {
@@ -17,6 +19,9 @@ namespace NYT::NObjectServer {
 struct TObjectDynamicData
     : public NHydra::TEntityDynamicDataBase
 { };
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TObjectDynamicData, 4);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -57,11 +62,6 @@ class TObject
     , public TPoolAllocator::TObjectBase
 {
 public:
-    //! For Sequoia objects equals to its aevum which is a version of representation of
-    //! object in dynamic tables.
-    //! For non-Sequoia objects equals to |EAevum::None|.
-    DEFINE_BYVAL_RW_PROPERTY(NSequoiaServer::EAevum, Aevum, NSequoiaServer::EAevum::None);
-
     DEFINE_BYVAL_RW_PROPERTY(NHydra::TRevision, AttributeRevision, NHydra::NullRevision);
     DEFINE_BYVAL_RW_PROPERTY(NHydra::TRevision, ContentRevision, NHydra::NullRevision);
 
@@ -229,10 +229,6 @@ public:
     //! Returns a pointer to the value of the attribute or |nullptr| if it is not set.
     const NYson::TYsonString* FindAttribute(const TString& key) const;
 
-    //! For Sequoia objects sets aevum equal to the current aevum.
-    //! For non-Sequoia objects does nothing.
-    void RememberAevum();
-
     NHydra::TRevision GetRevision() const;
     virtual void SetModified(EModificationType modificationType);
 
@@ -259,8 +255,7 @@ public:
     virtual void LoadEctoplasm(TStreamLoadContext& context);
 
 protected:
-    // COMPAT(h0pless): Make this field const when schema migration will be finished.
-    TObjectId Id_;
+    const TObjectId Id_;
 
     int RefCounter_ = 0;
     TEpochRefCounter EphemeralRefCounter_;
@@ -280,6 +275,9 @@ protected:
 
     std::unique_ptr<TAttributeSet> Attributes_;
 };
+
+// Think twice before increasing this.
+YT_STATIC_ASSERT_SIZEOF_SANITY(TObject, 88);
 
 ////////////////////////////////////////////////////////////////////////////////
 

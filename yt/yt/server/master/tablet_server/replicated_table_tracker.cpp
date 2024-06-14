@@ -84,7 +84,7 @@ using namespace NReplicatedTableTrackerClient;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static const auto& Logger = TabletServerLogger;
+static constexpr auto& Logger = TabletServerLogger;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -109,11 +109,6 @@ struct TClusterStateCacheKey
 void FormatValue(TStringBuilderBase* builder, const TClusterStateCacheKey& key, TStringBuf /*spec*/)
 {
     builder->AppendFormat("%v", key.ClusterName);
-}
-
-TString ToString(const TClusterStateCacheKey& key)
-{
-    return ToStringViaBuilder(key);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -147,11 +142,6 @@ void FormatValue(TStringBuilderBase* builder, const TBundleHealthCacheKey& key, 
         key.ClusterName);
 }
 
-TString ToString(const TBundleHealthCacheKey& key)
-{
-    return ToStringViaBuilder(key);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 DECLARE_REFCOUNTED_CLASS(TBundleHealthCache)
@@ -163,7 +153,7 @@ public:
     explicit TBundleHealthCache(TAsyncExpiringCacheConfigPtr config)
         : TAsyncExpiringCache(
             std::move(config),
-            TabletServerLogger.WithTag("Cache: BundleHealth"))
+            TabletServerLogger().WithTag("Cache: BundleHealth"))
     { }
 
 protected:
@@ -191,7 +181,7 @@ public:
     explicit TClusterStateCache(TAsyncExpiringCacheConfigPtr config)
         : TAsyncExpiringCache(
             std::move(config),
-            TabletServerLogger.WithTag("Cache: ClusterLivenessCheck"))
+            TabletServerLogger().WithTag("Cache: ClusterLivenessCheck"))
     { }
 
 protected:
@@ -392,8 +382,8 @@ private:
             }
 
             return CheckClusterState()
-                .Apply(BIND([=, this, weakThis_ = MakeWeak(this)] {
-                    if (auto this_ = weakThis_.Lock()) {
+                .Apply(BIND([=, this, weakThis = MakeWeak(this)] {
+                    if (auto this_ = weakThis.Lock()) {
                         return CheckReplicaState();
                     } else {
                         return VoidFuture;
@@ -413,7 +403,7 @@ private:
                 ->GetHydraFacade()
                 ->GetAutomatonInvoker(EAutomatonThreadQueue::TabletManager);
 
-            return BIND([=, this, this_ = MakeStrong(this)] () {
+            return BIND([=, this, this_ = MakeStrong(this)] {
                 auto req = TTableReplicaYPathProxy::Alter(FromObjectId(Id_));
                 GenerateMutationId(req);
                 req->set_mode(static_cast<int>(mode));

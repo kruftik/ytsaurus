@@ -30,7 +30,7 @@ using Porto::EError;
 
 #ifdef _linux_
 
-static const NLogging::TLogger& Logger = ContainersLogger;
+static constexpr auto& Logger = ContainersLogger;
 static constexpr auto RetryInterval = TDuration::MilliSeconds(100);
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -73,7 +73,7 @@ static const std::vector<TDevice> DefaultContainerDevices = {
         .Access = "rw",
         // It is necessary for the consistency of default devices in the container, but access must be denied.
         // See porto/src/device.cpp::TDevices::InitDefault and https://docs.kernel.org/admin-guide/serial-console.html.
-        .Path = "/dev/console"
+        .Path = "/dev/console",
     }
 };
 
@@ -174,11 +174,11 @@ public:
         Api_->SetTimeout(Config_->ApiTimeout.Seconds());
         Api_->SetDiskTimeout(Config_->ApiDiskTimeout.Seconds());
 
-        Profiler_.AddFuncGauge("/volume_surplus", MakeStrong(this), [this] () {
+        Profiler_.AddFuncGauge("/volume_surplus", MakeStrong(this), [this] {
             return VolumeSurplus_;
         });
 
-        Profiler_.AddFuncGauge("/layer_surplus", MakeStrong(this), [this] () {
+        Profiler_.AddFuncGauge("/layer_surplus", MakeStrong(this), [this] {
             return LayerSurplus_;
         });
 
@@ -411,14 +411,15 @@ public:
     }
 
     // This method allocates Porto "resources", so it should be uncancellable.
-    TFuture<void> ImportLayer(const TString& archivePath, const TString& layerId, const TString& place) override
+    TFuture<void> ImportLayer(const TString& archivePath, const TString& layerId, const TString& place, const TString& container) override
     {
         return ExecutePortoApiAction(
             &TPortoExecutor::DoImportLayer,
             "ImportLayer",
             archivePath,
             layerId,
-            place)
+            place,
+            container)
             .ToUncancelable();
     }
 
@@ -557,6 +558,7 @@ private:
 
         portoSpec.set_enable_porto(FormatEnablePorto(spec.EnablePorto));
         portoSpec.set_isolate(spec.Isolate);
+        portoSpec.set_enable_fuse(spec.EnableFuse);
 
         if (spec.StdinPath) {
             portoSpec.set_stdin_path(*spec.StdinPath);
@@ -990,10 +992,10 @@ private:
         return specs;
     }
 
-    void DoImportLayer(const TString& archivePath, const TString& layerId, const TString& place)
+    void DoImportLayer(const TString& archivePath, const TString& layerId, const TString& place, const TString& container)
     {
         ExecuteApiCall(
-            [&] { return Api_->ImportLayer(layerId, archivePath, false, place); },
+            [&] { return Api_->ImportLayer(layerId, archivePath, false, place, "", container); },
             "ImportLayer",
             /*idempotent*/ false);
         LayerSurplus_ += 1;
